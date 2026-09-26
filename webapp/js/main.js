@@ -100,3 +100,6 @@ document.querySelectorAll('#modeGroup .pill-btn').forEach(b => b.addEventListene
 // The appearance is applied at boot, before anyone looks — a stored "light"
 // that arrived after the first paint would flash the dark palette first.
 try { if (typeof applyAppearance === 'function') applyAppearance(); } catch (e) {}
+// The player scales to leave the Outputs pane a header and a row of cards on
+// every screen (queue.js, fitStagePlayer).
+initStagePlayerFit();

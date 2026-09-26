@@ -19,7 +19,7 @@
 
 </p>
 
-> **Current release: v4.16.1.** **No more black bars on a 720p or 1080p export.** Hailuo H3's Draft and Standard canvases (and LTX's Standard) are close to 16:9 but not exactly, and the export used to pad the difference with black: 40 px down each side of a Draft clip at 720p. Now the picture fills the frame and a few pixels are trimmed at the edges instead; canvases far from 16:9 (square, 4:3) still get bars. 4.16.0 brought the Music Studio and more than 70 fixes. Full notes on the [releases page](https://github.com/mrbizarro/Phosphene/releases).
+> **Current release: v4.16.2.** **The outputs list stays on screen, and Hailuo H3 times are honest on 48 GB Macs.** On a 1080p screen a square or wide clip used to make the preview so tall that the outputs list (and its delete buttons) went off the bottom; the preview now scales down so the outputs header and a full row of clips always stay visible. On a 36-59 GB Mac, H3's 10 s and 15 s estimates now include the reduced-memory engine's extra time (about a third longer than on 64 GB), and say why. 4.16.1 made 720p/1080p exports fill the frame; 4.16.0 brought the Music Studio and more than 70 fixes. Full notes on the [releases page](https://github.com/mrbizarro/Phosphene/releases).
 
 ## Overview
 

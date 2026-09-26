@@ -49,6 +49,21 @@ system memory the user read while rendering, not an MLX-internal number:
 Consistent with the Q8 lane's 25.63 GiB run peak plus macOS and the panel, and
 with the 36 GB floor leaving headroom on a 48 GB Mac.
 
+**Time estimates on 36-59 GB (v4.16.2).** Every H3 receipt was measured on a
+64 GB M4 Max, and until 4.16.2 the estimate only scaled it by chip. A Pinokio
+user on an M4 Pro 48 GB was told ~17 min for a 15 s Draft and waited 40+. The
+fleet (60 days to 2026-09-26, 6,587 H3 renders, wall bucket over the model's
+own estimate, one median per install) puts the reduced-RAM lane at **1.32x**
+the >=60 GB lane on chained 10/15 s lengths (29 vs 117 installs) and **1.07x**
+on single windows (43 vs 170). `_h3_ram_factor()` carries those two numbers
+(`H3_LOWRAM_FACTOR_CHAIN` / `_SINGLE`) into every H3 estimate below 60 GB, and
+chained cells there show a note: about a third longer than 64 GB, quit other
+apps, swapping can take far longer. The mechanism is not measured
+(`render_completed` has no pressure field); memory pressure inside a budget
+that leaves the Mac max(6, RAM/8) GB is the likely one. Separately, Fast is a
+one-click 180 MB adapter: until it is installed, a "Draft" render runs the
+full 8-forward sampler, about twice the Fast time.
+
 ---
 
 ## How it plugs in

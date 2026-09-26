@@ -8736,6 +8736,74 @@ def _hw_chip_family() -> str:
 
 
 
+# THE REDUCED-RAM LANE IS SLOWER, AND MOST SLOWER ON CHAINED LENGTHS. Every
+# number above was measured on a 64 GB M4 Max, i.e. the bf16 lane. Below
+# H3_MIN_RAM_GB (60) H3 renders on the Q8 DiT inside a memory budget that
+# leaves the Mac max(6, RAM/8) GB (h3_memory_budget), and the fleet says that
+# costs time the chip factor does not see. Reported from Pinokio (2026-09-20,
+# M4 Pro 48 GB): a 15 s Draft priced "~17 min" ran 40+ min.
+#
+# FLEET, PostHog render_completed, engine=h3, 60 days to 2026-09-26, 6,587
+# renders. Each render's wall_sec_bucket over this model's own estimate for
+# its exact cell and steps at its chip's factor, one median per install (so a
+# heavy user cannot outvote the fleet), then the median over installs:
+#
+#                     <60 GB (Q8 lane)    >=60 GB (bf16 lane)    ratio
+#   chained 10/15 s   1.43 (29 installs)  1.08 (117 installs)    1.32
+#   single window     1.21 (43 installs)  1.13 (170 installs)    1.07
+#
+# Taking each bucket's LOWER edge instead of its geometric middle gives 1.27
+# and 1.07 - the bucket ladder moves both bands together, so the ratio holds.
+# Same chip, M4 Pro: chained 1.43 (15 installs, 48 GB) vs 1.03 (5, 64 GB).
+# The mechanism is not measured here (render_completed carries no swap or
+# pressure field); the likely one is memory - a chained clip holds the earlier
+# windows' frames and audio while the next window denoises, inside a budget
+# that leaves a 48 GB Mac ~6 GB for macOS and everything else, so the rest of
+# the Mac is pushed into compression and swap. The factors below price what the
+# fleet sees; H3_TIER_LOWRAM_CHAIN_NOTE tells the user why and what helps.
+H3_LOWRAM_FACTOR_CHAIN = 1.3
+H3_LOWRAM_FACTOR_SINGLE = 1.07
+H3_TIER_LOWRAM_CHAIN_NOTE = (
+    "On this {ram} GB Mac, H3 runs its reduced-memory engine, and 10-15 s "
+    "clips take about a third longer than on a 64 GB Mac - the time shown "
+    "includes that. Quit other apps while it renders: if macOS runs short of "
+    "memory it starts swapping, and the render can take far longer than shown.")
+
+
+def _h3_ram_factor(windows: int, ram_gb: float | None = None) -> float:
+    """How much slower than the bf16 lane a render of `windows` chained
+    windows runs on this Mac's H3 lane (1.0 at 60 GB and up). A
+    PHOSPHENE_SPEED_FACTOR override is a TOTAL factor for a Mac the tables
+    misjudge, so it replaces this as well as the chip factor."""
+    raw = (os.environ.get("PHOSPHENE_SPEED_FACTOR") or "").strip()
+    if raw:
+        # Only an override _hw_speed_factor would actually USE replaces this
+        # one; "auto" or a typo leaves both tables in force (Codex, 4.16.2).
+        try:
+            float(raw)
+            return 1.0
+        except ValueError:
+            pass
+    ram = float(SYSTEM_RAM_GB if ram_gb is None else ram_gb)
+    if ram <= 0 or ram >= H3_MIN_RAM_GB:
+        return 1.0
+    return H3_LOWRAM_FACTOR_CHAIN if int(windows) > 1 else H3_LOWRAM_FACTOR_SINGLE
+
+
+def _h3_speed_factor(windows: int = 1) -> float:
+    """The ONE multiplier every H3 estimate carries: this Mac's chip, and the
+    lane its RAM puts H3 on."""
+    return _hw_speed_factor("h3") * _h3_ram_factor(windows)
+
+
+def h3_lowram_chain_note(windows: int, ram_gb: float | None = None) -> str:
+    """The sentence a chained cell owes a reduced-RAM Mac, or ''."""
+    ram = float(SYSTEM_RAM_GB if ram_gb is None else ram_gb)
+    if int(windows) <= 1 or ram <= 0 or ram >= H3_MIN_RAM_GB:
+        return ""
+    return H3_TIER_LOWRAM_CHAIN_NOTE.format(ram=int(round(ram)))
+
+
 def h3_estimate_minutes(w: int, h: int, window_frames: int, windows: int,
                         forwards: int) -> float:
     """Wall clock, in minutes, for a render of this exact shape. The one function
@@ -8747,7 +8815,7 @@ def h3_estimate_minutes(w: int, h: int, window_frames: int, windows: int,
     rows = _h3_packed_rows(w, h, window_frames)
     per_fwd = _h3_forward_seconds(rows)
     fixed = _h3_fixed_seconds(w, h, window_frames)
-    return (windows * max(0, int(forwards)) * per_fwd + windows * fixed) / 60.0 * _hw_speed_factor("h3")
+    return (windows * max(0, int(forwards)) * per_fwd + windows * fixed) / 60.0 * _h3_speed_factor(windows)
 
 
 def _fmt_eta(minutes: float) -> str:
@@ -9010,7 +9078,9 @@ def _build_h3_tiers() -> dict[str, dict]:
             # Receipts are M4 Max wall clocks. The model above already carries
             # this Mac's factor, so a receipt must carry it too or an M4 Pro is
             # promised the M4 Max number exactly where a measurement exists.
-            hw = _hw_speed_factor("h3")
+            # It includes the reduced-RAM lane's factor (_h3_ram_factor), so a
+            # 48 GB Mac is not promised a 64 GB Mac's chained clip either.
+            hw = _h3_speed_factor(windows)
             hit = H3_MEASURED_ETA.get((q["key"], ln["key"], False))
             if hit and int(hit[2]) == win_fwd:
                 eta_min, eta_measured = hit[0] * hw, True
@@ -9044,13 +9114,16 @@ def _build_h3_tiers() -> dict[str, dict]:
                 # checkbox can say what both cost together.
                 ff = FACE_FIX_5S_MIN.get(q["key"])
                 if ff:
-                    tristep["facefix_min"] = round(ff * hw * frames / 124.0, 2)
+                    # An LTX pass: the chip factor only, not H3's RAM lane.
+                    tristep["facefix_min"] = round(
+                        ff * _hw_speed_factor("h3") * frames / 124.0, 2)
             spec = f"{w}×{h} · {frames}f"
             if windows > 1:
                 spec += f" · {windows}×5s"
             elif ln["dense"]:
                 spec += " · single pass"
-            notes = [n for n in (q["note"], ln["note"]) if n]
+            notes = [n for n in (q["note"], ln["note"],
+                                 h3_lowram_chain_note(windows)) if n]
             tiers[key] = {
                 "key": key,
                 # Same "<name> · <length>" grammar the fixed tiers printed, so

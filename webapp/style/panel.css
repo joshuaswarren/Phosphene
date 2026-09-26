@@ -6596,10 +6596,19 @@
         linear-gradient(160deg, #0d1430, #0a0f24);
       background-size: 22px 22px, 100% 100%;
     }
+    /* WIDTH COMES FROM THE HEIGHT IT MAY HAVE. `--player-max-h` is the
+       height left once the Outputs pane has its header and one whole row of
+       cards (fitStagePlayer in queue.js measures it), `--media-ar` the clip's
+       w/h as a number; so the surface is as wide as the column OR as wide as
+       that height allows at the clip's shape, whichever is smaller, and
+       `aspect-ratio` gives it the matching height. A square or wide clip on a
+       1080p screen no longer pushes the gallery out of view (Pinokio report,
+       2026-09-25); a 16:9 clip on a big screen is still full width. The
+       fallback cap applies when the fitter is not running (stacked layout). */
     .player-surface {
       position: relative;
       flex: 0 0 auto;
-      width: 100%;
+      width: min(100%, calc(var(--player-max-h, calc(100vh - 340px)) * var(--media-ar, 1.7778)));
       aspect-ratio: var(--media-aspect, 16 / 9);
       margin: 0 auto;
       border-radius: var(--r-lg);
@@ -6609,6 +6618,13 @@
       box-shadow: var(--shadow-2);
       display: flex;
     }
+    /* A song hero has no shape of its own: full column width, and the
+       HEIGHT fitStagePlayer picked (the hero's own minimum up to the 16:9 it
+       had before). Without the variable it falls back to 16:9. */
+    .player-surface[data-song] {
+      width: 100%;
+      height: var(--player-max-h, auto);
+    }
     /* Vertical / portrait media: flip to height-driven sizing so the
        surface stays inside the visible stage area instead of growing
        past the carousel. Height budget is tighter than landscape — we
@@ -6617,9 +6633,9 @@
        520px so a 4K monitor doesn't get a giant vertical strip either. */
     .player-surface[data-orient="vertical"] {
       width: auto;
-      height: min(520px, calc(100vh - 380px));
+      height: min(520px, var(--player-max-h, calc(100vh - 380px)));
       max-width: 100%;
-      max-height: min(520px, calc(100vh - 380px));
+      max-height: min(520px, var(--player-max-h, calc(100vh - 380px)));
     }
     .player-wrap {
       flex: 1 1 auto;
@@ -6902,9 +6918,15 @@
        cluster can escape its bounds; the inner .player-wrap keeps its
        own overflow:hidden so the video itself still clips cleanly to
        the rounded corners. Landscape clips are unchanged. */
-    .player-surface[data-orient="vertical"] {
+    /* data-fit="narrow" is the same move for ANY clip the player had to
+       scale well inside its column (a square clip on a 1080p screen): the
+       cluster would otherwise cover the picture it no longer has room beside.
+       fitStagePlayer sets it only when the column has the room. */
+    .player-surface[data-orient="vertical"],
+    .player-surface[data-fit="narrow"] {
       overflow: visible;
     }
+    .player-surface[data-fit="narrow"] .player-overlay-actions,
     .player-surface[data-orient="vertical"] .player-overlay-actions {
       top: 6px;
       right: auto;
@@ -6914,10 +6936,24 @@
       gap: 2px;
       background: rgba(8, 14, 35, 0.42);
     }
+    .player-surface[data-fit="narrow"] .po-act,
     .player-surface[data-orient="vertical"] .po-act {
       justify-content: flex-start;
       padding: 6px 10px;
     }
+    /* Beside the picture the cluster is a column of full labels: it sizes to
+       its longest one instead of to the gap it starts in, and a label never
+       wraps ("Upscale & Face Fix" broke over three lines, with the split
+       button's settings half stranded beside it). */
+    .player-surface[data-fit="narrow"] .player-overlay-actions,
+    .player-surface[data-orient="vertical"] .player-overlay-actions {
+      width: max-content;
+    }
+    .player-surface[data-fit="narrow"] .po-act-label,
+    .player-surface[data-orient="vertical"] .po-act-label {
+      white-space: nowrap;
+    }
+    .player-surface[data-fit="narrow"] .po-act.po-act-danger,
     .player-surface[data-orient="vertical"] .po-act.po-act-danger {
       margin-top: 4px;
       padding-top: 8px;
@@ -7034,7 +7070,10 @@
        become visible on tall viewports. */
     .carousel-wrap {
       flex: 1 1 auto;
-      min-height: 200px;
+      /* --outputs-min-h is the pane's header plus one full row of cards,
+         measured by fitStagePlayer; everything else in the column gives way
+         before this does. */
+      min-height: max(200px, var(--outputs-min-h, 0px));
       display: flex;
       flex-direction: column;
       padding: 12px 14px 14px;
@@ -11416,6 +11455,10 @@ label > .ph:first-child:not(:only-child),
 /* The Song card: under the player, only for songs. */
 .song-card { margin: 10px 0 0; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--r-lg);
   background: var(--panel); box-shadow: var(--shadow-1); }
+/* In the stage column the card is the reader between the song hero and the
+   Outputs pane: it scrolls inside itself rather than pushing the list of
+   songs off the bottom of a 1080p screen (4.16.2). */
+.stage-pane > .song-card { flex: 0 1 auto; min-height: 120px; overflow-y: auto; }
 .song-card[hidden] { display: none; }
 .song-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .song-title { font-size: var(--fs-lg); font-weight: 650; letter-spacing: -0.01em; }

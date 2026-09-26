@@ -142,7 +142,7 @@ function _restoreSelectedOutputAfterLive() {
     <div class="ps-empty-sub">Generate something on the left and the result lands here.</div>
   </div>`;
   const surface = wrap.closest('.player-surface');
-  if (surface) { surface.removeAttribute('data-orient'); surface.style.removeProperty('--media-aspect'); }
+  if (surface) { surface.removeAttribute('data-song'); clearStageAspect(surface); }
 }
 
 function _handoffLiveStageToOutput(path) {
@@ -196,9 +196,7 @@ function _renderLiveStageFrame(s, preview) {
   // small strip inside a landscape box).
   const _lw = parseInt((cur.params || {}).width, 10) || 16;
   const _lh = parseInt((cur.params || {}).height, 10) || 9;
-  surface.style.setProperty('--media-aspect', `${_lw} / ${_lh}`);
-  if (_lh > _lw) surface.setAttribute('data-orient', 'vertical');
-  else surface.removeAttribute('data-orient');
+  setStageAspect(surface, _lw, _lh);
   wrap.classList.remove('empty');
   wrap.classList.add('live-stage');
   wrap.dataset.liveJobId = String(cur.id);

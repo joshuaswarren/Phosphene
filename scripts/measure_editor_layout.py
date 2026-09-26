@@ -425,8 +425,13 @@ def start_panel(work: Path, log: Path, verbose: bool) -> tuple[subprocess.Popen,
         "LTX_OUTPUT_DIR": str(work / "outputs"),
         "LTX_UPLOADS_DIR": str(work / "uploads"),
         # Nothing here should phone home or open a window.
+        # PHOSPHENE_NO_TELEMETRY is read by nothing; the panel's real switches
+        # are the two below, and without them a hand-run gate booted a panel
+        # that reported an app_boot to the fleet under a fresh install id.
         "LTX_NO_BROWSER": "1",
         "PHOSPHENE_NO_TELEMETRY": "1",
+        "PHOSPHENE_ANALYTICS_DISABLED": "1",
+        "PHOSPHENE_DISABLE_VERSION_CHECK": "1",
     })
     fh = log.open("wb")
     proc = subprocess.Popen(

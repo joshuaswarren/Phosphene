@@ -3015,6 +3015,7 @@ function renderCarousel() {
   el.classList.toggle('song-list', mainOutputsFilter === 'audio');
   if (mainOutputsFilter === 'audio' && visible.length && typeof renderSongList === 'function') {
     renderSongList(el, visible);
+    fitStagePlayer();
     return;
   }
   if (!visible.length) {
@@ -3025,6 +3026,7 @@ function renderCarousel() {
               : mainOutputsFilter === 'videos' ? 'No video outputs yet.'
               : 'No outputs in this view yet.';
     el.innerHTML = `<div class="empty-msg">${msg}</div>`;
+    fitStagePlayer();
     return;
   }
   // PERF: cap rendered DOM cards. The auto-fetch (d29de9c) started
@@ -3173,6 +3175,7 @@ function renderCarousel() {
       window._carThumbObserver.observe(c);
     }
   });
+  fitStagePlayer();
 }
 
 // Relative-time helper for the player overlay meta line. Takes the
@@ -3236,6 +3239,146 @@ function _wireStageMutePersistence(video) {
 
 function stageMayAutoSelectOutput() {
   return !activePath && !window._liveStageOwnsPlayer;
+}
+
+// ---- THE PLAYER NEVER PUSHES THE OUTPUTS OFF SCREEN -------------------------
+// Reported from a 1080p monitor (Pinokio, 2026-09-25): "video generations that
+// are square or more widescreen push down the outputs pane so far that it goes
+// out of view" - the thumbnails and their delete buttons were unreachable
+// until Pinokio's window was made narrower. The player was sized from the
+// column's WIDTH (`width:100%` + `aspect-ratio`), so a square clip in a
+// ~1000 px column asked for a ~1000 px-tall player on a ~940 px page, and the
+// stage pane (overflow:hidden) cut the gallery off below it.
+//
+// The rule now: the Outputs pane always keeps its header (filters, search) and
+// one whole row of cards; the player takes what is left and SCALES DOWN inside
+// it, keeping the clip's own shape. `fitStagePlayer` measures that height off
+// the laid-out page (stage pane minus every other visible row minus the pane's
+// own chrome and first card row) and hands it to CSS as `--player-max-h`; the
+// CSS turns it into a width through `--media-ar`, so nothing is stretched.
+// Where there was already room - a 16:9 clip on a big screen - the cap is
+// larger than the clip and nothing changes. Stacked (one-column, <=900 px)
+// layouts scroll, so the variable is removed there and the CSS fallback holds.
+// `test_outputs_layout_geometry.py` measures all of this in a real browser.
+const PLAYER_MIN_H = 180;          // below this the player is a postage stamp
+// A song shows a hero, not a picture: a 180 px cover in 32 px of padding with
+// the title and a Play button beside it. It has no shape of its own, so its
+// surface keeps the column's width and gets a HEIGHT: never under what the
+// hero needs, never over the 16:9 it had before (Codex review, 4.16.2).
+const SONG_HERO_MIN_H = 260;
+const PLAYER_SIDE_ACTIONS_MIN = 200;  // px of free column beside the player
+
+function setStageAspect(surface, w, h) {
+  if (!surface) return;
+  if (!(w > 0) || !(h > 0)) { clearStageAspect(surface); return; }
+  surface.style.setProperty('--media-aspect', `${w} / ${h}`);
+  surface.style.setProperty('--media-ar', String(Math.round((w / h) * 10000) / 10000));
+  surface.removeAttribute('data-song');      // media with a shape is not a song hero
+  if (h > w) surface.setAttribute('data-orient', 'vertical');
+  else surface.removeAttribute('data-orient');
+  fitStagePlayer();
+}
+function clearStageAspect(surface) {
+  if (!surface) return;
+  surface.removeAttribute('data-orient');
+  surface.style.removeProperty('--media-aspect');
+  surface.style.removeProperty('--media-ar');
+  fitStagePlayer();
+}
+
+let _stageFitRaf = 0;
+function fitStagePlayer() {
+  if (_stageFitRaf) return;
+  _stageFitRaf = requestAnimationFrame(() => { _stageFitRaf = 0; _fitStagePlayerNow(); });
+}
+function _fitStagePlayerNow() {
+  const surface = document.querySelector('.stage-pane > .player-surface');
+  if (!surface) return;
+  const stage = surface.parentElement;
+  const wrap = stage.querySelector(':scope > .carousel-wrap');
+  const car = document.getElementById('carousel');
+  const setVar = (v) => {
+    const cur = surface.style.getPropertyValue('--player-max-h');
+    if (v == null) { if (cur) surface.style.removeProperty('--player-max-h'); }
+    else if (cur !== v) surface.style.setProperty('--player-max-h', v);
+  };
+  const layout = stage.parentElement;
+  const stacked = !layout || getComputedStyle(layout).gridTemplateColumns
+    .trim().split(/\s+/).length < 2;
+  // Nothing to protect (storyboard, the Ideogram canvas, the Editor) or a
+  // layout that scrolls: hand the player back to the CSS fallback.
+  if (stacked || !wrap || !car || wrap.getClientRects().length === 0
+      || surface.getClientRects().length === 0) {
+    setVar(null);
+    stage.style.removeProperty('--outputs-min-h');
+    surface.removeAttribute('data-fit');
+    return;
+  }
+  const cs = getComputedStyle(stage);
+  const gap = parseFloat(cs.rowGap) || 0;
+  let avail = stage.clientHeight - (parseFloat(cs.paddingTop) || 0)
+            - (parseFloat(cs.paddingBottom) || 0);
+  let rows = 0;
+  for (const el of stage.children) {
+    if (!el.getClientRects().length) continue;             // display:none / hidden
+    const s = getComputedStyle(el);
+    if (s.position === 'absolute' || s.position === 'fixed') continue;
+    rows += 1;
+    if (el === surface || el === wrap) continue;
+    // Priced at its CONTENT height: the song card is the one row that can
+    // scroll inside itself, so if this leaves too little it is the card that
+    // shrinks (CSS), never the gallery and never the hero below its minimum.
+    avail -= Math.max(el.offsetHeight, el.scrollHeight) + (parseFloat(s.marginTop) || 0)
+           + (parseFloat(s.marginBottom) || 0);
+  }
+  avail -= gap * Math.max(0, rows - 1);
+  // The Outputs pane's own chrome (padding, border, the header row, the song
+  // bar when it is up) is everything in it that is not the scrolling grid, so
+  // it is measured the same way whether the pane is squeezed or not.
+  const chrome = wrap.offsetHeight - car.offsetHeight;
+  const first = car.firstElementChild;
+  // +4: the active ring and the hover lift draw outside the card's box.
+  const row = first ? first.offsetHeight + 4 : 150;
+  // The same number is the pane's own floor, so a row that can shrink (the
+  // song card, which scrolls) gives way before the gallery does.
+  const reserve = Math.ceil(chrome + row);
+  if (stage.style.getPropertyValue('--outputs-min-h') !== reserve + 'px') {
+    stage.style.setProperty('--outputs-min-h', reserve + 'px');
+  }
+  let cap = Math.max(PLAYER_MIN_H, Math.floor(avail - chrome - row));
+  if (surface.hasAttribute('data-song')) {
+    const natural = Math.floor(surface.parentElement.clientWidth * 9 / 16);
+    cap = Math.min(natural, Math.max(SONG_HERO_MIN_H, cap));
+  }
+  setVar(cap + 'px');
+  // A player scaled well inside its column has room beside it: the action
+  // cluster moves there (as it always has for portrait clips) instead of
+  // crowding the picture.
+  requestAnimationFrame(() => {
+    const free = stage.clientWidth - surface.offsetWidth;
+    if (free >= PLAYER_SIDE_ACTIONS_MIN * 2) surface.setAttribute('data-fit', 'narrow');
+    else surface.removeAttribute('data-fit');
+  });
+}
+let _stageFitWired = false;
+function initStagePlayerFit() {
+  if (_stageFitWired) return;
+  _stageFitWired = true;
+  const surface = document.querySelector('.stage-pane > .player-surface');
+  const stage = surface && surface.parentElement;
+  if (!stage) return;
+  if ('ResizeObserver' in window) {
+    const ro = new ResizeObserver(() => fitStagePlayer());
+    ro.observe(stage);
+    const wrap = stage.querySelector(':scope > .carousel-wrap');
+    if (wrap) ro.observe(wrap);
+    const head = wrap && wrap.querySelector('.carousel-head');
+    if (head) ro.observe(head);
+    const bar = document.getElementById('musicBar');
+    if (bar) ro.observe(bar);
+  }
+  window.addEventListener('resize', fitStagePlayer);
+  fitStagePlayer();
 }
 function selectOutput(path, options) {
   options = options || {};
@@ -3318,6 +3461,8 @@ function selectOutput(path, options) {
     // score, the words, the family. Sound starts on a play button and
     // nowhere else, and it keeps going while you browse other songs.
     wrap.innerHTML = songHero(o);
+    const _sf = wrap.closest('.player-surface');
+    if (_sf) _sf.setAttribute('data-song', '');
   } else if (isAudio) {
     wrap.innerHTML = `<audio class="train-voice-audio" controls preload="metadata"${autoplay ? ' autoplay' : ''} src="${escapeHtml(playerSrc)}"></audio>`;
   } else if (isPhoto) {
@@ -3356,17 +3501,20 @@ function selectOutput(path, options) {
   // to height-driven sizing rather than overflowing the stage.
   const surface = wrap.closest('.player-surface');
   if (surface) {
-    surface.removeAttribute('data-orient');
-    surface.style.removeProperty('--media-aspect');
+    if (!wrap.querySelector('.song-hero')) surface.removeAttribute('data-song');
+    clearStageAspect(surface);
     const media = wrap.querySelector(isPhoto ? 'img' : 'video');
     if (media) {
       const apply = () => {
+        // A still/clip that finished loading AFTER another output was picked
+        // is detached by then; its late load event used to stamp ITS shape
+        // on the surface now showing something else (a square photo framed
+        // 16:9 after a quick click from a wide one).
+        if (!media.isConnected) return;
         const w = isPhoto ? media.naturalWidth  : media.videoWidth;
         const h = isPhoto ? media.naturalHeight : media.videoHeight;
         if (!w || !h) return;
-        surface.style.setProperty('--media-aspect', `${w} / ${h}`);
-        if (h > w) surface.setAttribute('data-orient', 'vertical');
-        else       surface.removeAttribute('data-orient');
+        setStageAspect(surface, w, h);
       };
       if (isPhoto) {
         if (media.complete && media.naturalWidth) apply();
@@ -5197,6 +5345,7 @@ Object.assign(globalThis, {
   escapeHtml, api, _setOfflineBanner, startDeepVerify,
   friendlyJobError, poll, applyPackIncompleteGate, setRecentFilter,
   retryJob, renderCarousel, findOutputByPath, stageMayAutoSelectOutput,
+  setStageAspect, clearStageAspect, fitStagePlayer, initStagePlayerFit,
   selectOutput, openExpandLightbox, closeExpandLightbox, phosToast,
   animateActive, hide, openOutputsFolder, hideActive,
   useAsExtendSource, useAsUpscaleSource, useAsUpscaleSourcePath, setUpscalePreset,
