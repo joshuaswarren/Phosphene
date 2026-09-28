@@ -288,7 +288,69 @@ def _resolve_tool(name: str, env_var: str) -> Path:
     return Path("/usr/local/bin") / name   # will fail at runtime if missing
 
 
+def _ffmpeg_has_libx264(path: Path) -> bool | None:
+    """Whether this ffmpeg can encode H.264 with libx264. None = can't tell.
+
+    Every export and the engine's own writer pass `-c:v libx264`. A minimal
+    ffmpeg build (conda-forge's LGPL variant, some static builds) has no
+    libx264, runs fine, and fails every one of those with "Unknown encoder
+    'libx264'" — at the END of a render (fleet, 4.16.1: an M4 Max install whose
+    first ffmpeg on PATH was such a build never finished an LTX or H3 render)."""
+    try:
+        out = subprocess.run([str(path), "-hide_banner", "-encoders"],
+                             capture_output=True, text=True, errors="replace",
+                             timeout=10)
+    except Exception:                                      # noqa: BLE001
+        return None
+    if out.returncode != 0:
+        return None
+    return "libx264" in (out.stdout or "")
+
+
+def _ffmpeg_candidates() -> list[Path]:
+    """Every ffmpeg the resolver may pick, in _resolve_tool's order."""
+    cands: list[Path] = []
+    override = os.environ.get("LTX_FFMPEG")
+    if override:
+        cands.append(Path(override))
+    found = shutil.which("ffmpeg")
+    if found:
+        cands.append(Path(found))
+    for d in _pinokio_bin_dirs() + [Path("/opt/homebrew/bin"),
+                                    Path("/usr/local/bin"),
+                                    Path("/opt/local/bin")]:
+        cands.append(d / "ffmpeg")
+    return [c for c in dict.fromkeys(cands) if c.exists()]
+
+
+#: Set when the resolver had to skip an ffmpeg without libx264, or found no
+#: ffmpeg that has it. Printed at boot; None when the first choice was fine.
+FFMPEG_NOTE: str | None = None
+
+
 def _resolve_ffmpeg() -> Path:
+    """First ffmpeg (override, PATH, Pinokio's, Homebrew) that can encode
+    libx264. An ffmpeg whose encoders cannot be listed counts as usable, so a
+    slow or odd probe never costs a working install its ffmpeg; one that lists
+    its encoders and lacks libx264 is skipped. If none has it, the old first
+    match is kept and FFMPEG_NOTE says so at boot."""
+    global FFMPEG_NOTE
+    cands = _ffmpeg_candidates()
+    skipped: list[Path] = []
+    for cand in cands:
+        if _ffmpeg_has_libx264(cand) is False:
+            skipped.append(cand)
+            continue
+        if skipped:
+            FFMPEG_NOTE = (f"skipped {', '.join(map(str, skipped))} (no libx264 "
+                           f"encoder); using {cand}")
+        return cand
+    if skipped:
+        FFMPEG_NOTE = (f"no ffmpeg with the libx264 encoder was found (checked "
+                       f"{', '.join(map(str, skipped))}); exports will fail with "
+                       f"\"Unknown encoder 'libx264'\". Fix: in Pinokio, run "
+                       f"Update, or export LTX_FFMPEG=/path/to/an/ffmpeg that has it.")
+        return skipped[0]
     return _resolve_tool("ffmpeg", "LTX_FFMPEG")
 
 
@@ -307,6 +369,8 @@ FFMPEG_BIN = FFMPEG.parent
 FFPROBE = _resolve_ffprobe(FFMPEG)
 # Say it at boot, the way a missing helper venv is said above: an export that
 # dies 20 minutes into a render is a terrible place to learn this.
+if FFMPEG_NOTE:
+    sys.stderr.write(f"WARN: ffmpeg: {FFMPEG_NOTE}\n")
 if not FFMPEG.exists():
     _looked = ", ".join(str(d) for d in _pinokio_bin_dirs())
     sys.stderr.write(
@@ -29120,6 +29184,7 @@ def run_h3_job_inner(job: dict) -> None:
     _H3_POST_PHASES = ("video_vae_decode", "audio_vae_decode", "encode_mux", "stitch")
     _decode_est = (H3_DECODE_SEC_PER_PX_FRAME * int(width) * int(height)
                    * int(window_frames) * _hw_speed_factor("h3"))
+    _load_est = H3_LOAD_SEC * _h3_speed_factor(chain_windows)
     last_step, total_steps = 0, max(1, steps - 1)
     # Last look before the GPU: a Stop pressed during any of the preparation
     # above (the companion fetch, the reference crop) ends the job here.
@@ -29260,7 +29325,11 @@ def run_h3_job_inner(job: dict) -> None:
                 # clock does not read 0 through a minutes-long VAE decode.
                 later = tot_windows - cur_window
                 left = (total_steps - last_step) + total_steps * later
+                # Each window still to come also pays its staged loads, prompt
+                # encode and adaLN build before its first step (H3_LOAD_SEC in
+                # the cost model); leaving them out undersold a 15 s clip.
                 eta = max(0.0, left * per_step
+                          + _load_est * later
                           + _decode_est * (later + (1 if not post
                                                     or bare_phase == "video_vae_decode"
                                                     else 0)))
@@ -29279,6 +29348,12 @@ def run_h3_job_inner(job: dict) -> None:
                         "pct": min(99.0, pct),
                         "elapsed_sec": elapsed,
                         "eta_sec": eta,
+                        # eta_sec here is the time LEFT, and the Now card
+                        # printed it as "27m 23s / ~18m 21s", which a user read
+                        # as an 18-minute total (Pinokio, 2026-09-20). Handing
+                        # it over as remaining_sec makes the card say
+                        # "27m 23s in · ~18m 21s left".
+                        "remaining_sec": eta if last_step else None,
                         "denoise_step": last_step,
                         "denoise_total": total_steps,
                         "window": cur_window,
