@@ -169,6 +169,37 @@ Exit 0 on both. For a DiT pack, finish with a real loader round-trip on the
 reassembled transformer (`verify_load_ltx_dit` in `scripts/quantize_ltx.py`) —
 sha256 proves the bytes arrived, only the loader proves they are a model.
 
+## 3c. Fleet timings — rebuild before every release
+
+Owner ruling (2026-09-29): every time estimate in the panel should be built
+from what the fleet's own installs actually measured, not just the
+chip-factor cost model. `data/fleet_timings.json` (committed) is a
+snapshot, not live — it goes stale the moment new render_completed events
+land, so it is rebuilt as part of cutting a release, not on some separate
+schedule:
+
+```
+python3 scripts/fleet_timings_build.py
+```
+
+Needs a PostHog personal API key in Settings -> analytics_query_key on the
+Mac running it (the maintainer's own dev panel already has one — see
+`~/pinokio/api/phosphene-dev.git/state/panel_settings.json`, read-only, the
+key is never printed or committed). Queries the last 75 days of
+`render_completed` events, excludes the maintainer's own install by
+`distinct_id`, and writes three levels of real p25/p50/p75 wall-clock data
+(cell / chip family / model-wide) to `data/fleet_timings.json`. Users'
+own panels never query PostHog themselves — they only read the committed
+table, the same way every other bundled data file ships.
+
+Diff the rebuilt file before committing — a release that ran during an
+outage, or against a key that lost access, should not silently ship a
+near-empty table. `test_fleet_timings.py`'s
+`test_the_real_shipped_table_loads_without_raising` is a structural
+sanity check only (schema + the three level names); it cannot catch a
+table that is technically valid but thin, because real data changes every
+rebuild and a value assertion there would fail on the next honest run.
+
 ## 4. Version + compile
 
 ```

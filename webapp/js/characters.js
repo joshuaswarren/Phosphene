@@ -485,6 +485,23 @@ function closeMusicInstallCard() {
   document.getElementById('musicInstallModal').hidden = true;
 }
 
+// VA-01: the Video mode bar's entry point into lip-sync. The chip lives in
+// #modeGroup for discoverability (it was three levels deep: Audio tab →
+// Music video → a folded "One shot (audio → video)" row sharing a name with
+// the unrelated One Shot tab) but the form it opens is still the Audio tab's
+// one-shot composer — that form has its own submit path
+// (audioStudioGenerate → mode=a2v), so this jumps rather than switching
+// #genForm's mode.
+function openLipSyncEntry() {
+  audioModeSet('drive');
+  if (typeof workflowSwitch === 'function') workflowSwitch('audio');
+  const det = document.getElementById('mvOneShotDetails');
+  if (det) det.open = true;
+  requestAnimationFrame(() => {
+    if (det) det.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  });
+}
+
 function audioStudioInit() {
   if (musicComposeActive()) setMainOutputsFilter('audio');
   // The Drive-video pane is the Music video pane now (music.js owns it; the
@@ -498,6 +515,11 @@ function audioStudioInit() {
   // already dragged is left exactly where they put it.
   const _acsEl = document.getElementById('audioConditioningScale');
   if (!_acsEl || _acsEl.dataset.auto) audioConditioningScaleReset();
+  audioStudioRenderLoraNote();
+  audioStudioApplyTierClamp();
+  // VA-06: seed the price on every visit (not just after a slider drag) so
+  // the estimate is on screen before Generate is ever pressed.
+  if (typeof audioStudioDurationChanged === 'function') audioStudioDurationChanged();
   if (AUDIO_STUDIO.wired) return;
   AUDIO_STUDIO.wired = true;
   const audioSlot = document.getElementById('audioStudioAudioSlot');
@@ -529,6 +551,30 @@ function audioStudioInit() {
   audioStudioRenderSlots();
 }
 
+// VA-04: LoRAs the Video tab's picker has active ride into every a2v render
+// (audioStudioGenerate forwards _activeLoras below) with nothing on screen
+// to say so. A face LoRA left over from an earlier character render quietly
+// changes identity on a lip-sync shot with no way to see, remove, or
+// deliberately reproduce it. This is the visibility line — the picker
+// itself stays on the Video tab; "change" jumps there and opens it.
+function audioStudioRenderLoraNote() {
+  const el = document.getElementById('audioStudioLorasNote');
+  if (!el) return;
+  const active = (typeof _activeLoras !== 'undefined' && Array.isArray(_activeLoras)) ? _activeLoras : [];
+  if (!active.length) {
+    el.style.display = 'none';
+    el.innerHTML = '';
+    return;
+  }
+  const names = active.map(l => escapeHtml(l.name || String(l.path || '').split('/').pop())).join(', ');
+  el.style.display = '';
+  el.innerHTML = (active.length === 1 ? '1 LoRA' : active.length + ' LoRAs')
+    + ' from the Video tab will be applied here too: <b>' + names + '</b> — '
+    + '<a href="#" onclick="event.preventDefault();workflowSwitch(\'manual\');'
+    + 'var d=document.getElementById(\'lorasDetails\');if(d)d.open=true;'
+    + 'd&&d.scrollIntoView({block:\'start\'});">change</a>';
+}
+
 async function audioStudioUploadAudio(file) {
   const status = document.getElementById('audioStudioStatus');
   if (status) status.textContent = 'Uploading audio…';
@@ -544,6 +590,21 @@ async function audioStudioUploadAudio(file) {
     AUDIO_STUDIO.audioName = file.name;
     AUDIO_STUDIO.audioDuration = (data.duration_sec != null) ? Number(data.duration_sec) : null;
     audioStudioRenderSlots();
+    // Default the window to the file, not a fixed 7 s (VA-03): a fresh
+    // upload should default Duration to the whole clip (capped at the
+    // slider's own 30 s ceiling) so the common case — one short line —
+    // needs no manual trimming to avoid rendering silence.
+    if (AUDIO_STUDIO.audioDuration != null) {
+      const slider = document.getElementById('audioStudioDuration');
+      if (slider) {
+        // floor(len + 0.25): a 12.9 s file defaults to 13 s (0.1 s of tail,
+        // under the silent-tail threshold below), a 12.6 s file to 12 s —
+        // never a whole extra second of silence (4.17.0 render check).
+        const target = Math.max(1, Math.min(30, Math.floor(AUDIO_STUDIO.audioDuration + 0.25)));
+        slider.value = String(target);
+      }
+    }
+    audioStudioDurationChanged();
     if (status) status.textContent = '';
   } catch (e) {
     if (status) status.textContent = 'Audio upload failed: ' + (e.message || 'unknown');
@@ -555,6 +616,42 @@ async function audioStudioUploadAudio(file) {
 // component (key='a2v_image'). pickerUploadFile + pickerSetImage now
 // handle upload and clear, and the hidden input #a2v_image carries the
 // path that audioStudioGenerate() reads.
+
+// Open-mouth anchor check (build item 3 of the "Keyframe + lip-sync"
+// section, report_video-advanced.txt). The 2026-09-22 anchor lesson: a
+// strength-1.0 frame-0 anchor cut from an open-mouth still freezes the
+// performance open-mouthed for the whole clip — "mouth open, doesn't move,
+// doesn't sing" was the owner's exact report. Called from queue.js's
+// pickerSetImage() whenever the a2v_image picker gets a new (or cleared)
+// path; a crop preview belongs on the SAME picker tile (VA-02, the
+// size-faces package) — this only owns the openness verdict line under it.
+function audioStudioMouthCheck(path) {
+  const warn = document.getElementById('audioStudioMouthWarn');
+  if (!warn) return;
+  if (!path) { warn.style.display = 'none'; warn.innerHTML = ''; return; }
+  warn.style.display = '';
+  warn.style.color = '';
+  warn.textContent = 'Checking the mouth in this picture…';
+  fetch('/a2v/mouth_check', { method: 'POST', body: new URLSearchParams({ image: path }) })
+    .then(r => r.json())
+    .then(res => {
+      // A picker change while the request was in flight — don't overwrite
+      // a newer check's result with a stale one.
+      const current = (document.getElementById('a2v_image') || {}).value;
+      if (current !== path) return;
+      if (!res.ok || !res.measured) { warn.style.display = 'none'; warn.innerHTML = ''; return; }
+      if (res.open) {
+        warn.style.color = 'var(--warn,#c98a2b)';
+        warn.innerHTML = 'This picture’s mouth looks open — lip-sync tends to '
+          + 'freeze on an open-mouth start frame. A closed-mouth, face-forward '
+          + 'picture works better.';
+      } else {
+        warn.style.display = 'none';
+        warn.innerHTML = '';
+      }
+    })
+    .catch(() => { warn.style.display = 'none'; warn.innerHTML = ''; });
+}
 
 function audioStudioClearAudio() {
   AUDIO_STUDIO.audioPath = null;
@@ -644,6 +741,63 @@ function _a2vFramesForSeconds(sec) {
   const target = Math.max(1, Math.round(sec * 24));
   return ((target - 1 + 7) >> 3 << 3) + 1;   // round up to 8k+1
 }
+// VA-06: A2V showed no time estimate before a 10-25 minute render — the
+// #audioStudioEstimate span existed in the markup and nothing wrote to it.
+// Priced server-side (GET /a2v/estimate -> ltx_a2v_estimate_minutes), from
+// the lane that actually runs (Q8 two-stage vs Q4 distilled) and the real
+// clamped canvas, the same way the Video tab and One Shot already price a
+// render before Generate. Debounced + sequence-guarded (osEstimate's
+// pattern in oneshot.js) since duration is a drag slider that fires on
+// every tick.
+let _a2vEstimateSeq = 0;
+let _a2vEstimateTimer = null;
+function a2vUpdateEstimate(frames, w, h) {
+  const el = document.getElementById('audioStudioEstimate');
+  if (!el) return;
+  el.textContent = 'pricing…';
+  clearTimeout(_a2vEstimateTimer);
+  const seq = ++_a2vEstimateSeq;
+  _a2vEstimateTimer = setTimeout(async () => {
+    try {
+      const r = await fetch(`/a2v/estimate?frames=${frames}&width=${w}&height=${h}`);
+      const d = await r.json();
+      if (seq !== _a2vEstimateSeq) return;
+      if (!d.ok) { el.textContent = ''; return; }
+      const pack = d.pack === 'q8' ? 'Q8' : 'Q4';
+      el.textContent = `${d.width}×${d.height} · ${pack} · about ${String(d.eta).replace(/^~\s*/, '')} on this Mac`;
+    } catch (e) {
+      if (seq === _a2vEstimateSeq) el.textContent = '';
+    }
+  }, 150);
+}
+// VA-35: on Compact tier (t2v_max_dim, e.g. 768) the A2V form used to show
+// and price the size the user typed (e.g. 1024×576) while the server
+// silently clamped to the tier cap at render time — the canvas warning
+// below was then computed on the wrong number too. Runs once per Audio-tab
+// visit: sets the Width/Height inputs' max attribute and pulls down any
+// value that already exceeds it (same proportional-fit shape as the
+// server's ltx_fit_canvas), so what's on screen is what will render.
+function audioStudioApplyTierClamp() {
+  const cap = ((BOOT || {}).tier || {}).t2v_max_dim || 0;
+  if (!cap) return;
+  const wEl = document.getElementById('audioStudioWidth');
+  const hEl = document.getElementById('audioStudioHeight');
+  if (!wEl || !hEl) return;
+  wEl.max = String(cap);
+  hEl.max = String(cap);
+  const w = parseInt(wEl.value || '1024', 10);
+  const h = parseInt(hEl.value || '576', 10);
+  if (Math.max(w, h) > cap) {
+    const scale = cap / Math.max(w, h);
+    wEl.value = String(Math.max(32, Math.round((w * scale) / 32) * 32));
+    hEl.value = String(Math.max(32, Math.round((h * scale) / 32) * 32));
+    if (typeof phosToast === 'function') {
+      phosToast(`This Mac renders Audio → Video up to ${cap} px on the longer side — size adjusted to fit.`,
+                { kind: 'info' });
+    }
+  }
+}
+
 function audioStudioDurationChanged(val) {
   const slider = document.getElementById('audioStudioDuration');
   // Called with no argument from the Width/Height inputs, so the canvas and
@@ -652,25 +806,69 @@ function audioStudioDurationChanged(val) {
                         : (slider ? slider.value : '7')) || '7', 10);
   const out = document.getElementById('audioStudioDurationVal');
   if (out) out.textContent = sec + ' s';
-  const warn = document.getElementById('audioStudioDurationWarn');
-  if (!warn) return;
   const frames = _a2vFramesForSeconds(sec);
   const w = parseInt((document.getElementById('audioStudioWidth') || {}).value || '1024', 10);
   const h = parseInt((document.getElementById('audioStudioHeight') || {}).value || '576', 10);
+  if (typeof a2vUpdateEstimate === 'function') a2vUpdateEstimate(frames, w, h);
+  const warn = document.getElementById('audioStudioDurationWarn');
+  if (!warn) return;
   const area = (w > 0 && h > 0) ? w * h : 1024 * 576;
+  // THE WINDOW VS THE FILE (VA-03). Duration and Audio start used to be
+  // free-floating numbers with no idea how long the uploaded file actually
+  // is — a 4 s vocal silently rendered 7 s, 43% of it silence, which is
+  // exactly where a lip-sync mouth freezes. Now that /upload returns
+  // duration_sec, warn (start+duration past the end) or refuse outright
+  // (start already past the end — nothing would play at all).
+  const startEl = document.getElementById('audioStudioStart');
+  const startSec = Math.max(0, parseFloat((startEl && startEl.value) || '0') || 0);
+  if (AUDIO_STUDIO.audioDuration != null) {
+    const fileLen = AUDIO_STUDIO.audioDuration;
+    if (startSec >= fileLen) {
+      warn.style.display = '';
+      warn.innerHTML = '<b>Start at</b> (' + startSec.toFixed(1) + ' s) is past '
+        + 'the end of this file (' + fileLen.toFixed(1) + ' s long) — this would '
+        + 'render a fully silent clip. Pick a start under ' + fileLen.toFixed(1) + ' s.';
+      return;
+    }
+  }
   // A MEMORY LIMIT COMES FIRST. On a Compact-tier Mac the panel refuses an
   // a2v render past BOOT.a2v_max_frames (see a2v_max_frames() server-side):
   // a 30 s clip on an 8 GB Mac died in the GPU watchdog instead. Say so here,
   // before Generate, with the same number the worker refuses on.
+  // 4.17.0 render check: this used to sit AFTER the silent-tail note, so a
+  // 12.9 s song defaulted to 13 s on a 32 GB Mac showed "the last 0.1 s
+  // renders against silence" and never the cap or its Split link — the one
+  // action that renders the song on that Mac. A refusal outranks a nuance.
   const a2vCap = (BOOT && BOOT.a2v_max_frames) || 0;
   if (a2vCap && frames > a2vCap) {
     const capSec = Math.round((a2vCap - 1) / 24);
     warn.style.display = '';
+    // VA-30: was a manual-chore instruction only ("set Start at to 0, N,
+    // 2N... and join them in the Editor"). "Split into clips" queues the
+    // whole song as a sequence, each part after the first anchored on the
+    // previous part's own most-closed-mouth frame (the "Continue the song"
+    // primitive, build item 2) — no jump cuts at the joins, no hand math.
     warn.innerHTML = 'This Mac renders Audio → Video up to <b>' + capSec
       + ' s</b> per clip — longer ones outgrow its memory and are refused. '
-      + 'Render the song as ' + capSec + ' s clips (set <b>Start at</b> to 0, '
-      + capSec + ', ' + (2 * capSec) + ' …) and join them in the Editor.';
+      + '<a href="#" onclick="event.preventDefault();audioStudioSplitIntoClips(' + capSec + ');">'
+      + 'Split into ' + capSec + ' s clips</a> — queues the whole song as a '
+      + 'sequence, each part starting where the last one’s mouth closed, '
+      + 'no jump cuts at the joins. One at a time; this Mac’s own a2v speed '
+      + 'applies per part, so a long song is a long wait, not a fast one.';
     return;
+  }
+  if (AUDIO_STUDIO.audioDuration != null) {
+    const fileLen = AUDIO_STUDIO.audioDuration;
+    // Under a quarter second of tail is the rounding of a whole-second
+    // slider, not a clip that "renders against silence".
+    if (startSec + sec > fileLen + 0.25) {
+      const silentTail = (startSec + sec - fileLen).toFixed(1);
+      warn.style.display = '';
+      warn.innerHTML = 'The last <b>' + silentTail + ' s</b> of this clip render '
+        + 'against silence (the file ends at ' + fileLen.toFixed(1) + ' s) — the '
+        + 'mouth will stop there. Shorten Duration or move Start at earlier.';
+      return;
+    }
   }
   // THE CANVAS IS THE LEVER, NOT THE LENGTH. Below the knee the reports run
   // clean to 721 frames, so there is nothing to say; above it they give out
@@ -695,6 +893,45 @@ function audioStudioDurationChanged(val) {
   }
 }
 
+// VA-05 (client half): "this freezes the mouth — Fix" for the lip-sync
+// prompt box. Debounced (400ms) so it doesn't fire a request per keystroke.
+// The server-side pass (storyboard.a2v_prompt in run_job_inner) is the real
+// safety net and runs unconditionally on every a2v render; this is purely a
+// before-you-render heads-up.
+let _a2vPromptCheckTimer = null;
+function audioStudioPromptCheck() {
+  clearTimeout(_a2vPromptCheckTimer);
+  _a2vPromptCheckTimer = setTimeout(_audioStudioPromptCheckNow, 400);
+}
+async function _audioStudioPromptCheckNow() {
+  const ta = document.getElementById('audioStudioPrompt');
+  const warn = document.getElementById('audioStudioPromptWarn');
+  if (!ta || !warn) return;
+  const text = ta.value;
+  if (!text.trim()) { warn.style.display = 'none'; warn.innerHTML = ''; return; }
+  try {
+    const r = await fetch('/a2v/prompt_check', { method: 'POST', body: new URLSearchParams({ prompt: text }) });
+    const res = await r.json();
+    if (!res.ok || !res.problems || !res.problems.length) {
+      warn.style.display = 'none';
+      warn.innerHTML = '';
+      return;
+    }
+    const phrases = res.problems.map(p => '"' + escapeHtml(p) + '"').join(', ');
+    warn.style.display = '';
+    warn.innerHTML = 'This freezes the mouth: ' + phrases
+      + ' — audio-driven clips read stillness language as "nothing moves, '
+      + 'including the lips." <a href="#" onclick="event.preventDefault();audioStudioPromptApplyFix(' + JSON.stringify(res.cleaned) + ');">Fix</a>';
+  } catch (e) { /* best-effort — the server-side pass is the real gate */ }
+}
+function audioStudioPromptApplyFix(cleaned) {
+  const ta = document.getElementById('audioStudioPrompt');
+  if (!ta) return;
+  ta.value = cleaned;
+  const warn = document.getElementById('audioStudioPromptWarn');
+  if (warn) { warn.style.display = 'none'; warn.innerHTML = ''; }
+}
+
 async function audioStudioEnhancePrompt() {
   const ta = document.getElementById('audioStudioPrompt');
   const original = ta.value.trim();
@@ -702,9 +939,16 @@ async function audioStudioEnhancePrompt() {
   const btn = document.getElementById('audioStudioEnhanceBtn');
   const originalLabel = btn.innerHTML;
   btn.disabled = true;
-  btn.innerHTML = '<svg class="ph" aria-hidden="true" style="margin-right:6px;vertical-align:-2px"><use href="#ph-sparkle-fill"/></svg>Loading Gemma\u2026 (~15s)';
+  // VC-23: same plain-English swap as queue.js's enhancePrompt().
+  btn.innerHTML = '<svg class="ph" aria-hidden="true" style="margin-right:6px;vertical-align:-2px"><use href="#ph-sparkle-fill"/></svg>Loading the prompt helper\u2026 (~15s)';
   try {
-    const r = await fetch('/prompt/enhance', { method: 'POST', body: new URLSearchParams({ prompt: original, mode: 't2v' }) });
+    // VA-24: was mode 't2v' — that Gemma system prompt asks for "describe
+    // the scene AND the sound", which competes with the actual conditioning
+    // audio, and readily writes stillness phrasing ("a static shot") that
+    // freezes the mouth. mode 'a2v' (routes_queue.py) borrows the i2v system
+    // prompt instead and runs the result through the same stillness-cleanup
+    // + word-cap every other a2v prompt goes through.
+    const r = await fetch('/prompt/enhance', { method: 'POST', body: new URLSearchParams({ prompt: original, mode: 'a2v' }) });
     const res = await r.json();
     if (res.error) { alert('Enhance failed: ' + res.error); return; }
     if (confirm('Original:\n' + res.original + '\n\nEnhanced:\n' + res.enhanced + '\n\nReplace your prompt with the enhanced version?'))
@@ -736,17 +980,21 @@ function audioConditioningScaleReset() {
   const el = document.getElementById('audioConditioningScale');
   if (!el) return;
   el.dataset.auto = '1';
+  const isQ4 = window.PHOSPHENE_CAP_TIER === 'q4';
+  // VA-19: on Q8, 1.0 is exactly "audio guidance off" and below 1.0 inverts
+  // the term — a user dragging the thumb "down a bit" from Auto's 3.0 could
+  // land in that dead zone with no warning. Q8's floor moves up to 1.5 so
+  // the slider itself cannot reach the off point; Q4 has no such trap.
+  el.min = isQ4 ? '0.5' : '1.5';
   el.value = String(a2vLaneAudioScale());
   const out = document.getElementById('audioConditioningScaleVal');
   if (out) out.textContent = 'Auto';
   const hint = document.getElementById('audioConditioningScaleHint');
   if (hint) {
-    hint.textContent = 'Auto is ' + a2vLaneAudioScale().toFixed(1)
-      + ' on this Mac (' + (window.PHOSPHENE_CAP_TIER === 'q4' ? 'Q4' : 'Q8')
-      + ' pipeline) — the engine\'s own setting. Higher = stronger audio '
-      + 'adhesion, lower visual flexibility.'
-      + (window.PHOSPHENE_CAP_TIER === 'q4' ? ''
-         : ' On this lane 1.0 switches audio guidance off.');
+    hint.textContent = 'How hard the mouth follows the audio. Auto is best '
+      + 'for most clips — it picks the right value for this Mac\'s render '
+      + 'lane (' + (isQ4 ? 'Q4' : 'Q8') + '). Drag right for tighter sync, '
+      + 'left for more visual freedom.';
   }
 }
 
@@ -768,7 +1016,22 @@ function a2vLoadParams(p) {
   audioModeSet('drive');
   if (typeof workflowSwitch === 'function') workflowSwitch('audio');
   const det = document.getElementById('mvOneShotDetails');
-  if (det) det.open = true;
+  if (det) {
+    det.open = true;
+    // VA-10: opening the details left the restored form below the fold —
+    // the data landed correctly, the user just never scrolled down far
+    // enough to see it. Scroll it into view and give it the same brief
+    // pulse the Params flash uses elsewhere (.flash / phos-tab-flash).
+    // setTimeout(…, 0), not requestAnimationFrame: the JS test harness
+    // (scripts/extract_panel_js.py) runs this in plain node, which has no
+    // rAF. Either defers past the details' own reflow from `open = true`
+    // just above, which is all this needs.
+    setTimeout(() => {
+      try { det.scrollIntoView({ block: 'start', behavior: 'smooth' }); } catch (e) { try { det.scrollIntoView(); } catch (e2) {} }
+      det.classList.add('flash');
+      setTimeout(() => det.classList.remove('flash'), 1200);
+    }, 0);
+  }
   audioStudioRenderSlots();
   const setVal = (id, v) => {
     const el = document.getElementById(id);
@@ -790,6 +1053,10 @@ function a2vLoadParams(p) {
   }
   if (typeof pickerSetImage === 'function') {
     pickerSetImage('a2v_image', p.image ? String(p.image) : '', { snapAspect: false });
+    // The lip-sync picture's saved crop framing (VA-02), not the last one's.
+    if (typeof _setCropFocus === 'function' && typeof _cropFocusFromParams === 'function') {
+      _setCropFocus('a2v_image', _cropFocusFromParams(p));
+    }
   }
   const acs = p.audio_conditioning_scale;
   const acsEl = document.getElementById('audioConditioningScale');
@@ -806,12 +1073,224 @@ function a2vLoadParams(p) {
   } else {
     audioConditioningScaleReset();
   }
+  // LIPSYNC-10: "Listen to the voice only" as the clip was made — Generate
+  // and Continue the song submit this checkbox. Same accepted values as the
+  // server's a2v_conditioning_audio(); an explicit vocal stem (a music-video
+  // shot) also means the model listened to the voice alone. A sidecar
+  // without the field predates the control and rendered the full mix.
+  const stemEl = document.getElementById('audioStudioStemAuto');
+  if (stemEl) {
+    const autoOn = ['1', 'true', 'on', 'yes'].includes(String(p.audio_stem_auto ?? '').trim().toLowerCase());
+    stemEl.checked = autoOn || !!String(p.audio_stem || '').trim();
+  }
+  audioStudioRenderLoraNote();
 }
 
-async function audioStudioGenerate() {
+// VA-07: Draft · Final. Draft renders the first ~3s of the CHOSEN window at
+// full settings — same seed, same image, same audio start, same prompt —
+// so "does this picture and prompt move the mouth?" costs about 3 min
+// instead of the full 10-25. Final is the same recipe at the full duration
+// the Duration slider still shows (Draft does not touch it). The pairing
+// is seed-locked: Draft resolves a random seed (-1) to a concrete number
+// and writes it back into the Seed field, so Final — pressed after —
+// reproduces the same take, just longer, rather than drawing a new one.
+// VA-30: "Split into N clips" — queues the WHOLE song as a sequence of a2v
+// jobs on a Compact-tier Mac (a2v_max_frames cap), one at a time, each part
+// after the first anchored on the previous part's own most-closed-mouth
+// frame (the "Continue the song" primitive above — /a2v/continue_song) so
+// the joins don't show a mid-syllable jump. This is a real client-side
+// orchestration loop, not a server job: it takes as long as N a2v renders
+// take (each 10-25 min on this Mac's own a2v speed), and the tab has to
+// stay open for it. NEEDS RENDER CHECK (see ledger_lipsync.txt): the
+// single-clip a2v path and /a2v/continue_song are both already exercised
+// elsewhere; the multi-part CHAIN — does part 2's anchor really read back
+// cleanly after part 1 is on disk, N times in a row — has not been proven
+// against a real render.
+let _a2vSplitCancel = false;
+// LIPSYNC-7: one split chain at a time. AUDIO_STUDIO.busy only covers a single
+// submit; a second Split (or a double-activated link) used to start a second
+// chain that queued duplicate parts and reset the first one's cancel flag.
+let _a2vSplitRunning = false;
+function audioStudioSplitCancel() { _a2vSplitCancel = true; }
+async function _waitForJob(jobId, onProgress) {
+  const started = Date.now();
+  const timeoutMs = 40 * 60 * 1000;   // generous over the measured 10-25 min a2v ceiling
+  while (Date.now() - started < timeoutMs) {
+    if (_a2vSplitCancel) return { status: 'cancelled' };
+    try {
+      const r = await fetch('/status');
+      const s = await r.json();
+      const all = [].concat(s.current ? [s.current] : [], s.queue || [], s.history || []);
+      const job = all.find(j => j && j.id === jobId);
+      if (job) {
+        if (job.status === 'done') return { status: 'done', output_path: job.output_path };
+        if (job.status === 'failed' || job.status === 'error') return { status: job.status, error: job.error };
+        if (job.status === 'stopped' || job.status === 'cancelled') return { status: job.status };
+        if (onProgress) onProgress(job.status === 'running' ? 'rendering…' : 'queued…');
+      }
+    } catch (e) { /* transient network hiccup — keep polling */ }
+    await new Promise(res => setTimeout(res, 4000));
+  }
+  return null;   // timed out
+}
+async function audioStudioSplitIntoClips(capSec) {
+  if (_a2vSplitRunning) {
+    if (typeof phosToast === 'function') {
+      phosToast('A split is already running — Stop it first, or wait for it to finish.', { kind: 'warning' });
+    }
+    return;
+  }
+  if (AUDIO_STUDIO.busy) { alert('Wait for the current render to finish first.'); return; }
+  const totalDur = AUDIO_STUDIO.audioDuration;
+  if (!totalDur) {
+    alert('This file’s length is not known yet — wait for the upload to finish, or re-drop it.');
+    return;
+  }
+  const startEl = document.getElementById('audioStudioStart');
+  const fromSec = Math.max(0, parseFloat((startEl && startEl.value) || '0') || 0);
+  const remaining = totalDur - fromSec;
+  if (remaining <= 0) { alert('Start at is already past the end of this file.'); return; }
+  const n = Math.max(1, Math.ceil(remaining / capSec));
+  if (!confirm('Queue ' + n + ' clips of up to ' + capSec + 's each, one at a time — '
+    + 'this Mac’s own a2v speed applies per part, so this can take a while. Continue?')) return;
+  // Taken BEFORE the first await and released in finally — a second call
+  // returns above without touching this chain's cancel flag.
+  _a2vSplitRunning = true;
+  _a2vSplitCancel = false;
+  try {
+    await _a2vSplitChain(capSec, totalDur, fromSec, n);
+  } finally {
+    _a2vSplitRunning = false;
+  }
+}
+async function _a2vSplitChain(capSec, totalDur, fromSec, n) {
+  const status = document.getElementById('audioStudioStatus');
+  const w = Math.max(32, Math.round(parseInt(document.getElementById('audioStudioWidth').value || '1024', 10) / 32) * 32);
+  const h = Math.max(32, Math.round(parseInt(document.getElementById('audioStudioHeight').value || '576', 10) / 32) * 32);
+  const prompt = (document.getElementById('audioStudioPrompt').value || '').trim() || 'A performer sings to camera.';
+  const a2vImageEl = document.getElementById('a2v_image');
+  let imagePath = (a2vImageEl && a2vImageEl.value) || '';
+  // LIPSYNC-6: the same request settings Generate sends. The picked
+  // picture's crop position applies to the FIRST part only — later parts
+  // anchor on a frame of the previous clip, already at the output size.
+  const focusEl = document.getElementById('a2v_image_crop_focus');
+  let cropFocus = imagePath ? ((focusEl && focusEl.value) || '0.5') : '';
+  const lorasJson = (typeof _activeLoras !== 'undefined' && Array.isArray(_activeLoras) && _activeLoras.length)
+    ? JSON.stringify(_activeLoras.map(l => ({ path: l.path, strength: l.strength })))
+    : '';
+  const acsEl = document.getElementById('audioConditioningScale');
+  const audioConditioningScale = (acsEl && !acsEl.dataset.auto) ? parseFloat(acsEl.value) : null;
+  const stemAutoEl = document.getElementById('audioStudioStemAuto');
+  const stemAuto = !!(stemAutoEl && stemAutoEl.checked);
+  // LIPSYNC-4: each closed-mouth anchor sits a little before its part's end,
+  // so the parts overlap and the song needs MORE parts than the first
+  // estimate. Loop until the rendered audio reaches the end of the file; `n`
+  // is re-estimated as it goes. A non-advancing anchor falls back to the
+  // plain cut, and a hard ceiling stops any runaway.
+  const EPS = 0.05;
+  const maxParts = 2 * n + 2;
+  let nextStart = fromSec;
+  let done = 0;
+  while (nextStart < totalDur - EPS) {
+    const i = done;
+    n = Math.max(n, i + Math.ceil((totalDur - nextStart - EPS) / capSec));
+    if (_a2vSplitCancel) { if (status) status.textContent = 'Split stopped after part ' + i + ' of ' + n + '.'; return; }
+    if (i >= maxParts) break;
+    const partDur = Math.min(capSec, totalDur - nextStart);
+    const frames = _a2vFramesForSeconds(partDur);
+    if (status) status.textContent = 'Queueing part ' + (i + 1) + ' of ' + n + ' ('
+      + nextStart.toFixed(1) + 's–' + (nextStart + partDur).toFixed(1) + 's)…';
+    const fd = new URLSearchParams();
+    fd.set('mode', 'a2v');
+    fd.set('prompt', prompt);
+    fd.set('audio', AUDIO_STUDIO.audioPath);
+    if (imagePath) {
+      fd.set('image', imagePath);
+      if (cropFocus) fd.set('image_crop_focus', cropFocus);
+    }
+    fd.set('width', String(w));
+    fd.set('height', String(h));
+    fd.set('frames', String(frames));
+    fd.set('seed', '-1');
+    if (audioConditioningScale !== null && !Number.isNaN(audioConditioningScale)) {
+      fd.set('audio_conditioning_scale', String(audioConditioningScale));
+    }
+    fd.set('audio_start_time', String(nextStart));
+    if (stemAuto) fd.set('audio_stem_auto', 'on');
+    fd.set('quality', 'high');
+    fd.set('accel', 'off');
+    fd.set('enhance', 'off');
+    if (lorasJson) fd.set('loras', lorasJson);
+    fd.set('preset_label', 'Split ' + (i + 1) + '/' + n);
+    let jobId;
+    try {
+      const r = await fetch('/queue/add', { method: 'POST', body: fd });
+      const res = await r.json().catch(() => ({}));
+      if (!r.ok || res.error) throw new Error(res.error || ('HTTP ' + r.status));
+      jobId = res.id;
+    } catch (e) {
+      const msg = 'Part ' + (i + 1) + ' failed to queue: ' + (e.message || e)
+        + ' — ' + i + ' clip(s) already rendered are safe in Outputs.';
+      if (status) status.textContent = msg;
+      if (typeof phosToast === 'function') phosToast(msg, { kind: 'danger', duration: 8000 });
+      return;
+    }
+    const result = await _waitForJob(jobId, (msg) => {
+      if (status) status.textContent = 'Part ' + (i + 1) + ' of ' + n + ': ' + msg;
+    });
+    if (!result || result.status !== 'done' || !result.output_path) {
+      const msg = 'Part ' + (i + 1) + ' did not finish (' + ((result && result.error) || result?.status || 'timed out')
+        + ') — ' + i + ' clip(s) already rendered are safe in Outputs.';
+      if (status) status.textContent = msg;
+      if (typeof phosToast === 'function') phosToast(msg, { kind: 'danger', duration: 8000 });
+      return;
+    }
+    done = i + 1;
+    const partEnd = nextStart + partDur;
+    if (partEnd < totalDur - EPS) {
+      // Anchor the NEXT part on THIS part's own closed-mouth frame — the
+      // same primitive "Continue the song" uses — instead of a naive fixed
+      // cut, so the joins don't show a mid-syllable jump. Falls back to the
+      // naive cut (still correct, just un-anchored) if the probe fails or
+      // the anchor would not move the song forward.
+      let anchored = false;
+      try {
+        const cr = await fetch('/a2v/continue_song', { method: 'POST', body: new URLSearchParams({ clip: result.output_path }) });
+        const cres = await cr.json();
+        const at = Number(cres && cres.audio_start_time);
+        if (cres && cres.ok && cres.anchor_image && Number.isFinite(at)
+            && at > nextStart + EPS && at <= partEnd + EPS) {
+          imagePath = cres.anchor_image;
+          cropFocus = '';
+          nextStart = at;
+          anchored = true;
+        }
+      } catch (e) { /* fall through to the plain cut */ }
+      if (!anchored) nextStart = partEnd;
+    } else {
+      nextStart = partEnd;
+    }
+    if (typeof poll === 'function') poll();
+  }
+  if (nextStart < totalDur - EPS) {
+    const msg = 'Split stopped after ' + done + ' clips at ' + nextStart.toFixed(1)
+      + 's — the rest of the song was not queued. The clips made are safe in Outputs.';
+    if (status) status.textContent = msg;
+    if (typeof phosToast === 'function') phosToast(msg, { kind: 'danger', duration: 8000 });
+    return;
+  }
+  if (status) status.textContent = 'Split into ' + done + ' clips done — join them in the Editor.';
+  if (typeof phosToast === 'function') {
+    phosToast('Split into ' + done + ' clips finished — join them in the Editor.', { kind: 'success' });
+  }
+}
+
+async function audioStudioGenerate(opts) {
+  opts = opts || {};
+  const draft = !!opts.draft;
   if (AUDIO_STUDIO.busy) return;
   const status = document.getElementById('audioStudioStatus');
-  const btn = document.getElementById('audioStudioGenBtn');
+  const btn = document.getElementById(draft ? 'audioStudioDraftBtn' : 'audioStudioGenBtn');
   const prompt = (document.getElementById('audioStudioPrompt').value || '').trim();
   if (!AUDIO_STUDIO.audioPath) {
     if (status) status.textContent = 'Audio file is required.';
@@ -825,10 +1304,20 @@ async function audioStudioGenerate() {
   // (LTX latent grid requirement).
   const w = Math.max(32, Math.round(parseInt(document.getElementById('audioStudioWidth').value || '1024', 10) / 32) * 32);
   const h = Math.max(32, Math.round(parseInt(document.getElementById('audioStudioHeight').value || '576', 10) / 32) * 32);
-  // Duration from slider → frames at 8k+1 cadence the model expects.
+  // Duration from slider → frames at 8k+1 cadence the model expects. Draft
+  // clamps the SUBMITTED frame count only — the slider itself is left
+  // alone, so it still shows the length Final will use.
   const dur = parseInt(document.getElementById('audioStudioDuration').value || '7', 10);
-  const frames = _a2vFramesForSeconds(dur);
-  const seed = parseInt(document.getElementById('audioStudioSeed').value || '-1', 10);
+  const frames = _a2vFramesForSeconds(draft ? Math.min(3, dur) : dur);
+  const seedEl = document.getElementById('audioStudioSeed');
+  let seed = parseInt((seedEl && seedEl.value) || '-1', 10);
+  if (draft && (!Number.isFinite(seed) || seed < 0)) {
+    // Resolve -1 to a concrete seed NOW, client-side, and write it back —
+    // Final needs to see the same number Draft is about to render with,
+    // and the server would otherwise draw its own random seed per job.
+    seed = Math.floor(Math.random() * 2147483647);
+    if (seedEl) seedEl.value = String(seed);
+  }
   // Auto = do not send the field at all; see audioConditioningScaleChanged.
   const acsEl = document.getElementById('audioConditioningScale');
   const audioConditioningScale = (acsEl && !acsEl.dataset.auto)
@@ -838,6 +1327,14 @@ async function audioStudioGenerate() {
   // a negative start would be silently swallowed by load_audio.
   const audioStartEl = document.getElementById('audioStudioStart');
   const audioStart = Math.max(0, parseFloat((audioStartEl && audioStartEl.value) || '0') || 0);
+  // VA-03: a start past the end of the known file renders pure silence —
+  // refuse it the same way the missing-audio / missing-prompt checks do,
+  // rather than spend 10-25 minutes finding out.
+  if (AUDIO_STUDIO.audioDuration != null && audioStart >= AUDIO_STUDIO.audioDuration) {
+    if (status) status.textContent = 'Start at (' + audioStart.toFixed(1)
+      + ' s) is past the end of this file (' + AUDIO_STUDIO.audioDuration.toFixed(1) + ' s).';
+    return;
+  }
 
   AUDIO_STUDIO.busy = true;
   if (btn) btn.disabled = true;
@@ -852,7 +1349,12 @@ async function audioStudioGenerate() {
     fd.set('mode', 'a2v');
     fd.set('prompt', prompt);
     fd.set('audio', AUDIO_STUDIO.audioPath);
-    if (a2vImagePath) fd.set('image', a2vImagePath);
+    if (a2vImagePath) {
+      fd.set('image', a2vImagePath);
+      // VA-02: the crop-preview overlay's drag position for this picker.
+      const focusEl = document.getElementById('a2v_image_crop_focus');
+      fd.set('image_crop_focus', (focusEl && focusEl.value) || '0.5');
+    }
     fd.set('width', String(w));
     fd.set('height', String(h));
     fd.set('frames', String(frames));
@@ -861,6 +1363,9 @@ async function audioStudioGenerate() {
       fd.set('audio_conditioning_scale', String(audioConditioningScale));
     }
     fd.set('audio_start_time', String(audioStart));
+    // VA-21: vocal-stem seam, exposed on the manual form for the first time.
+    const stemAutoEl = document.getElementById('audioStudioStemAuto');
+    if (stemAutoEl && stemAutoEl.checked) fd.set('audio_stem_auto', 'on');
     fd.set('quality', 'high');  // A2V is always pipeline-class (Q8 dev or Q4 distilled)
     // No accel, no enhance — A2V uses A2VidPipelineTwoStage's own walks.
     fd.set('accel', 'off');
@@ -870,14 +1375,21 @@ async function audioStudioGenerate() {
       const slim = _activeLoras.map(l => ({ path: l.path, strength: l.strength }));
       fd.set('loras', JSON.stringify(slim));
     }
+    fd.set('preset_label', (draft ? 'Draft' : (prompt.slice(0, 40) || 'Lip-sync')));
     const r = await fetch('/queue/add', { method: 'POST', body: fd });
     if (!r.ok) {
       const txt = await r.text();
       throw new Error('HTTP ' + r.status + ' ' + txt);
     }
-    if (status) status.textContent = 'Submitted. Watch Now / Recent.';
+    if (status) {
+      status.textContent = draft
+        ? 'Draft queued (~3s, same seed) — check the mouth, then Generate the full clip.'
+        : 'Submitted. Watch Now / Recent.';
+    }
     if (typeof phosToast === 'function') {
-      phosToast('Queued Audio → Video clip · watch Now', { kind: 'success' });
+      phosToast(draft
+        ? 'Draft queued · ~3s at this seed — watch Now, then Generate for the full clip'
+        : 'Queued Audio → Video clip · watch Now', { kind: 'success' });
     }
     const nowTab = document.querySelector('.tabs button[data-tab="now"]');
     if (nowTab) {
@@ -1045,11 +1557,20 @@ function trainUpdatePresetNote() {
       'and no preset on this machine can reach it. Expect a weak adapter and treat the result as a look rather than an identity — that is the hardware, not your photos.';
     return;
   }
+  // SYS-15: this used to lead with raw delta_rms numbers (lab jargon a
+  // creator can't act on) while they were still picking a preset. Outcome
+  // language up front; the measurement stays available for anyone who
+  // wants it (or is filing a bug report) behind a details disclosure,
+  // same pattern as the Now-card's own "Details for troubleshooting".
   el.innerHTML =
     '<strong>High is the only recipe ever graded on a face.</strong> ' +
-    'Measured with <code>lora_compat.py</code>, rank-32 adapters that carry an identity sit at 5.4e-04 to 1.6e-03 delta_rms; ' +
-    'Quick\'s rank 8 has measured 1.54e-04 and 1.98e-04 on real datasets, at or under the 2.0e-04 floor no working adapter has been below. ' +
-    'Pick Quick for a fast look or a style, not for a person.';
+    'Pick Quick for a fast look or a style, not for a person — it has not ' +
+    'held an identity in any measured run. ' +
+    '<details class="h3-diag"><summary>Measured numbers</summary>' +
+    '<p>Measured with <code>lora_compat.py</code>: rank-32 (High) adapters ' +
+    'that carry an identity sit at 5.4e-04 to 1.6e-03 delta_rms. Quick\'s ' +
+    'rank 8 has measured 1.54e-04 and 1.98e-04 on real datasets — at or ' +
+    'under the 2.0e-04 floor no working adapter has been below.</p></details>';
 }
 
 function trainDisableSelectAbove(selectId, maxValue) {
@@ -1819,7 +2340,45 @@ async function charactersLoadParams(p) {
 const TRAIN_MIN = Number(BOOT.train_min_images || 15);
 const TRAIN_MAX = Number(BOOT.train_max_images || 50);
 
+// SYS-03: on a Mac under TRAIN_MIN_RAM_GB, /train/start has always
+// refused (409) -- but only AFTER a user drops a whole dataset, captions
+// it, and downloads 41 GB of LTX-2.3 weights the preflight card offers
+// unconditionally. Gate the whole tab at the entry instead: every direct
+// child of #trainSection except the gate card itself is hidden, and
+// Generate never reaches the 41 GB offer or the dataset dropzone.
+// Returns true when gated (caller should skip the rest of trainInit).
+function trainApplyRamGate() {
+  const card = document.getElementById('trainGateCard');
+  const section = document.getElementById('trainSection');
+  if (!card || !section) return false;
+  const tier = (LAST_STATUS && LAST_STATUS.tier) || {};
+  const ram = typeof tier.ram_gb === 'number' ? tier.ram_gb : null;
+  const minRam = typeof tier.train_min_ram_gb === 'number' ? tier.train_min_ram_gb : 24;
+  const gated = ram !== null && ram > 0 && ram < minRam;
+  card.hidden = !gated;
+  // Codex UI-7: this used to set every other child's `hidden` to `gated`
+  // — on every /status poll — which overwrote
+  // visibility the children own themselves: Style training hides the Voice
+  // card, and the next poll un-hid it. The gate is a class on the section
+  // now (panel.css hides every child but the gate card); no child's own
+  // `hidden` is touched.
+  section.classList.toggle('train-ram-gated', gated);
+  if (gated) {
+    document.getElementById('trainGateTitle').textContent =
+      `Training a character needs a Mac with ${minRam} GB or more`;
+    document.getElementById('trainGateBody').textContent =
+      `This one has ${ram} GB — the trainer runs out of memory before it `
+      + `finishes on this Mac, every time. You can still use characters: `
+      + `try the sample character below, or a community-trained one.`;
+  }
+  return gated;
+}
+
 function trainInit() {
+  // SYS-03: check the RAM gate before anything else runs — a gated Mac
+  // never wires the drop zone, never renders presets, never shows the
+  // 41 GB download offer.
+  if (trainApplyRamGate()) return;
   // Idempotent — safe to call on every setMode('train') without re-binding
   // the drop zone. Triggers a list refresh too so the user sees the LoRAs
   // they trained in earlier sessions.
@@ -1948,10 +2507,22 @@ async function trainCheckPreflight() {
       return;
     }
     box.style.display = 'block';
+    // SYS-04: this used to disclose the cost piecemeal, one Download
+    // button per row, with the actual total (41 GB across these two
+    // downloads, on a build that already has everything else) never
+    // stated anywhere. One combined total + one "Download all" that
+    // runs them in sequence (the download lane is a singleton — only
+    // one hf pull runs at a time, so this awaits each before starting
+    // the next rather than firing them together).
+    const totalGb = missing.reduce((sum, m) => sum + (Number(m.size_gb) || 0), 0);
+    const q8ExtraNote = (LAST_STATUS && LAST_STATUS.q8_available)
+      ? ''
+      : ` Using a trained character afterward needs the separate 30 GB `
+      + `Q8 pack too — that one's offered from Character mode when you get there.`;
     box.innerHTML = `
       <div class="train-preflight-card">
         <div class="train-preflight-title">
-          <svg class="ph" aria-hidden="true" style="margin-right:6px;vertical-align:-2px"><use href="#ph-warning-fill"/></svg>Required model${missing.length > 1 ? 's' : ''} not downloaded
+          <svg class="ph" aria-hidden="true" style="margin-right:6px;vertical-align:-2px"><use href="#ph-warning-fill"/></svg>Get ready to train: ~${totalGb.toFixed(1)} GB (LTX-2.3 training weights)
         </div>
         <div class="train-preflight-list">
           ${missing.map(m => `
@@ -1964,24 +2535,60 @@ async function trainCheckPreflight() {
             </div>
           `).join('')}
         </div>
+        <div class="train-preflight-actions">
+          <button type="button" class="btn btn-primary" id="trainInstallAllBtn">Download all (~${totalGb.toFixed(1)} GB)</button>
+        </div>
         <div class="train-preflight-foot">
           Phosphene installs only what it renders with. Training runs against
           LTX-2.3 and needs its own weights, so they are downloaded on demand
           rather than shipped to everyone. Each download is resumable, and
-          nothing above is needed to render.
+          nothing above is needed to render.${q8ExtraNote}
         </div>
       </div>
     `;
+    // Codex UI-4: the handler was an inline onclick="trainInstallAll([...])"
+    // whose JSON's double quotes closed the double-quoted attribute, leaving
+    // `trainInstallAll([` — a syntax error, so "Download all" did nothing.
+    // Bound here instead, with the key list as a real array.
+    const allKeys = missing.map(m => m.key);
+    const allBtn = box.querySelector('#trainInstallAllBtn');
+    if (allBtn) allBtn.onclick = () => trainInstallAll(allKeys);
   } catch (e) {
     box.style.display = 'none';
   }
 }
 
-async function trainInstall(key) {
+// SYS-04: "Download all" — runs the missing items through the SAME
+// singleton download lane trainInstall() already uses, one at a time
+// (only one hf pull can be active, so firing them concurrently would
+// just 409 on the second). Each step awaits the preflight actually
+// reporting that key ready before starting the next.
+async function trainInstallAll(keys) {
+  const btn = document.getElementById('trainInstallAllBtn');
+  for (const key of keys) {
+    if (btn) { btn.disabled = true; btn.textContent = 'Downloading…'; }
+    await trainInstallAndWait(key);
+  }
+  trainCheckPreflight();
+}
+
+function trainInstallAndWait(key) {
+  return new Promise((resolve) => {
+    trainInstall(key, resolve);
+  });
+}
+
+async function trainInstall(key, onDone) {
   // The panel parses POST bodies with parse_qs (urlencoded ONLY); a FormData
   // body serializes as multipart and reads back empty, so /train/install saw
   // key='' and returned "unknown install key" (reported by @cocktailpeanut,
   // 2026-06-04). Send urlencoded like every other POST in this panel.
+  //
+  // `onDone` (SYS-04, added for trainInstallAll's sequential "Download
+  // all"): called once this KEY is ready, or once, on failure, so a
+  // multi-item sequence never hangs waiting for a download that never
+  // started. Optional — the plain single-button Download path ignores it.
+  const finish = () => { if (typeof onDone === 'function') onDone(); };
   try {
     const r = await fetch('/train/install', {
       method: 'POST',
@@ -1991,23 +2598,28 @@ async function trainInstall(key) {
     const data = await r.json();
     if (!data.ok) {
       alert('Download failed: ' + (data.error || r.status));
+      finish();
       return;
     }
     // Progress streams to STATUS log. Re-poll preflight every 5s; banner
-    // self-hides when the file lands.
+    // self-hides when the file lands. Watches THIS key specifically (not
+    // "everything missing is now ready") so a sequential multi-download
+    // resolves after each step instead of only after the last one.
     const watch = setInterval(async () => {
       try {
         const r2 = await fetch('/train/preflight');
         const d2 = await r2.json();
-        const stillMissing = (d2.required || []).filter(m => !m.ready).length;
-        if (stillMissing === 0) {
+        const row = (d2.required || []).find(m => m.key === key);
+        if (!row || row.ready) {
           clearInterval(watch);
           trainCheckPreflight();
+          finish();
         }
       } catch (e) { /* ignore */ }
     }, 5000);
   } catch (e) {
     alert('Download request failed: ' + e.message);
+    finish();
   }
 }
 
@@ -2180,13 +2792,28 @@ async function trainUploadFiles(fileList) {
   // either type into the same zone — image_001.png + image_001.txt is the
   // intended workflow.
   const all = Array.from(fileList);
+  // SYS-02: HEIC/HEIF/AVIF (macOS Photos/AirDrop's default hand-off) used
+  // to fail BOTH tests here and get silently dropped from the selection —
+  // no toast, no row in the grid, nothing. The server now converts them to
+  // JPEG on upload (normalize_ingested_image_bytes); this filter just has
+  // to stop throwing them away before they get there.
   const imgs = all.filter(f =>
-    /^image\/(png|jpe?g|webp)$/.test(f.type) ||
-    /\.(png|jpe?g|webp)$/i.test(f.name));
+    /^image\/(png|jpe?g|webp|heic|heif|avif)$/.test(f.type) ||
+    /\.(png|jpe?g|webp|heic|heif|avif)$/i.test(f.name));
   const caps = all.filter(f =>
     /\.txt$/i.test(f.name) || /^text\/plain$/.test(f.type));
+  // SYS-10b: files that are neither an accepted image type nor a caption
+  // used to just vanish from the drop with zero message. They're now named
+  // in the persistent end-of-batch summary below instead of silently
+  // dropped. (HEIC is accepted above since SYS-02 — the server converts it.)
+  const rejected = all.filter(f => !imgs.includes(f) && !caps.includes(f))
+    .map(f => `${f.name} (unsupported format)`);
   if (!imgs.length && !caps.length) {
-    if (status) status.textContent = 'No supported files in that selection (need PNG / JPG / WEBP / TXT).';
+    if (status) {
+      status.textContent = rejected.length
+        ? `No supported files in that selection. Skipped: ${rejected.join(', ')}`
+        : 'No supported files in that selection (need PNG / JPG / WEBP / HEIC / TXT).';
+    }
     return;
   }
   const total = imgs.length + caps.length;
@@ -2194,6 +2821,12 @@ async function trainUploadFiles(fileList) {
 
   let done = 0;
   let capThinWarnings = [];
+  // Per-file failures (413 too-large, server error, network) used to only
+  // ever live in status.textContent for the instant before the NEXT file's
+  // "Uploaded N / total…" overwrote it — so a failure on file 2 of 6 was
+  // invisible by the time file 3 finished. Collected here and folded into
+  // the persistent end-of-batch summary instead.
+  let failed = [];
 
   // ----- IMAGES (optimistic placeholders so the grid lights up immediately) -----
   for (let i = 0; i < imgs.length; i++) {
@@ -2221,7 +2854,9 @@ async function trainUploadFiles(fileList) {
       const j = await r.json();
       if (!r.ok || !j.ok) {
         TRAIN.images.splice(placeholderIdx, 1);
-        if (status) status.textContent = 'Upload error: ' + (j.error || r.status);
+        const reason = j.error || `HTTP ${r.status}`;
+        failed.push(`${f.name} (${reason})`);
+        if (status) status.textContent = 'Upload error: ' + reason;
         trainRenderThumbs();
         continue;
       }
@@ -2241,7 +2876,9 @@ async function trainUploadFiles(fileList) {
       if (status) status.textContent = `Uploaded ${done} / ${total}…`;
     } catch (e) {
       TRAIN.images.splice(placeholderIdx, 1);
-      if (status) status.textContent = 'Upload failed: ' + (e.message || 'unknown');
+      const reason = e.message || 'unknown';
+      failed.push(`${f.name} (${reason})`);
+      if (status) status.textContent = 'Upload failed: ' + reason;
       trainRenderThumbs();
     }
   }
@@ -2256,7 +2893,9 @@ async function trainUploadFiles(fileList) {
       const r = await fetch('/train/upload', { method: 'POST', body: fd });
       const j = await r.json();
       if (!r.ok || !j.ok) {
-        if (status) status.textContent = 'Caption upload error: ' + (j.error || r.status);
+        const reason = j.error || `HTTP ${r.status}`;
+        failed.push(`${f.name} (${reason})`);
+        if (status) status.textContent = 'Caption upload error: ' + reason;
         continue;
       }
       TRAIN.jobId = j.job_id;
@@ -2266,7 +2905,9 @@ async function trainUploadFiles(fileList) {
       done += 1;
       if (status) status.textContent = `Uploaded ${done} / ${total}…`;
     } catch (e) {
-      if (status) status.textContent = 'Caption upload failed: ' + (e.message || 'unknown');
+      const reason = e.message || 'unknown';
+      failed.push(`${f.name} (${reason})`);
+      if (status) status.textContent = 'Caption upload failed: ' + reason;
     }
   }
   if (caps.length) {
@@ -2285,7 +2926,13 @@ async function trainUploadFiles(fileList) {
     if (capThinWarnings.length) {
       bits.push(`thin captions: ${capThinWarnings.slice(0, 3).join(', ')}${capThinWarnings.length > 3 ? '…' : ''}`);
     }
+    const skipped = rejected.concat(failed);
+    if (skipped.length) {
+      bits.push(`${skipped.length} file${skipped.length === 1 ? '' : 's'} skipped: `
+        + `${skipped.slice(0, 3).join(', ')}${skipped.length > 3 ? '…' : ''}`);
+    }
     status.textContent = bits.join(' · ');
+    status.classList.toggle('train-status-warn', skipped.length > 0);
   }
   trainUpdateEstimate();
   trainUpdateButtonState();
@@ -2346,13 +2993,19 @@ function trainUpdateCounter() {
   if (!counter) return;
   const n = TRAIN.images.length;
   const captioned = TRAIN.images.filter(x => x.captioned).length;
-  counter.textContent = `${n} / ${TRAIN_MAX} images`;
+  // SYS-36: this used to be "N / 500 images" -- TRAIN_MAX (500) is a
+  // technical ceiling (mlx_ltx_panel.py's own comment calls the earlier
+  // 50 "a friendly-default-misread-as-hard-rule"), not a target, so it
+  // reads as a goal nobody should aim for. The sweet spot (20-50) is
+  // what's worth stating; the hard ceiling only matters once someone is
+  // actually near it.
+  counter.textContent = `${n} image${n === 1 ? '' : 's'}`;
   counter.classList.toggle('ok', n >= TRAIN_MIN);
   counter.classList.toggle('short', n > 0 && n < TRAIN_MIN);
   if (hint) {
-    if (n === 0) hint.textContent = `need at least ${TRAIN_MIN} to train`;
+    if (n === 0) hint.textContent = `${TRAIN_MIN} minimum · 20–50 is the sweet spot`;
     else if (n < TRAIN_MIN) hint.textContent = `need ${TRAIN_MIN - n} more`;
-    else if (n < TRAIN_MAX) hint.textContent = `ready · up to ${TRAIN_MAX - n} more if you want variety`;
+    else if (n < TRAIN_MAX) hint.textContent = `ready · 20–50 is the sweet spot, more helps variety`;
     else hint.textContent = `at the ${TRAIN_MAX}-image limit`;
   }
   if (capChip) {
@@ -2482,7 +3135,7 @@ async function trainAutoCaption() {
   if (label) label.textContent = 'Captioning…';
   if (prog) prog.hidden = false;
   if (fill) fill.style.width = '0%';
-  if (status) status.textContent = `Loading Gemma 3 (~3s)…`;
+  if (status) status.textContent = `Loading the prompt helper (~3s)…`;
   const fd = new FormData();
   fd.set('train_job_id', TRAIN.jobId);
   fd.set('trigger', trig);
@@ -2798,26 +3451,38 @@ function trainWireVoice() {
   trainRenderVoice();
 }
 
+function _trainVoiceInlineError(msg) {
+  const el = document.getElementById('trainVoiceInlineError');
+  if (!el) return;
+  if (msg) { el.textContent = msg; el.hidden = false; }
+  else { el.hidden = true; el.textContent = ''; }
+}
+
 async function trainVoiceUpload(file) {
   if (!file) return;
   const status = document.getElementById('trainStatus');
+  _trainVoiceInlineError(null);
   // The voice endpoint requires a dataset (job_id) — the user must drop
-  // at least one image first. Guard with a friendly message.
+  // at least one image first. Guard with a friendly message, shown BOTH
+  // on the card itself (SYS-10c) and on the shared status line.
   if (!TRAIN.jobId) {
-    if (status) status.textContent =
-      'Upload at least one training image before adding a voice clip.';
+    const msg = 'Upload at least one training image first — the voice clip attaches to that dataset.';
+    if (status) status.textContent = msg;
+    _trainVoiceInlineError(msg);
     return;
   }
   // Quick client-side extension + size check (server re-validates).
   const ext = (file.name.match(/\.[^.]+$/) || [''])[0].toLowerCase();
   if (!['.wav', '.mp3', '.m4a', '.flac'].includes(ext)) {
-    if (status) status.textContent =
-      `Unsupported audio type ${ext} — use WAV / MP3 / M4A / FLAC.`;
+    const msg = `Unsupported audio type ${ext} — use WAV / MP3 / M4A / FLAC.`;
+    if (status) status.textContent = msg;
+    _trainVoiceInlineError(msg);
     return;
   }
   if (file.size > 50 * 1024 * 1024) {
-    if (status) status.textContent =
-      `Voice clip too large (${(file.size / 1024 / 1024).toFixed(1)} MB) — max 50 MB.`;
+    const msg = `Voice clip too large (${(file.size / 1024 / 1024).toFixed(1)} MB) — max 50 MB.`;
+    if (status) status.textContent = msg;
+    _trainVoiceInlineError(msg);
     return;
   }
   try {
@@ -2827,8 +3492,9 @@ async function trainVoiceUpload(file) {
     const r = await fetch('/train/upload-voice', { method: 'POST', body: fd });
     const j = await r.json();
     if (!r.ok || !j.ok) {
-      if (status) status.textContent =
-        'Voice upload failed: ' + (j.error || r.status);
+      const msg = 'Voice upload failed: ' + (j.error || r.status);
+      if (status) status.textContent = msg;
+      _trainVoiceInlineError(msg);
       return;
     }
     // Build a local object URL for the audio preview so we can play
@@ -3050,6 +3716,36 @@ function trainFmtAge(ms) {
   return `${d}d ago`;
 }
 
+// SYS-35: called from queue.js's notifyJobsDone the moment a mode='train'
+// job finishes. /train/list is the same source trainRefreshLoraList()
+// already renders from, so the newest entry by created_at IS the character
+// that just finished — reused rather than trusting anything off the job
+// dict itself, whose output shape for training differs from a render job's.
+async function _trainAnnounceReady(job) {
+  try {
+    const r = await fetch('/train/list');
+    const j = await r.json();
+    const items = (j.loras || []);
+    if (!items.length) return;
+    const newest = items.reduce((a, b) =>
+      (Number(b.created_at) || 0) > (Number(a.created_at) || 0) ? b : a);
+    if (!newest || !newest.path || !newest.trigger) return;
+    const el = phosToast(`Your character "${newest.trigger}" is ready.`,
+      { kind: 'success', duration: 0 });
+    if (!el) return;
+    const a = document.createElement('a');
+    a.href = '#';
+    a.className = 'phos-toast-action';
+    a.textContent = 'Make a clip with it';
+    a.onclick = (ev) => {
+      ev.preventDefault();
+      el.remove();
+      trainUseInVideo(newest.path, newest.trigger, 't2v');
+    };
+    el.appendChild(a);
+  } catch (e) { /* best-effort */ }
+}
+
 function trainUseInVideo(loraPath, trigger, targetMode) {
   // Switch the panel into the requested video mode + pre-fill the LoRA
   // picker by emitting an "add" against the unified picker's state. The
@@ -3130,9 +3826,19 @@ function setQuality(q) {
   // aspect choice. Quick is 4:3 only — landscape orientation only.
   const preset = QUALITY_PRESETS[q];
   const aspect = document.getElementById('aspect').value || 'landscape';
-  const vertical = (aspect === 'vertical' && q !== 'quick');
-  document.getElementById('width').value  = vertical ? preset.h : preset.w;
-  document.getElementById('height').value = vertical ? preset.w : preset.h;
+  if (q === 'quick') {
+    document.getElementById('width').value  = preset.w;
+    document.getElementById('height').value = preset.h;
+  } else {
+    // VC-39: square (1:1) and 4:5 are fixed cells, shared with applyAspect
+    // via _aspectDims so the two never disagree about what a pick renders.
+    const dims = (typeof _aspectDims === 'function')
+      ? _aspectDims(aspect, q)
+      : { w: (aspect === 'vertical' ? preset.h : preset.w),
+          h: (aspect === 'vertical' ? preset.w : preset.h) };
+    document.getElementById('width').value  = dims.w;
+    document.getElementById('height').value = dims.h;
+  }
   setUpscale(preset.upscale || 'off');
   // Hide the Aspect row when Quick is active (only 4:3 supported); show
   // it for Standard/High where 16:9 vs 9:16 is a real choice.
@@ -3203,25 +3909,110 @@ function setTemporalMode(t) {
   updateDerived();
 }
 
-// One line per window on screen, a JSON array on the wire — the same shape
-// the H3 chain posts, so a curl and the form agree. The hint counts the
-// windows the current length needs (ltx_windows: 121-frame windows, 112 new
-// frames each) so the box says how many lines mean something.
+// VA-18: one LABELLED, TIMED box per LATER window, a JSON array on the wire
+// (same shape the H3 chain posts) whose index 0 is ALWAYS blank — window 1
+// is always the main prompt above (ltx_windows.window_prompts' own
+// contract), and there is now no UI control that can override it. This
+// replaces a free-text textarea whose placeholder read "(first window uses
+// the prompt above)⏎he turns to the window…" — the first REAL line typed
+// there became index 0 and silently replaced the main prompt.
+//
+// Real per-window time ranges come from /ltx/windows_plan
+// (ltx_windows.plan_windows, a pure function — same numbers the engine's
+// own chain will use), not a client-side re-derivation that could drift
+// from the server's rounding.
+let _windowsPlanCache = { frames: null, plan: null };
+let _windowsPlanFetching = null;
 function windowPromptsInput() {
-  const ta = document.getElementById('window_prompts_text');
+  const out = document.getElementById('window_prompts');
+  const wrap = document.getElementById('windowsDynamicSlots');
+  if (!out || !wrap) return;
+  // Only fetch/render while Windows mode is actually selected — this runs
+  // on every updateDerived() call (every frames/duration/width/height
+  // edit, in every mode), so a mode guard keeps it from hitting the
+  // endpoint on unrelated keystrokes.
+  const tmode = (document.getElementById('temporal_mode') || {}).value;
+  if (tmode !== 'windows') return;
+  const f = parseInt(document.getElementById('frames')?.value || '121', 10) || 121;
+  if (_windowsPlanCache.frames === f && _windowsPlanCache.plan) {
+    _renderWindowsSlotsFromPlan(_windowsPlanCache.plan);
+    return;
+  }
+  if (_windowsPlanFetching === f) return;   // already in flight for this length
+  _windowsPlanFetching = f;
+  fetch('/ltx/windows_plan?frames=' + f).then(r => r.json()).then(plan => {
+    if (_windowsPlanFetching === f) _windowsPlanFetching = null;
+    if (!plan || !plan.ok) return;
+    // LIPSYNC-9: a plan for a length the form no longer shows is stale — two
+    // quick length changes can answer out of order, and the older, shorter
+    // plan used to redraw the boxes (dropping later windows' typed text) and
+    // take the cache slot from the current one.
+    const nowFrames = parseInt(document.getElementById('frames')?.value || '121', 10) || 121;
+    const nowMode = (document.getElementById('temporal_mode') || {}).value;
+    if (nowFrames !== f || nowMode !== 'windows') return;
+    _windowsPlanCache = { frames: f, plan };
+    _renderWindowsSlotsFromPlan(plan);
+  }).catch(() => { if (_windowsPlanFetching === f) _windowsPlanFetching = null; });
+}
+function _fmtMinSec(sec) {
+  sec = Math.max(0, Number(sec) || 0);
+  const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
+  return m + ':' + String(s).padStart(2, '0');
+}
+function _renderWindowsSlotsFromPlan(plan) {
+  const wrap = document.getElementById('windowsDynamicSlots');
   const out = document.getElementById('window_prompts');
   const hint = document.getElementById('windowsHint');
-  if (!ta || !out) return;
-  const lines = String(ta.value || '').split('\n').map(s => s.trim());
-  while (lines.length && !lines[lines.length - 1]) lines.pop();
-  out.value = lines.length ? JSON.stringify(lines) : '';
+  if (!wrap || !out) return;
+  const n = plan.count || 1;
   if (hint) {
-    const f = parseInt(document.getElementById('frames')?.value || '121', 10) || 121;
-    const n = f <= 121 ? 1 : 1 + Math.ceil((f - 121) / 112);
     hint.textContent = n <= 1
       ? 'this length fits one window — pick a longer clip'
-      : n + ' windows · one line per window · blank holds the last moment';
+      : n + ' windows · window 1 is the prompt above · blank holds the last moment';
   }
+  if (n <= 1) {
+    wrap.innerHTML = '<div class="hint">This length renders in one pass — no per-window prompts needed.</div>';
+    out.value = '';
+    return;
+  }
+  // Preserve already-typed text for a window index that survives a
+  // duration change (20s -> 15s keeps windows 2-3's lines) — UNLESS a Load
+  // Params restore is pending, which wins (it is a deliberate reopen of a
+  // specific clip's exact recipe, not an in-progress edit).
+  const previous = {};
+  wrap.querySelectorAll('textarea[data-window-index]').forEach(t => {
+    previous[t.dataset.windowIndex] = t.value;
+  });
+  const restore = (typeof window !== 'undefined') ? window._pendingWindowPromptsRestore : null;
+  if (typeof window !== 'undefined') window._pendingWindowPromptsRestore = null;   // consume once
+  const rows = (plan.windows || []).slice(1);   // window 0 has no box — it's the main prompt
+  wrap.innerHTML = rows.map(w => {
+    const label = 'Window ' + (w.index + 1) + ' · ' + _fmtMinSec(w.start_sec) + '–' + _fmtMinSec(w.end_sec);
+    return '<div class="mf-cell" style="margin-top:6px">'
+      + '<span class="mf-label">' + escapeHtml(label) + '</span>'
+      + '<textarea class="sb-textarea" rows="2" data-window-index="' + w.index + '" '
+      + 'oninput="_windowsSlotChanged()" placeholder="the next beat, led by the movement — blank holds the previous moment"></textarea>'
+      + '</div>';
+  }).join('');
+  rows.forEach(w => {
+    const el = wrap.querySelector('textarea[data-window-index="' + w.index + '"]');
+    if (!el) return;
+    const fromRestore = Array.isArray(restore) ? restore[w.index] : undefined;
+    el.value = (fromRestore !== undefined && fromRestore !== null)
+      ? fromRestore : (previous[String(w.index)] || '');
+  });
+  _windowsSlotChanged();
+}
+function _windowsSlotChanged() {
+  const wrap = document.getElementById('windowsDynamicSlots');
+  const out = document.getElementById('window_prompts');
+  if (!wrap || !out) return;
+  const boxes = Array.from(wrap.querySelectorAll('textarea[data-window-index]'))
+    .sort((a, b) => Number(a.dataset.windowIndex) - Number(b.dataset.windowIndex));
+  // Index 0 is ALWAYS blank — window 1 is the main prompt, by construction.
+  const lines = [''].concat(boxes.map(b => b.value.trim()));
+  while (lines.length && !lines[lines.length - 1]) lines.pop();
+  out.value = lines.length ? JSON.stringify(lines) : '';
 }
 function setUpscale(u) {
   const v = ['off', 'fit_720p', 'x2'].includes(u) ? u : 'off';
@@ -3323,6 +4114,47 @@ function updateShotSetupSummary() {
     let eta = '';
     try { eta = h3CellEta(cell); } catch (_) {}
     if (eta) parts.push(eta);
+    // H3-08: the closed section named quality/length/speed/eta but never
+    // said whether any LoRA was going to influence the render at all —
+    // the LoRA panel is its own disclosure, further down, easy to miss.
+    // Lane lookup mirrors _serializeLoras()'s _laneOf (loras.js): the
+    // active entry itself carries no reliable lane, _knownUserLoras does.
+    try {
+      const laneOf = (p) => {
+        const u = Array.isArray(_knownUserLoras)
+          ? _knownUserLoras.find(x => x.path === p) : null;
+        return (u && u.lane) || 'ltx';
+      };
+      const n = (Array.isArray(_activeLoras) ? _activeLoras : [])
+        .filter(a => a && laneOf(a.path) === 'h3').length;
+      if (n > 0) parts.push(n + (n === 1 ? ' LoRA' : ' LoRAs'));
+    } catch (_) {}
+  } else if (currentMode === 'keyframe' || currentMode === 'extend') {
+    // VA-11 / VA-12: these two modes run a pipeline the Quality strip's
+    // selected cell does NOT describe (keyframe is always Q8 two-stage at
+    // this Mac's clamp; extend runs its own step count) — read the real,
+    // server-computed price instead of ltxCellFor's cell.
+    const tier = (typeof BOOT !== 'undefined' && BOOT.tier) || {};
+    let card = null, pending = false;
+    if (currentMode === 'keyframe') {
+      // EST-7: priced for the duration and canvas the form holds, not 5 s.
+      const kp = (typeof keyframePriceFor === 'function')
+        ? keyframePriceFor() : { card: tier.keyframe_price, pending: false };
+      card = kp.card; pending = kp.pending;
+      parts.push('Q8 two-stage');
+    } else {
+      const proOn = (document.getElementById('extend_steps') || {}).value === '30';
+      card = proOn ? tier.extend_price_pro : tier.extend_price_draft;
+      parts.push(proOn ? 'Q8 Pro' : 'Q8 Draft');
+    }
+    if (card && pending) {
+      parts.push('pricing…');
+    } else if (card) {
+      parts.push(`${card.width}×${card.height}`);
+      parts.push(card.eta);
+    } else {
+      parts.push('needs more memory than this Mac has');
+    }
   } else {
     let cell = null;
     try { cell = ltxCellFor(ltxCurrentQuality(), ltxCurrentLength()); } catch (_) {}
@@ -3352,8 +4184,26 @@ function updateFinishSummary() {
   const parts = [];
   if (document.body.dataset.engine === 'h3') {
     const up = (document.getElementById('h3_upscale') || {}).value || 'off';
-    if (up === 'fit_720p') parts.push('720p export');
-    else if (up === 'fit_1080p') parts.push('1080p export');
+    // H3-38: bare "720p export" on a Draft cell (640×384, a 1.875× lanczos
+    // stretch) reads as "this shipped at 720p detail" — it didn't, the
+    // source canvas decided the detail and this pass only fills the frame.
+    // Say the upscale explicitly whenever the source is below the 720p
+    // long side; a cell that's already there (High · 720p) keeps the plain
+    // label because nothing is being stretched.
+    let cell = null;
+    try { cell = (typeof h3CurrentCell === 'function') ? h3CurrentCell() : null; } catch (_) {}
+    const upscaling720 = cell && Math.max(cell.width, cell.height) < 1280;
+    const upscaling1080 = cell && Math.max(cell.width, cell.height) < 1920;
+    if (up === 'fit_720p') {
+      parts.push(upscaling720
+        ? `720p export (upscaled from ${cell.width}×${cell.height}, not added detail)`
+        : '720p export');
+    }
+    else if (up === 'fit_1080p') {
+      parts.push(upscaling1080
+        ? `1080p export (upscaled from ${cell.width}×${cell.height}, not added detail)`
+        : '1080p export');
+    }
     else if (up === 'ltx_x2') parts.push('native + Upscale & Face Fix after');
     else parts.push('native export');
   } else {
@@ -3417,12 +4267,50 @@ function setExtendMode(m) {
   // Fast = no-CFG path, fits in 64 GB at 1280×704. Quality = upstream
   // defaults, requires headroom. Both are exposed on the form via hidden
   // inputs; this just flips the values + active pill.
-  const steps = m === 'quality' ? 30  : 12;
+  //
+  // VA-12: Draft used to send 12 steps here — 50% slower than the
+  // validated default (owner ruling 2026-05-21, mlx_ltx_panel.py's extend
+  // branch: "steps cut from 12 -> 8"). The server has defaulted to 8 for a
+  // while; this client value was silently overriding it back up to 12 on
+  // every Draft render.
+  const steps = m === 'quality' ? 30 : 8;
   const cfg   = m === 'quality' ? 3.0 : 1.0;
   document.getElementById('extend_steps').value = String(steps);
   document.getElementById('extend_cfg').value   = String(cfg);
   document.querySelectorAll('#extendModeGroup .pill-btn').forEach(b =>
     b.classList.toggle('active', b.dataset.extendMode === m));
+  if (typeof updateDerivedForClampedMode === 'function') updateDerivedForClampedMode('extend');
+  if (typeof updateShotSetupSummary === 'function') { try { updateShotSetupSummary(); } catch (e) {} }
+}
+
+// VA-12: rewrite the Extend pill subtitles from the server's real,
+// clamped-canvas price instead of the hardcoded "12 steps · ~16 min" /
+// "30 steps · ~38 min" HTML — and hide Q8 Pro below the tier where it
+// pushes the render into swap (the pill's own hint already warned about
+// this; now the pill itself doesn't offer it there).
+function applyExtendPillPrices() {
+  const tier = (typeof BOOT !== 'undefined' && BOOT.tier) || {};
+  const group = document.getElementById('extendModeGroup');
+  if (!group) return;
+  const draftBtn = group.querySelector('[data-extend-mode="fast"]');
+  const proBtn = group.querySelector('[data-extend-mode="quality"]');
+  const fill = (btn, card, stepsLabel) => {
+    if (!btn || !card) return;
+    const spec = btn.querySelector('.ql-spec');
+    const tierEl = btn.querySelector('.ql-tier');
+    if (spec) spec.textContent = `${stepsLabel} · ${card.width}×${card.height} safe`;
+    if (tierEl) tierEl.textContent = `${card.pipeline_note} · ${card.eta}`;
+  };
+  fill(draftBtn, tier.extend_price_draft, '8 steps');
+  fill(proBtn, tier.extend_price_pro, '30 steps');
+  // Pro pushes the render past what Comfortable/Compact tiers can hold
+  // resident (the hint text already said so) — hide it below "high" rather
+  // than let it look like an equally-safe option.
+  if (proBtn) {
+    const proSafe = tier.key === 'high' || tier.key === 'pro';
+    proBtn.hidden = !proSafe;
+    if (!proSafe && proBtn.classList.contains('active')) setExtendMode('fast');
+  }
 }
 
 function updatePromptPlaceholder() {
@@ -3448,10 +4336,14 @@ function updatePromptPlaceholder() {
 // mode. The click handler chooses the 2- or 3-frame UI after setMode()
 // restores the shared keyframe screen.
 document.querySelectorAll('#modeGroup .pill-btn').forEach(b => b.onclick = () => {
+  // Lip-sync (VA-01) isn't a #genForm mode — it's a jump to the Audio tab's
+  // audio-driven form, which submits through its own path
+  // (audioStudioGenerate). Keep it out of setMode()'s dispatch entirely.
+  if (b.dataset.lipsync) { openLipSyncEntry(); return; }
   setMode(b.dataset.mode);
   if (b.dataset.mode === 'keyframe') {
     const def = b.dataset.kfDefault || '2';
-    const fallback = parseInt(document.getElementById('keyframe_count')?.value || '6', 10);
+    const fallback = parseInt(document.getElementById('keyframe_count')?.value || '3', 10);
     setKeyframeMode(def === 'multi' ? fallback : parseInt(def, 10));
   }
 });
@@ -3529,21 +4421,34 @@ Object.assign(globalThis, {
   musicLoraPicks, musicLoraRender, musicLoraToggled, musicLoraSummaryText,
   musicLoraInstallCard, musicLoraInstall, musicFetchCard,
   windowPromptsInput,
+  // VA-18: _windowsSlotChanged is an inline onclick/oninput target on the
+  // generated per-window textareas.
+  _windowsSlotChanged,
   audioStudioInit, audioStudioDurationChanged, audioStudioEnhancePrompt, audioStudioGenerate,
   audioConditioningScaleChanged, audioConditioningScaleReset, a2vLoadParams,
   trainRecommendedPreset, trainUpdatePresetButtons, trainUpdatePresetNote, downloadSampleCharacter,
   charactersInit, charactersRenderChips, charactersOpenCompose, charactersBackToGrid,
   charactersHandleAudioUpload, charactersClearAudio, charactersUpdateStrengthDisplay, charactersSyncStrengthControls,
   charactersGenerate, charactersEscapeHtml, charactersEscapeAttr, _restoreCharacterStrengths,
-  charactersLoadParams, trainInit, trainGuidanceDismiss, trainCheckPreflight,
+  charactersLoadParams, trainInit, trainApplyRamGate, trainGuidanceDismiss, trainCheckPreflight,
   trainSuggestTrigger, trainClearAll, trainAutoCaption, trainStart,
   trainVoiceRemove, trainVoiceToggleChanged, trainRefreshLoraList, trainRenderVerdictBanner,
+  _trainAnnounceReady,
   setQuality, _qualityUsesHq, setAccel, setTemporalMode,
   setUpscale, setUpscaleMethod, updateAccelAvailability, updateTemporalAvailability,
   setAspect, updateCustomizeSummary, updatePromptPlaceholder,
   updateShotSetupSummary, updateFinishSummary, updateAdvancedSummary,
+  setExtendMode, applyExtendPillPrices,
   // inline-handler targets: generated markup resolves these through the
   // global scope (the v4.9.0 regression, PR #69)
-  audioStudioClearAudio, charactersPickChip, trainInstall, trainRemoveImage,
+  audioStudioClearAudio, charactersPickChip, trainInstall, trainInstallAll, trainRemoveImage,
   trainUseInVideo,
+  // VA-01 / VA-04 / VA-20: openLipSyncEntry is an inline onclick target from
+  // both the mode-bar chip's delegate (same file, would work unpublished)
+  // and the mux-warning link in index.html (a different module's markup —
+  // needs the global). audioStudioRenderLoraNote's own onclick lives in the
+  // string it builds, so it needs the global too.
+  openLipSyncEntry, audioStudioRenderLoraNote,
+  audioStudioPromptCheck, audioStudioPromptApplyFix, audioStudioMouthCheck,
+  audioStudioSplitIntoClips, audioStudioSplitCancel,
 });

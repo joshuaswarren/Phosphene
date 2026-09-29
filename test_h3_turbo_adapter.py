@@ -191,7 +191,14 @@ class TestH3TurboInstallContract(unittest.TestCase):
         status = P.h3_turbo_status()
         self.assertTrue(status["install_available"])
         self.assertFalse(status["installing"])
-        self.assertIn(P.H3_TURBO_LORA_FILE, status["install_note"])
+        # H3-29: install_note used to hardcode H3_TURBO_LORA_FILE (the
+        # retired v1.0 LightX2V asset) unconditionally, disagreeing with
+        # what the install button actually fetches by default
+        # (H3_TURBO_DEFAULT_ASSET = v4-600-EMA). It now names whichever
+        # asset _h3_turbo_asset() (the SAME resolver the install action
+        # calls) actually resolves.
+        self.assertIn(P._h3_turbo_asset()["file"], status["install_note"])
+        self.assertIn(P.H3_TURBO_V4_REPO, status["install_note"])
 
 
 def _write_lora_fixture(path: Path, adaln_modules: list[str],

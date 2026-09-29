@@ -162,7 +162,7 @@ _KEY = {"space": " ", "escape": "Escape", "backspace": "Backspace", "delete": "D
         "arrowleft": "ArrowLeft", "arrowright": "ArrowRight", "arrowup": "ArrowUp",
         "arrowdown": "ArrowDown", "home": "Home", "end": "End", "plus": "+", "minus": "-",
         "equals": "=", "underscore": "_", "backslash": "\\", "enter": "Enter",
-        "backquote": "`"}
+        "backquote": "`", "comma": ",", "period": "."}
 
 # State each row needs for its branch to be the one that answers.
 _STATE = {

@@ -199,6 +199,43 @@ class StopFilmStopsItsStills(Sandbox):
         self.assertEqual(len(queued), 1)
 
 
+class TheRealResolutionIsStamped(Sandbox):
+    """FILM-42: the Draft/Delivery badge used to be read off whichever pass
+    queued the clip, board-wide — not the clip itself. _sb_reconcile now
+    ffprobes a shot's REAL pixel size the moment a new output lands, once,
+    so the client can judge each shot on its own clip."""
+
+    def _reconcile(self, board, index, dims=(1024, 576)):
+        with mock.patch.object(panel, "_sb_job_index", return_value=index), \
+             mock.patch.object(panel, "_probe_video_dims", return_value=dims):
+            return panel._sb_reconcile(board)
+
+    def test_a_newly_landed_output_is_measured(self):
+        board = _board([_shot(1, uid="shot_00000001", draft_job_id="j1")])
+        self._reconcile(board, {"j1": {"status": "done", "output_path": "/o/s1.mp4"}},
+                        dims=(1280, 704))
+        self.assertEqual(board["shots"][0]["output_dims"], [1280, 704])
+
+    def test_a_failed_probe_is_silent_and_clears_any_stale_dims(self):
+        board = _board([_shot(1, uid="shot_00000001", draft_job_id="j1",
+                              output_dims=[999, 999])])
+        self._reconcile(board, {"j1": {"status": "done", "output_path": "/o/s1.mp4"}},
+                        dims=(0, 0))
+        self.assertNotIn("output_dims", board["shots"][0])
+
+    def test_an_unchanged_output_is_not_reprobed(self):
+        board = _board([_shot(1, uid="shot_00000001", draft_job_id="j1",
+                              draft_output="/o/s1.mp4", status="done",
+                              output_dims=[1024, 576])])
+        with mock.patch.object(panel, "_sb_job_index",
+                               return_value={"j1": {"status": "done",
+                                                    "output_path": "/o/s1.mp4"}}), \
+             mock.patch.object(panel, "_probe_video_dims") as probe:
+            panel._sb_reconcile(board)
+        probe.assert_not_called()
+        self.assertEqual(board["shots"][0]["output_dims"], [1024, 576])
+
+
 class ACutShotStaysCut(Sandbox):
     """SB5-10."""
 
@@ -243,6 +280,76 @@ class ACutShotStaysCut(Sandbox):
         with mock.patch.object(panel, "_sb_job_index", return_value={}):
             panel._sb_reconcile(after and self.load(board["id"]))
         self.assertEqual(self.load(board["id"])["shots"][0]["status"], "done")
+
+
+class AShotWhoseJobVanishedIsUnstuck(Sandbox):
+    """FILM-18. /queue/remove and /queue/clear drop a job with NO history —
+    it is not "cancelled", it simply vanishes from `_sb_job_index()`. A shot
+    still pointing at that job id used to be left alone forever: stuck
+    reading "queued" (or "rendering"), locked in the UI (the card and the
+    trash button both gate on non-done status) with no way to re-render or
+    delete it."""
+
+    def _reconcile(self, board, index):
+        with mock.patch.object(panel, "_sb_job_index", return_value=index):
+            return panel._sb_reconcile(board)
+
+    def test_a_queued_shot_whose_job_vanished_goes_back_to_pending(self):
+        board = _board([_shot(1, status="queued", draft_job_id="ghost")])
+        changed = self._reconcile(board, {})
+        self.assertTrue(changed)
+        shot = board["shots"][0]
+        self.assertEqual(shot["status"], "pending")
+        self.assertNotIn("draft_job_id", shot)
+
+    def test_a_rendering_shot_whose_job_vanished_goes_back_to_pending_too(self):
+        board = _board([_shot(1, status="rendering", final_job_id="ghost")])
+        self._reconcile(board, {})
+        shot = board["shots"][0]
+        self.assertEqual(shot["status"], "pending")
+        self.assertNotIn("final_job_id", shot)
+
+    def test_a_shot_that_already_has_its_output_is_left_alone(self):
+        # The job that MADE this output can legitimately age out of history
+        # after the shot is done — that must never un-finish it.
+        board = _board([_shot(1, status="done", draft_job_id="ghost",
+                              draft_output="/o/s1.mp4")])
+        self._reconcile(board, {})
+        shot = board["shots"][0]
+        self.assertEqual(shot["status"], "done")
+        self.assertEqual(shot["draft_job_id"], "ghost")
+        self.assertEqual(shot["draft_output"], "/o/s1.mp4")
+
+    def test_a_cut_shot_stays_cut_even_with_a_vanished_job(self):
+        board = _board([_shot(1, status="skipped", grade="cut",
+                              draft_job_id="ghost")])
+        self._reconcile(board, {})
+        self.assertEqual(board["shots"][0]["status"], "skipped")
+
+    def test_a_pending_shot_with_no_job_id_is_unaffected(self):
+        board = _board([_shot(1, status="pending", uid="shot_00000001")])
+        changed = self._reconcile(board, {})
+        self.assertFalse(changed)
+        self.assertEqual(board["shots"][0]["status"], "pending")
+
+    def test_a_vanished_still_job_is_cleared_so_a_new_one_can_be_queued(self):
+        board = _board([_shot(1, still_job_id="ghost-still")])
+        changed = self._reconcile(board, {})
+        self.assertTrue(changed)
+        self.assertNotIn("still_job_id", board["shots"][0])
+
+    def test_the_skipped_still_sentinel_is_never_treated_as_a_vanished_job(self):
+        # "skipped" means "could not even be queued, render unanchored" —
+        # it was never a real job id, and clearing it would silently retry
+        # a still the render thread deliberately gave up on.
+        board = _board([_shot(1, still_job_id="skipped",
+                              still_error="no engine for stills",
+                              uid="shot_00000002")])
+        changed = self._reconcile(board, {})
+        self.assertFalse(changed)
+        shot = board["shots"][0]
+        self.assertEqual(shot["still_job_id"], "skipped")
+        self.assertEqual(shot["still_error"], "no engine for stills")
 
 
 if __name__ == "__main__":

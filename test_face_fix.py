@@ -159,6 +159,20 @@ class TestQueueFaceFix(_Env):
         self.assertEqual(p["frames"], 241)
         self.assertEqual(P.upscale_frame_plan(240, p["frames"]), (240, 241))
 
+    def test_target_dims_come_back_for_the_toast(self):
+        # VA-22: the queued-toast used to say nothing about size. _Env's
+        # fixture clip is 640×384; queue_face_fix already computes the ×2
+        # canvas for its own refusal checks, so surfacing it is free.
+        r = P.queue_face_fix(str(self.clip))
+        self.assertTrue(r["ok"], r)
+        self.assertEqual((r["target_w"], r["target_h"]), (1280, 768))
+
+    def test_target_dims_on_a_duplicate_too(self):
+        a = P.queue_face_fix(str(self.clip))
+        b = P.queue_face_fix(str(self.clip))
+        self.assertTrue(b.get("duplicate"))
+        self.assertEqual((b["target_w"], b["target_h"]), (a["target_w"], a["target_h"]))
+
     def test_a_one_shot_take_uses_the_whole_takes_prompt(self):
         Path(str(self.clip) + ".json").write_text(json.dumps({
             "prompt": "the whole take", "label": "take", "take": {"seconds": 20},
@@ -377,7 +391,10 @@ class TestUI(unittest.TestCase):
         self.assertIn("upscale_steps", fn)
 
     def test_load_params_restores_the_exact_recipe(self):
-        lp = QJS[QJS.index("  else if (p.mode === 'upscale') {"):]
+        # VA-08: this branch used to be `else if` — now a plain `if`, because
+        # loadParams() switches to the Video tab (workflowSwitch('manual'))
+        # right before it, for every branch that fills #genForm.
+        lp = QJS[QJS.index("  if (p.mode === 'upscale') {"):]
         lp = lp[:lp.index("  else if (p.mode === 'extend')")]
         self.assertIn("(b.dataset.start || '') === start && (b.dataset.steps || '') === steps", lp)
         self.assertIn("set('keep_shot', keep); set('upscale_start', start); set('upscale_steps', steps);", lp)
@@ -395,7 +412,10 @@ class TestUI(unittest.TestCase):
         self.assertIn('type="checkbox" id="h3FaceFixAfter"', row)
         tag = row.split('id="h3FaceFixAfter"')[1].split(">")[0]
         self.assertNotRegex(tag, r'(^|\s)checked(\s|=|$)')
-        self.assertIn("Also run <b>Upscale &amp; Face Fix</b> after the draft", row)
+        # H3-26: this checkbox is offered whenever H3.upscale_modes allows
+        # ltx_x2, not only on the Draft tier, so its label no longer says
+        # "the draft" — "this render" is accurate on Standard/High too.
+        self.assertIn("Also run <b>Upscale &amp; Face Fix</b> after this render", row)
         self.assertIn('id="h3_upscale" value="fit_720p"', HTML)
         self.assertEqual(P.H3_UPSCALE_DEFAULT, "fit_720p")
         self.assertIn("ltx_x2", P.H3_UPSCALE_MODES)            # stored value kept

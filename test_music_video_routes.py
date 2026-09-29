@@ -264,6 +264,149 @@ class TheStructureCanBeGiven(unittest.TestCase):
                 self.assertIn(word, h.body["error"])
 
 
+class TheClassifierMustNotPlanSilentlyAgainstNoVocal(unittest.TestCase):
+    """FILM-12: a real track with no voice band and a Singer picture cast
+    used to plan straight through to "0 singing shots" with nothing said.
+    The route now refuses (409) and hands back the phrases it looked at, so
+    the client can mark them — unless the caller already gave `sections`,
+    `lyrics`/`score_abc`, or explicitly says `plan_anyway`."""
+
+    def test_a_voiceless_track_with_a_singer_cast_is_refused_not_silently_shot(self):
+        with _Fixture() as fx:
+            song = (P.UPLOADS / "_mvtest_novoice.wav").resolve()
+            click_track(song, bars=24, vocal_bars=())          # no voice band
+            try:
+                h = _Handler(fx.form(song=str(song)))          # a singer IS cast
+                R.post_music_video_plan(h, "/music/video/plan", {}, "")
+                self.assertEqual(h.status, 409, h.body)
+                self.assertTrue(h.body.get("no_vocal_detected"))
+                self.assertTrue(h.body.get("sections"))
+                self.assertTrue(all(r["kind"] == "instrumental"
+                                    for r in h.body["sections"]))
+                self.assertIn("no singing", h.body["error"])
+            finally:
+                song.unlink(missing_ok=True)
+
+    def test_plan_anyway_bypasses_the_refusal(self):
+        with _Fixture() as fx:
+            song = (P.UPLOADS / "_mvtest_novoice2.wav").resolve()
+            click_track(song, bars=24, vocal_bars=())
+            try:
+                h = _Handler(fx.form(song=str(song), plan_anyway="1"))
+                R.post_music_video_plan(h, "/music/video/plan", {}, "")
+                self.assertEqual(h.status, 200, h.body)
+                self.assertEqual(sum(1 for s in h.body["shots"]
+                                     if s["kind"] == "singing"), 0)
+            finally:
+                song.unlink(missing_ok=True)
+
+    def test_marking_a_section_vocal_and_resubmitting_as_sections_plans_it(self):
+        with _Fixture() as fx:
+            song = (P.UPLOADS / "_mvtest_novoice3.wav").resolve()
+            click_track(song, bars=24, vocal_bars=())
+            try:
+                h = _Handler(fx.form(song=str(song)))
+                R.post_music_video_plan(h, "/music/video/plan", {}, "")
+                self.assertEqual(h.status, 409)
+                sections = h.body["sections"]
+                sections[0]["kind"] = "vocal"          # the user marks one
+                h2 = _Handler(fx.form(song=str(song),
+                                      sections=json.dumps(sections)))
+                R.post_music_video_plan(h2, "/music/video/plan", {}, "")
+                self.assertEqual(h2.status, 200, h2.body)
+                self.assertGreater(sum(1 for s in h2.body["shots"]
+                                       if s["kind"] == "singing"), 0)
+            finally:
+                song.unlink(missing_ok=True)
+
+    def test_a_cast_with_no_singer_is_never_nagged(self):
+        # All-instrumental with no Singer picture is a CORRECT plan, not a
+        # miss — must not be refused.
+        with _Fixture() as fx:
+            song = (P.UPLOADS / "_mvtest_novoice4.wav").resolve()
+            click_track(song, bars=24, vocal_bars=())
+            try:
+                images = [im for im in fx.images if im["role"] != "singer"]
+                h = _Handler(fx.form(song=str(song), images=json.dumps(images)))
+                R.post_music_video_plan(h, "/music/video/plan", {}, "")
+                self.assertEqual(h.status, 200, h.body)
+            finally:
+                song.unlink(missing_ok=True)
+
+    def test_a_song_with_lyrics_in_the_form_is_never_nagged(self):
+        # Lyrics/score are the user's OWN word on which sections sing — the
+        # classifier is not even consulted, so there is nothing to warn about.
+        with _Fixture() as fx:
+            song = (P.UPLOADS / "_mvtest_novoice5.wav").resolve()
+            click_track(song, bars=24, vocal_bars=())
+            try:
+                h = _Handler(fx.form(song=str(song), lyrics=LYRICS, score_abc=SCORE))
+                R.post_music_video_plan(h, "/music/video/plan", {}, "")
+                self.assertEqual(h.status, 200, h.body)
+            finally:
+                song.unlink(missing_ok=True)
+
+
+class ReplanningUpdatesTheSameBoard(unittest.TestCase):
+    """FILM-43: every re-plan used to mint a brand-new, identically-titled
+    board — the board list filled up with duplicates of the same music
+    video instead of the plan just updating."""
+
+    def test_a_board_id_naming_an_existing_music_video_board_is_reused(self):
+        with _Fixture() as fx:
+            h1 = _Handler(fx.form())
+            R.post_music_video_plan(h1, "/music/video/plan", {}, "")
+            self.assertEqual(h1.status, 200, h1.body)
+            first_id = h1.body["board_id"]
+
+            h2 = _Handler(fx.form(board_id=first_id, title="Renamed cut"))
+            R.post_music_video_plan(h2, "/music/video/plan", {}, "")
+            self.assertEqual(h2.status, 200, h2.body)
+            self.assertEqual(h2.body["board_id"], first_id, "re-plan minted a new board")
+
+            boards = storyboard.list_storyboards(P.STATE_DIR)
+            self.assertEqual(sum(1 for b in boards if b["id"] == first_id), 1)
+
+    def test_the_original_created_at_survives_a_reused_replan(self):
+        with _Fixture() as fx:
+            h1 = _Handler(fx.form())
+            R.post_music_video_plan(h1, "/music/video/plan", {}, "")
+            first_id = h1.body["board_id"]
+            before = storyboard.load_storyboard(P.STATE_DIR, first_id)["created_at"]
+
+            h2 = _Handler(fx.form(board_id=first_id))
+            R.post_music_video_plan(h2, "/music/video/plan", {}, "")
+            after = storyboard.load_storyboard(P.STATE_DIR, first_id)["created_at"]
+            self.assertEqual(before, after)
+
+    def test_a_board_id_for_a_non_music_video_board_is_never_reused(self):
+        with _Fixture() as fx:
+            plain = P.storyboard.new_storyboard("sb_plain_board", "Not a music video")
+            P.storyboard.save_storyboard(P.STATE_DIR, plain)
+            h = _Handler(fx.form(board_id="sb_plain_board"))
+            R.post_music_video_plan(h, "/music/video/plan", {}, "")
+            self.assertEqual(h.status, 200, h.body)
+            self.assertNotEqual(h.body["board_id"], "sb_plain_board")
+            # the unrelated board is untouched
+            self.assertNotIn("music_video",
+                            P.storyboard.load_storyboard(P.STATE_DIR, "sb_plain_board"))
+
+    def test_an_unknown_board_id_just_plans_a_fresh_board(self):
+        with _Fixture() as fx:
+            h = _Handler(fx.form(board_id="sb_does_not_exist"))
+            R.post_music_video_plan(h, "/music/video/plan", {}, "")
+            self.assertEqual(h.status, 200, h.body)
+            self.assertNotEqual(h.body["board_id"], "sb_does_not_exist")
+
+    def test_no_board_id_at_all_still_plans_a_fresh_board_as_before(self):
+        with _Fixture() as fx:
+            h1 = _Handler(fx.form())
+            R.post_music_video_plan(h1, "/music/video/plan", {}, "")
+            h2 = _Handler(fx.form())
+            R.post_music_video_plan(h2, "/music/video/plan", {}, "")
+            self.assertNotEqual(h1.body["board_id"], h2.body["board_id"])
+
+
 class TheShotPromptsAreParsed(unittest.TestCase):
 
     def test_both_spellings_mean_the_same_thing(self):

@@ -376,9 +376,17 @@ def post_character_generate(h, path, qs, ctype) -> None:
     # Optional image / audio paths for i2v and i2v+clean-audio modes.
     # Frontend uploads files via /upload, gets back a path, and
     # passes it here. Mode auto-switches:
-    #   image + audio  → i2v_clean_audio (character lip-syncs to audio)
+    #   image + audio  → i2v_clean_audio (audio MUXED onto the render —
+    #                    not lip-sync; the mouth does not follow this file,
+    #                    see VA-20/webapp/docs/audio.md)
     #   image only     → i2v             (character animates from still)
-    #   audio only     → t2v + audio     (audio drives generation; rare)
+    #   audio only     → REFUSED (VA-37) — t2v never reads the audio field,
+    #                    so this used to queue a silent-audio render with
+    #                    no indication anything was dropped. For real
+    #                    lip-sync (audio-conditioned generation, the mouth
+    #                    actually follows the track) use the Video tab's
+    #                    Lip-sync mode (a2v), which takes a character's face
+    #                    LoRA as an ordinary LoRA pick.
     #   neither        → t2v             (default)
     image_path = (form.get("image", [""])[0] or "").strip()
     audio_path = (form.get("audio", [""])[0] or "").strip()
@@ -386,6 +394,13 @@ def post_character_generate(h, path, qs, ctype) -> None:
         h._json({"error": f"image not found: {image_path}"}, 400); return
     if audio_path and not P.Path(audio_path).exists():
         h._json({"error": f"audio not found: {audio_path}"}, 400); return
+    if audio_path and not image_path:
+        h._json({"error": "audio needs an image to make a mux (image + "
+                           "audio); without one the audio would be silently "
+                           "dropped. For a character that talks or sings to "
+                           "your audio, use Lip-sync on the Video tab "
+                           "instead — that's audio-conditioned generation, "
+                           "not a mux."}, 400); return
     if image_path and audio_path:
         mode = "i2v_clean_audio"
     elif image_path:

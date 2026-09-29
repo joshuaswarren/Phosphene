@@ -71,6 +71,42 @@ ROLE_LINES = {
     ("room", "broll"): "wide, small room, warm light",
 }
 
+#: FILM-12: the same ROLE_LINES sentence repeated on every B-roll slot is
+#: what an 8-shot plan with one picture per role looked like — "8 shots, all
+#: the same prompt." Each role gets a small rotation of framing/subject/
+#: motion so consecutive B-roll shots of the same picture do not read as
+#: duplicates; `_broll_variant_line` below picks one per slot, deterministic
+#: on the slot's own turn number so a re-plan of the same cast is stable.
+#: `ROLE_LINES` stays the single-entry fallback for a role with no rotation.
+ROLE_LINE_VARIANTS = {
+    "singer": [
+        "close-up, still, eyes down between lines",
+        "medium close-up, three-quarter turn, still",
+        "close-up, a slow breath before the next line, still",
+        "medium shot, hands resting, looking past the camera, still",
+    ],
+    "instrument": [
+        "hands on the piano keys, slow push-in",
+        "close on the strings, fingers resting, warm light",
+        "wide on the instrument at rest in the room, still",
+        "over the shoulder on the hands, slow pull-back",
+    ],
+    "room": [
+        "wide, small room, warm light",
+        "medium wide, low angle across the room, warm light",
+        "wide, drifting slowly across the room, warm light",
+        "close on one detail of the room, warm light",
+    ],
+}
+
+
+def _broll_variant_line(role: str, turn: int) -> str:
+    """The `turn`-th B-roll direction for `role` — see ROLE_LINE_VARIANTS."""
+    variants = ROLE_LINE_VARIANTS.get(role)
+    if variants:
+        return variants[turn % len(variants)]
+    return ROLE_LINES.get((role, "broll")) or ROLE_LINES[("room", "broll")]
+
 # ---------------------------------------------------------------------------
 # THE DURATION AXIS
 # ---------------------------------------------------------------------------
@@ -649,7 +685,7 @@ def _with_style(line: str, style: str) -> str:
 
 
 def _prompt_for(image: dict, kind: str, style: str, *,
-                silent: bool = False) -> str:
+                silent: bool = False, variant: int = 0) -> str:
     """The shot's direction: the picture's own line, then the film's look.
 
     An image carries `prompt` when the user typed one for it, and that REPLACES
@@ -662,22 +698,48 @@ def _prompt_for(image: dict, kind: str, style: str, *,
     words are scrubbed, the direction is capped, and the literal sync
     contract is appended LAST so a user's own line cannot paraphrase it away.
     `silent=True` swaps that contract for the relaxed-closed-lips one.
+
+    FILM-12: for a B-roll shot with no picture-level `prompt`, `variant`
+    (the shot's own turn in the B-roll rotation) picks one of that role's
+    ROLE_LINE_VARIANTS instead of always the same single sentence — the same
+    picture cut to twice in a row reads as two different shots, not a loop.
     """
-    line = (str(image.get("prompt") or "").strip()
-            or ROLE_LINES.get((image.get("role"), kind))
-            or ROLE_LINES[("room", "broll")])
-    return _sing_prompt(_with_style(line, style), kind, silent=silent)
+    typed = str(image.get("prompt") or "").strip()
+    if typed:
+        line = typed
+    elif kind == "broll":
+        line = _broll_variant_line(image.get("role") or "room", variant)
+    else:
+        line = ROLE_LINES.get((image.get("role"), kind)) or ROLE_LINES[("room", "broll")]
+    return _sing_prompt(line, style, kind, silent=silent)
 
 
-def _sing_prompt(text: str, kind: str, *, silent: bool = False) -> str:
+def _sing_prompt(line: str, style: str, kind: str, *, silent: bool = False) -> str:
     """One direction, put through the a2v law when the shot is audio-driven.
 
     B-roll is untouched: an i2v shot has no waveform, so a contract about
-    syllables would be a sentence about a sound that is not there.
+    syllables would be a sentence about a sound that is not there — B-roll
+    still gets `line + style` joined the ordinary way, uncapped.
+
+    FILM-13/FILM-14: for a SINGING shot the LINE is capped FIRST
+    (`a2v_direction`, `storyboard.A2V_MAX_WORDS`), and the style is appended
+    ONLY AFTER — the join used to happen before the cap
+    (`_with_style(line, style)` handed straight to the a2v pipeline), so a
+    line already near the 40-word limit silently lost the whole style
+    suffix the cap trimmed off the end. A singing shot rendered with no
+    style is a singing shot with different (or no) lighting from the film's
+    B-roll, which is uncapped and always keeps it — the lighting mismatch
+    this fixes.
     """
     if kind != "singing":
-        return text
-    return storyboard.a2v_prompt(text, silent=silent)
+        return _with_style(line, style)
+    capped_line = storyboard.a2v_direction(line, max_words=storyboard.A2V_MAX_WORDS)
+    combined = _with_style(capped_line, style)
+    # max_words=None: the direction was already capped above; this second
+    # pass only re-scrubs stillness in the (uncapped) style clause and
+    # appends the literal lip-sync contract last, per storyboard.a2v_prompt's
+    # own contract.
+    return storyboard.a2v_prompt(combined, silent=silent, max_words=None)
 
 
 def slice_is_silent(sections, t0: float, t1: float) -> bool:
@@ -841,7 +903,8 @@ def plan_music_video(sections, images, *, style: str, bpm_grid,
     singer_turn = 0
     broll_turn = 0
 
-    def emit(image: dict, kind: str, frames: int, section: dict) -> None:
+    def emit(image: dict, kind: str, frames: int, section: dict,
+            variant: int = 0) -> None:
         nonlocal cursor
         dur = frames / float(FPS)
         n = len(shots) + 1
@@ -865,13 +928,18 @@ def plan_music_video(sections, images, *, style: str, bpm_grid,
             # have to know that rule.
             "mode": "a2v" if kind == "singing" else "text",
             "engine": "ltx",
-            "prompt": _sing_prompt(_with_style(line, style), kind,
-                                   silent=silent) if line
-                      else _prompt_for(image, kind, style, silent=silent),
+            "prompt": _sing_prompt(line, style, kind, silent=silent) if line
+                      else _prompt_for(image, kind, style, silent=silent,
+                                       variant=variant),
             "duration_s": round(dur, 4),
             "seed": -1,
             "refs": [],
             "still": image["path"],
+            # FILM-11: this is the user's OWN uploaded cast picture, not a
+            # machine-generated anchor still — "New still" must never treat
+            # it as disposable render-cache the way it treats a planner's
+            # own still.
+            "still_source": "user",
             "status": "pending",
             "music_video": {
                 "kind": kind,
@@ -931,7 +999,8 @@ def plan_music_video(sections, images, *, style: str, bpm_grid,
                 cursor += new_dur - old_dur
                 continue
             frames = max(_frames_for(max(span, MIN_SHOT_S)), _frames_for(MIN_SHOT_S))
-            emit(ring[broll_turn % len(ring)], "broll", frames, sec)
+            emit(ring[broll_turn % len(ring)], "broll", frames, sec,
+                variant=broll_turn)
             broll_turn += 1
 
     if not shots:
@@ -1139,11 +1208,13 @@ def _recast(shot: dict, image: dict, style: str, overrides: dict) -> None:
     """
     block = shot["music_video"]
     shot["still"] = image["path"]
+    shot["still_source"] = "user"          # FILM-11 — see emit()
     block["image"] = image["path"]
     block["role"] = image["role"]
     line = overrides.get(int(shot["n"]))
     shot["prompt"] = (_with_style(line, style) if line
-                      else _prompt_for(image, "broll", style))
+                      else _prompt_for(image, "broll", style,
+                                       variant=int(shot.get("n") or 0)))
 
 
 def _pin_broll(shots: list[dict], pool: list[dict], style: str,

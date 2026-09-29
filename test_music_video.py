@@ -428,6 +428,95 @@ class ThePlan(_Planned, unittest.TestCase):
             self.plan(images=[])
 
 
+class BrollPromptsVaryPerSlot(_Planned, unittest.TestCase):
+    """FILM-12: "8 shots · 0 singing · 8 B-roll" all shared ONE sentence —
+    the same picture cast on consecutive B-roll shots got the exact same
+    direction every time, which reads as a loop rather than a film."""
+
+    def test_consecutive_broll_shots_of_the_same_role_get_different_lines(self):
+        # All instrumental: every shot is B-roll, cast from a 1-picture pool
+        # (IMAGES has one "room" picture and one "singer"; force room-only).
+        rows = [dict(r, kind="instrumental") for r in self.sections]
+        out = self.plan(sections=rows,
+                        images=[{"path": "/tmp/mv/room_a.png", "role": "room"}])
+        broll = [s for s in out["shots"] if s["music_video"]["kind"] == "broll"]
+        self.assertGreaterEqual(len(broll), 3, "need several shots to prove variation")
+        prompts = [s["prompt"] for s in broll]
+        # Not every prompt is identical — the whole point of the fix.
+        self.assertGreater(len(set(prompts)), 1, prompts)
+        # Consecutive shots specifically must differ (that's what reads as
+        # "the same clip 8 times" to a viewer).
+        for a, b in zip(prompts, prompts[1:]):
+            self.assertNotEqual(a, b)
+        # Still the film's look on every one of them.
+        for p in prompts:
+            self.assertIn(STYLE, p)
+
+    def test_the_rotation_is_deterministic_across_replans(self):
+        rows = [dict(r, kind="instrumental") for r in self.sections]
+        images = [{"path": "/tmp/mv/room_a.png", "role": "room"}]
+        a = [s["prompt"] for s in self.plan(sections=rows, images=images)["shots"]]
+        b = [s["prompt"] for s in self.plan(sections=rows, images=images)["shots"]]
+        self.assertEqual(a, b)
+
+    def test_a_pictures_own_typed_line_is_never_overridden_by_a_variant(self):
+        rows = [dict(r, kind="instrumental") for r in self.sections]
+        images = [{"path": "/tmp/mv/room_a.png", "role": "room",
+                  "prompt": "the empty stage after the show"}]
+        out = self.plan(sections=rows, images=images)
+        for s in out["shots"]:
+            self.assertIn("the empty stage after the show", s["prompt"])
+
+
+class SingingShotsKeepTheStyle(_Planned, unittest.TestCase):
+    """FILM-13/14: the style used to be joined onto the line BEFORE the
+    40-word a2v cap, so a long sung line silently deleted the whole style
+    suffix — singing shots rendered under different (or no) light from the
+    film's B-roll, which is never capped and always keeps it."""
+
+    LONG_LINE = ("she leans into the microphone and closes her eyes, "
+                "singing the chorus with her whole chest, one hand "
+                "lifted, the room holding its breath around her voice "
+                "as the band falls back to let her carry the whole line "
+                "alone until the final note fades into silence")
+
+    def test_a_long_sung_line_still_carries_the_style(self):
+        self.assertGreaterEqual(len(self.LONG_LINE.split()), storyboard.A2V_MAX_WORDS)
+        out = self.plan(images=[
+            {"path": "/tmp/mv/singer_a.png", "role": "singer",
+             "prompt": self.LONG_LINE}])
+        sung = [s for s in out["shots"] if s["music_video"]["kind"] == "singing"]
+        self.assertTrue(sung)
+        for s in sung:
+            self.assertIn(STYLE, s["prompt"], s["prompt"])
+
+    def test_the_line_is_capped_and_the_contract_still_lands_last(self):
+        out = self.plan(images=[
+            {"path": "/tmp/mv/singer_a.png", "role": "singer",
+             "prompt": self.LONG_LINE}])
+        sung = [s for s in out["shots"] if s["music_video"]["kind"] == "singing"]
+        self.assertTrue(sung)
+        for s in sung:
+            p = s["prompt"]
+            # style survives, AND lands BEFORE the contract (the fix's whole
+            # order requirement: line, then style, then contract, last).
+            self.assertIn(STYLE, p)
+            self.assertIn("lip-sync", p.lower())
+            self.assertLess(p.index(STYLE), p.lower().index("lip-sync"))
+            # the line was genuinely capped, not smuggled through whole
+            self.assertNotIn("until the final note fades into silence", p)
+
+    def test_a_short_sung_line_is_unaffected(self):
+        out = self.plan(images=[
+            {"path": "/tmp/mv/singer_a.png", "role": "singer",
+             "prompt": "she looks up and sings the last line"}])
+        sung = [s for s in out["shots"] if s["music_video"]["kind"] == "singing"]
+        self.assertTrue(sung)
+        for s in sung:
+            self.assertIn("she looks up and sings the last line", s["prompt"])
+            self.assertIn(STYLE, s["prompt"])
+
+
 class TheQualityDecidesTheDurationAxis(_Planned, unittest.TestCase):
     """The bug the first real film found: a 481-frame a2v shot planned onto a
     1024×576 board, where LTX dies around frame 454. The planner now knows

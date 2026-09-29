@@ -38,7 +38,8 @@ FETCHES = [];
 NEXT = { status: 200, body: { boards: [
   { id: 'sb_a', title: 'Night Drive', clips: 3 },
   { id: 'sb_b', title: 'Divorce <v2>', clips: 1 },
-  { id: 'sb_c', title: 'Not rendered yet', clips: 0 } ] } };
+  { id: 'sb_c', title: 'Not rendered yet', clips: 0 },
+  { id: 'sb_d', title: 'Cut from imports', clips: 0, has_timeline: true } ] } };
 await sbeFilmsToggle();
 out.asked = FETCHES.map(f => f.url);
 out.open = !els.sbeFilmsMenu.hidden;
@@ -93,6 +94,10 @@ function escapeHtml(s) {
         self.assertNotIn("Not rendered yet", html)
         self.assertEqual(html.count('aria-current="true"'), 1)
         self.assertIn("sbeFilmsPick('sb_b')", html)
+        # FILM-43: a film cut from imported/Video-tab clips has a timeline
+        # and zero rendered shots of its own — `has_timeline` keeps it in
+        # the list where `clips > 0` alone would have dropped it.
+        self.assertIn("Cut from imports", html)
         self.assertTrue(self.r["noteHidden"])
 
     def test_picking_another_film_opens_it_and_the_open_one_is_a_no_op(self):

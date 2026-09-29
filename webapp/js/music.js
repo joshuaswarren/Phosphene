@@ -22,7 +22,14 @@ function _say(msg) { const el = _el('songStatus'); if (el) el.textContent = msg 
 async function songCardRender(o) {
   const card = _el('songCard');
   if (!card) return;
-  const isSong = o && o.kind === 'audio' && o.engine === 'music';
+  // VC-20: the Song card (New take / Re-roll the sound / Cover it / Sheet
+  // music...) is Music Studio's own surface. selectOutput() runs this for
+  // EVERY selection, including a song reached by filtering the Video tab's
+  // own gallery to Audio — which used to fill the Video tab's player pane
+  // with the Music tab's controls. Only the Audio tab itself gets the full
+  // card; everywhere else a song is just another gallery entry.
+  const onAudioTab = document.body.dataset.workflow === 'audio';
+  const isSong = o && o.kind === 'audio' && o.engine === 'music' && onAudioTab;
   card.hidden = !isSong;
   // THE PREVIOUS SONG IS GONE THE MOMENT ANOTHER IS PICKED (M6-02). SONG
   // used to keep the last song until the new one's score arrived, so an
@@ -68,7 +75,16 @@ async function songCardRender(o) {
 }
 
 function _songNameFromFile(name) {
-  return String(name || '').replace(/\.wav$/i, '').replace(/^music_\d{8}_\d{6}_/, '').replace(/_/g, ' ');
+  // FILM-43: only .wav was stripped here, so a dropped .mp3/.m4a/.flac (or
+  // a raw upload, which used file.name directly and skipped this function
+  // entirely) kept its extension as the board's title forever ("song40.wav").
+  // 4.17: also the upload route's millisecond prefix ("1790123456789_…"),
+  // which a raw upload's path carries. Server mirror: routes_music.py
+  // _board_title_from_song.
+  return String(name || '').split('/').pop()
+    .replace(/\.(wav|mp3|m4a|flac|aac|ogg|opus|aiff?)$/i, '')
+    .replace(/^\d{10,}_/, '')
+    .replace(/^music_\d{8}_\d{6}_/, '').replace(/_/g, ' ').trim();
 }
 
 // The gallery block carries `loras: [{name, strength}]`; /music/score answers
@@ -251,6 +267,16 @@ function musicCoverFromSong(song) {
 }
 
 function musicOpenSong(path) {
+  if (typeof selectOutput === 'function') selectOutput(path);
+}
+
+// VC-20: the "Open in Audio tab" link on a song reached from another tab's
+// filtered gallery (e.g. Video -> Outputs -> Audio). Switches workflow
+// FIRST so songCardRender()/selectOutput()'s onAudioTab check sees the
+// audio tab already active and renders the full Music Studio surface,
+// then selects the song there.
+function openSongInAudioTab(path) {
+  if (typeof workflowSwitch === 'function') workflowSwitch('audio');
   if (typeof selectOutput === 'function') selectOutput(path);
 }
 
@@ -742,6 +768,7 @@ function _watchScoreJob(id) {
 
 Object.assign(globalThis, {
   songCardRender, musicVariation, musicRestyleFromSong, musicCoverFromSong, musicOpenSong,
+  openSongInAudioTab,
   musicSongAction,
   musicScoreEditToggle, musicScorePreview, musicRenderEditedScore, musicScoreCopy,
   musicTaskSet, musicTaskPick, musicWriteLyrics, musicTranscribe,
@@ -1048,6 +1075,43 @@ const MV = { song: null, songName: '', songSeconds: null, cast: [], busy: false,
 
 function mvSay(msg) { const el = _el('mvStatus'); if (el) el.textContent = msg || ''; }
 
+// 4.17: THE BRIEF SURVIVES A RELOAD. The song, the pictures and their roles
+// (and the board they last planned) used to live only in this object, so a
+// reload — or the restart every Update asks for — emptied the pane and the
+// user re-uploaded every picture. A per-browser draft (localStorage, same
+// shape as the Video tab's VC-38 draft), written on every change, read once
+// on the first mvInit. Every access is guarded: blocked storage degrades to
+// "no draft", never to a broken pane.
+const MV_DRAFT_KEY = 'phos_mv_draft_v1';
+let _mvDraftRestored = false;
+function mvSaveDraft() {
+  try {
+    const d = { song: MV.song, songName: MV.songName, songSeconds: MV.songSeconds,
+                boardId: MV.boardId,
+                cast: MV.cast.map(c => ({ path: c.path, name: c.name,
+                                          role: c.role || '', prompt: c.prompt || '' })) };
+    if (!d.song && !d.cast.length) localStorage.removeItem(MV_DRAFT_KEY);
+    else localStorage.setItem(MV_DRAFT_KEY, JSON.stringify(d));
+  } catch (e) { /* private window / blocked storage: no draft */ }
+}
+function mvRestoreDraft() {
+  if (_mvDraftRestored) return;
+  _mvDraftRestored = true;
+  if (MV.song || MV.cast.length) return;           // never over live work
+  let d = null;
+  try { d = JSON.parse(localStorage.getItem(MV_DRAFT_KEY) || 'null'); } catch (e) { d = null; }
+  if (!d || typeof d !== 'object') return;
+  MV.song = (typeof d.song === 'string' && d.song) ? d.song : null;
+  MV.songName = String(d.songName || '');
+  MV.songSeconds = (d.songSeconds != null && isFinite(Number(d.songSeconds))) ? Number(d.songSeconds) : null;
+  MV.boardId = String(d.boardId || '');
+  MV.cast = Array.isArray(d.cast)
+    ? d.cast.filter(c => c && typeof c.path === 'string' && c.path)
+        .map(c => ({ path: c.path, name: String(c.name || ''),
+                     role: String(c.role || ''), prompt: String(c.prompt || '') }))
+    : [];
+}
+
 function mvInit() {
   const drop = _el('mvImagesDrop');
   const file = _el('mvImagesFile');
@@ -1076,6 +1140,7 @@ function mvInit() {
     });
     song.addEventListener('change', () => { if (song.files[0]) mvUploadSong(song.files[0]); });
   }
+  mvRestoreDraft();
   mvRenderSong();
   mvRenderCast();
   mvFillLibrary();
@@ -1087,8 +1152,15 @@ function mvInit() {
 function mvFillLibrary() {
   const sel = _el('mvSongLibrary');
   if (!sel) return;
+  // FILM-44: this used to list only songs COMPOSED in-app (engine ===
+  // 'music') — any audio the user already had (dropped into uploads,
+  // rendered somewhere else, a client's raw track) never appeared, so
+  // "pick one from the library" was a lie unless you had written it here
+  // first. Every audio file the gallery knows about is a candidate now;
+  // a composed song still leads with its real title, an uploaded file
+  // with its (extension-stripped) filename.
   const songs = (typeof currentOutputs !== 'undefined' && currentOutputs || [])
-    .filter(o => o && o.kind === 'audio' && o.engine === 'music');
+    .filter(o => o && o.kind === 'audio');
   const keep = sel.value;
   sel.innerHTML = songs.length
     ? '<option value="">Pick one…</option>' + songs.map(o => {
@@ -1096,7 +1168,7 @@ function mvFillLibrary() {
         const label = m.title || _songNameFromFile(o.name) || o.name;
         return `<option value="${_esc(o.path)}">${_esc(label)}</option>`;
       }).join('')
-    : '<option value="">Nothing composed yet</option>';
+    : '<option value="">No audio in outputs or uploads yet</option>';
   if (keep && songs.some(o => o.path === keep)) sel.value = keep;
 }
 
@@ -1105,7 +1177,7 @@ function mvPickFromLibrary(path) {
   const o = (typeof currentOutputs !== 'undefined' && currentOutputs || [])
     .find(x => x && x.path === path);
   MV.song = path;
-  MV.songName = (o && ((o.music || {}).title || _songNameFromFile(o.name))) || path.split('/').pop();
+  MV.songName = (o && ((o.music || {}).title || _songNameFromFile(o.name))) || _songNameFromFile(path);
   MV.songSeconds = (o && (o.clip_sec != null ? Number(o.clip_sec) : null));
   mvRenderSong();
   mvSay('');
@@ -1120,7 +1192,7 @@ async function mvUploadSong(file) {
     const data = await r.json();
     if (!r.ok || data.error) throw new Error(data.error || ('HTTP ' + r.status));
     MV.song = data.path;
-    MV.songName = file.name;
+    MV.songName = _songNameFromFile(file.name);
     MV.songSeconds = (data.duration_sec != null) ? Number(data.duration_sec) : null;
     const sel = _el('mvSongLibrary'); if (sel) sel.value = '';
     mvRenderSong();
@@ -1132,11 +1204,16 @@ async function mvUploadSong(file) {
 
 function mvClearSong() {
   MV.song = null; MV.songName = ''; MV.songSeconds = null;
+  // FILM-43: a cleared song is a genuinely new session — the next Plan
+  // must mint its own board, not silently overwrite whatever this pane
+  // planned before.
+  MV.boardId = '';
   const sel = _el('mvSongLibrary'); if (sel) sel.value = '';
   mvRenderSong();
 }
 
 function mvRenderSong() {
+  mvSaveDraft();
   const slot = _el('mvSongSlot');
   if (!slot) return;
   if (!MV.song) {
@@ -1169,9 +1246,14 @@ async function mvAddPictures(files) {
       if (!r.ok || data.error) throw new Error(data.error || ('HTTP ' + r.status));
       // The FIRST picture is the singer unless the user says otherwise: a cast
       // with no face plans as B-roll only, and arriving at that by default
-      // would read as the feature not working.
+      // would read as the feature not working. FILM-12: every picture AFTER
+      // that used to default to Room with no evidence at all — a photo of a
+      // guitar or a piano silently mislabelled "the wide, the lights, the
+      // audience" and rendered with that prompt. There is no vision check
+      // here, so guessing wrong is worse than asking: left unset, and
+      // mvPlan() refuses to plan until every picture has a role.
       MV.cast.push({ path: data.path, name: f.name,
-                     role: MV.cast.length === 0 ? 'singer' : 'room', prompt: '' });
+                     role: MV.cast.length === 0 ? 'singer' : '', prompt: '' });
     } catch (e) {
       mvSay(`Could not add ${f.name}: ` + (e.message || e));
       mvRenderCast();
@@ -1190,6 +1272,7 @@ function mvSetRole(i, role) {
 
 function mvSetPrompt(i, text) {
   if (MV.cast[i]) MV.cast[i].prompt = String(text || '');
+  mvSaveDraft();
 }
 
 function mvRemovePicture(i) {
@@ -1204,10 +1287,11 @@ const MV_ROLES = [
 ];
 
 function mvRenderCast() {
+  mvSaveDraft();
   const box = _el('mvCast');
   if (!box) return;
   box.innerHTML = MV.cast.map((im, i) => `
-    <div class="mv-pic">
+    <div class="mv-pic${im.role ? '' : ' needs-role'}">
       <img class="mv-pic-thumb" src="/image?path=${encodeURIComponent(im.path)}&w=160" alt="">
       <div class="mv-pic-body">
         <div class="mv-pic-name" title="${_esc(im.path)}">${_esc(im.name || im.path.split('/').pop())}</div>
@@ -1216,6 +1300,7 @@ function mvRenderCast() {
             <button type="button" class="pill-btn${im.role === key ? ' active' : ''}"
                     data-i="${i}" data-role="${key}" title="${_esc(tip)}">${label}</button>`).join('')}
         </div>
+        ${im.role ? '' : '<div class="hint mv-pic-warn">Pick a role — nothing is guessed for you.</div>'}
         <input type="text" class="mv-pic-prompt" data-i="${i}"
                placeholder="Optional — what happens in this shot"
                value="${_esc(im.prompt || '')}">
@@ -1241,10 +1326,41 @@ function mvRenderCast() {
   }
 }
 
+// FILM-12: the classifier can plan a real vocal track as all-instrumental —
+// "0 singing shots" with a Singer picture cast. The server refuses that one
+// case (409, no_vocal_detected) instead of silently shipping it, and hands
+// back the phrases it looked at so the user can mark which ones are sung.
+// `MV.pendingSections` holds that list, editable, between the refusal and a
+// deliberate re-submit — either "Plan with these sections" or "Plan as
+// B-roll only" (which just sets plan_anyway and bypasses the check).
+Object.assign(MV, { pendingSections: null });
+
 async function mvPlan() {
   if (MV.busy) return;
   if (!MV.song) { mvSay('Pick a song first.'); return; }
   if (!MV.cast.length) { mvSay('Drop at least one picture.'); return; }
+  // FILM-12: a picture with no role picked is one nobody has told the
+  // planner what to do with — mvAddPictures() no longer guesses "Room" for
+  // it, so pressing Plan on an unlabelled cast asks instead of misfiring.
+  if (MV.cast.some(c => !c.role)) {
+    mvSay('Pick a role for every picture — Singer, Instrument or Room.');
+    mvRenderCast();
+    return;
+  }
+  await _mvPlanRequest({});
+}
+
+async function mvPlanWithSections() {
+  if (!MV.pendingSections) return;
+  await _mvPlanRequest({ sections: MV.pendingSections });
+}
+
+async function mvPlanAnyway() {
+  await _mvPlanRequest({ planAnyway: true });
+}
+
+async function _mvPlanRequest(opts) {
+  if (MV.busy) return;
   const btn = _el('mvPlanBtn');
   MV.busy = true;
   if (btn) { btn.disabled = true; btn.textContent = 'Reading the song…'; }
@@ -1256,10 +1372,28 @@ async function mvPlan() {
       path: c.path, role: c.role, prompt: c.prompt || '' }))));
     fd.set('style', (_el('mvStyle') || {}).value || '');
     fd.set('title', MV.songName || 'Music video');
+    if (opts.sections) fd.set('sections', JSON.stringify(opts.sections));
+    if (opts.planAnyway) fd.set('plan_anyway', '1');
+    // FILM-43: re-planning inside the SAME session (marking sections,
+    // adjusting the cast, pressing Plan again) updates the board this pane
+    // already made instead of minting an identically-named duplicate of
+    // it. Cleared by mvClearSong() so a genuinely new song still gets its
+    // own board.
+    if (MV.boardId) fd.set('board_id', MV.boardId);
     const r = await fetch('/music/video/plan', { method: 'POST', body: fd });
     const data = await r.json();
+    if (data && data.no_vocal_detected) {
+      MV.pendingSections = data.sections || [];
+      mvRenderSections();
+      mvSay(data.error || 'I heard no singing in this track — mark the sung parts below.');
+      return;
+    }
+    // BOARD-1: the board is rendering — the plan was refused, nothing changed.
+    if (data && data.busy) { mvSay(data.error); return; }
     if (!r.ok || data.error) throw new Error(data.error || ('HTTP ' + r.status));
+    mvSectionsHide();
     MV.boardId = data.board_id;
+    mvSaveDraft();
     mvSay(data.summary + (data.notes && data.notes.length ? ' — ' + data.notes.join(' ') : ''));
     const chip = _el('mvSummary'); if (chip) chip.textContent = data.summary;
     if (typeof phosToast === 'function') phosToast(data.summary, { kind: 'success' });
@@ -1275,8 +1409,54 @@ async function mvPlan() {
   }
 }
 
+function mvSectionsHide() {
+  MV.pendingSections = null;
+  const box = _el('mvSections');
+  if (box) { box.hidden = true; box.innerHTML = ''; }
+}
+
+function _mvClock(sec) {
+  const s = Math.max(0, Math.round(Number(sec) || 0));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+// One chip per phrase the classifier looked at. Click toggles vocal <->
+// instrumental; the edited list is exactly what gets sent back as `sections`
+// on "Plan with these sections", which skips the classifier entirely
+// (given_sections() takes the caller's word for it).
+function mvRenderSections() {
+  const box = _el('mvSections');
+  if (!box || !MV.pendingSections) return;
+  box.hidden = false;
+  box.innerHTML = '<div class="hint" style="margin-bottom:6px;">'
+    + 'Click a phrase to mark it sung or instrumental, then plan again:</div>'
+    + '<div class="mv-section-chips">'
+    + MV.pendingSections.map((s, i) => {
+        const vocal = String(s.kind || '').toLowerCase() === 'vocal';
+        return `<button type="button" class="pill-btn mv-section-chip${vocal ? ' active' : ''}" data-i="${i}"
+                  title="${_esc(s.name || '')}: ${_mvClock(s.start)}–${_mvClock(s.end)}">
+                  ${_mvClock(s.start)}–${_mvClock(s.end)} · ${vocal ? 'Sung' : 'Instrumental'}
+                </button>`;
+      }).join('')
+    + '</div>'
+    + '<div class="actions" style="margin-top:8px;">'
+    + '<button type="button" class="primary" onclick="mvPlanWithSections()">Plan with these sections</button>'
+    + '<button type="button" onclick="mvPlanAnyway()">Plan as B-roll only</button>'
+    + '</div>';
+  box.querySelectorAll('.mv-section-chip').forEach(b =>
+    b.addEventListener('click', () => mvToggleSection(+b.dataset.i)));
+}
+
+function mvToggleSection(i) {
+  const s = MV.pendingSections && MV.pendingSections[i];
+  if (!s) return;
+  s.kind = String(s.kind || '').toLowerCase() === 'vocal' ? 'instrumental' : 'vocal';
+  mvRenderSections();
+}
+
 Object.assign(globalThis, {
   renderSongList, songHero, songCoverStyle, musicMenuOpen, musicMenuClose,
   musicBarShow, musicBarToggle, musicBarTogglePlay, musicBarStep, musicBarSeek, musicBarInit,
-  mvInit, mvPlan, mvPickFromLibrary, mvClearSong, mvFillLibrary,
+  mvInit, mvPlan, mvPlanWithSections, mvPlanAnyway, mvToggleSection,
+  mvPickFromLibrary, mvClearSong, mvFillLibrary,
 });

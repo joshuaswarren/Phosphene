@@ -70,8 +70,8 @@ const SHORTCUTS = [
 
   // ---- typing a prompt --------------------------------------------------------
   { id: 'prompt.generate', scope: 'prompt', combos: ['mod+enter'], typing: true,
-    owner: 'shortcuts.js (Video, Images) · oneshot.js (One Shot)',
-    label: 'Generate — from the Video prompt, the Images prompt or the One Shot prompt. Same as pressing the Generate button, so it queues a render.',
+    owner: 'shortcuts.js (Video, Images, Lip-sync) · oneshot.js (One Shot)',
+    label: 'Generate — from the Video prompt, the Images prompt, the Lip-sync prompt or the One Shot prompt. Same as pressing the Generate button, so it queues a render.',
     run: (ev) => shortcutGenerateFrom(ev.target) },
   { id: 'oneshot.beats', scope: 'prompt', combos: ['enter', 'backspace'], owner: 'oneshot.js',
     label: 'In One Shot beats: ⏎ goes to the next beat · ⌫ in an empty beat goes back one' },
@@ -87,6 +87,9 @@ const SHORTCUTS = [
   { id: 'outputs.trash', scope: 'outputs', combos: ['mod+backspace'], owner: 'shortcuts.js',
     label: 'Move the selected output to the Trash — asks first, like the trash button on the card',
     run: () => shortcutTrashOutput() },
+  { id: 'outputs.newtake', scope: 'outputs', combos: ['r'], owner: 'shortcuts.js',
+    label: 'New take — queue another render of the selected output, same recipe, a fresh seed (VC-03)',
+    run: () => shortcutNewTake() },
 
   // ---- the Editor: keys ---------------------------------------------------------
   // `calls` is the function the Editor's own keydown handler runs for these
@@ -104,6 +107,10 @@ const SHORTCUTS = [
   { id: 'editor.nudge', scope: 'editor', combos: ['alt+arrowleft', 'alt+arrowright'],
     hidden: ['alt+shift+arrowleft', 'alt+shift+arrowright'], owner: 'editor.js',
     calls: 'sbeNudge', label: 'Nudge the selected clips one frame earlier / later · add ⇧ for ten' },
+  { id: 'editor.slip', scope: 'editor', combos: ['alt+comma', 'alt+period'],
+    hidden: ['alt+shift+comma', 'alt+shift+period'], owner: 'editor.js',
+    calls: 'sbeSlipNudge',
+    label: 'Slip the selected clip one frame — changes what plays, not when (⌥⌘-drag the clip body for the same thing by eye) · add ⇧ for ten' },
   { id: 'editor.split', scope: 'editor', combos: ['s', 'mod+k', 'mod+b'], owner: 'editor.js',
     calls: 'sbeSplitHere', label: 'Split the shot under the playhead — or, with sounds on an audio track selected, those sounds (S, or ⌘K as in Premiere, ⌘B as in Final Cut and Resolve)' },
   { id: 'editor.lift', scope: 'editor', combos: ['backspace'], hidden: ['delete'], owner: 'editor.js',
@@ -134,9 +141,21 @@ const SHORTCUTS = [
     calls: 'sbeZoomFit', label: 'Fit the whole sequence in the window' },
   { id: 'editor.snap', scope: 'editor', combos: ['n'], owner: 'editor.js',
     calls: 'sbeToggleSnap', label: 'Snap to beat on / off' },
-  { id: 'editor.mute', scope: 'editor', combos: ['m'], owner: 'editor.js',
+  // FILM-58: M is MARKER in every NLE this timeline aliases itself to
+  // (Premiere, Final Cut, Resolve) — the preview mute that used to own it
+  // moved to ⇧M, the same displacement pattern editor.ripple already uses
+  // for its own delete key.
+  { id: 'editor.marker', scope: 'editor', combos: ['m'], owner: 'editor.js',
+    calls: 'sbeMarkerAtPlayhead',
+    label: 'Add a marker at the playhead (Premiere\'s, Final Cut\'s and Resolve\'s M)' },
+  { id: 'editor.mute', scope: 'editor', combos: ['shift+m'], owner: 'editor.js',
     calls: ['sbeSetMute', 'sbeUnmuteFromRefusal'],
     label: 'Mute / unmute the preview — the film itself is not changed' },
+  { id: 'editor.copy', scope: 'editor', combos: ['mod+c'], owner: 'editor.js',
+    calls: 'sbeClipCopy', label: 'Copy the selected clip(s)' },
+  { id: 'editor.paste', scope: 'editor', combos: ['mod+v'], owner: 'editor.js',
+    calls: 'sbeClipPaste',
+    label: 'Paste — onto one selected clip, pastes its grade, frame, fades and speed; otherwise pastes new clips at the playhead' },
   // THE SPLIT. Sound mode is the one thing that changes it: the sound lanes
   // at full height and the picture small, or back. The ⌁ button on the tool
   // row and the ▾ on the A1 head are the same control.
@@ -218,7 +237,7 @@ const _SC_KEYNAMES = {
   space: ' ', enter: 'enter', escape: 'escape', backspace: 'backspace', delete: 'delete',
   arrowleft: 'arrowleft', arrowright: 'arrowright', arrowup: 'arrowup', arrowdown: 'arrowdown',
   home: 'home', end: 'end', plus: '+', minus: '-', equals: '=', underscore: '_',
-  backslash: '\\', backquote: '`', comma: ',', tab: 'tab', slash: '/',
+  backslash: '\\', backquote: '`', comma: ',', period: '.', tab: 'tab', slash: '/',
 };
 // Keys whose character already needs Shift on a US layout: their combos do not
 // say shift, and matching ignores it.
@@ -419,6 +438,20 @@ function shortcutGenerateFrom(t) {
     imgStudioGenerate();
     return;
   }
+  // VA-34: Lip-sync's prompt box had no Cmd+Enter — shortcuts.js listed
+  // Video and Images, oneshot.js has its own listener for One Shot, and
+  // A2V (audioStudioGenerate, its own submit path outside #genForm) had
+  // neither.
+  if (id === 'audioStudioPrompt') {
+    const btn = document.getElementById('audioStudioGenBtn');
+    if (!btn || typeof audioStudioGenerate !== 'function') return false;
+    if (btn.disabled) {
+      if (typeof phosToast === 'function') phosToast(btn.title || 'Generate is not available right now.', { duration: 5000 });
+      return;
+    }
+    audioStudioGenerate();
+    return;
+  }
   return false;   // One Shot's prompt has its own listener (oneshot.js)
 }
 
@@ -451,6 +484,14 @@ function shortcutTrashOutput() {
   if (shortcutTopModal() || !_scOnOutputsTab()) return false;
   if (typeof activePath === 'undefined' || !activePath || typeof deleteOutput !== 'function') return false;
   deleteOutput(activePath);   // confirms before it moves anything
+}
+
+function shortcutNewTake() {
+  if (shortcutTopModal() || !_scOnOutputsTab()) return false;
+  if (typeof activePath === 'undefined' || !activePath || typeof newTakeActive !== 'function') return false;
+  const btn = document.getElementById('newTakeBtn');
+  if (btn && btn.disabled) return false;
+  newTakeActive();
 }
 
 document.addEventListener('keydown', (ev) => {

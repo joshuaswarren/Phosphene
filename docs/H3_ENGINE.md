@@ -120,7 +120,7 @@ duplicating 75 GB.
 | `LTX_H3_MODELS` | `<install>/mlx_models/hailuo-h3` | the three weight components |
 | `LTX_H3_PYTHON` | `<H3_ROOT>/.venv/bin/python3.11` → `python` | interpreter override (a checkout without its own venv) |
 | `LTX_H3_FORCE_CAPABLE` | unset | test-only: stop the UI hiding the pill on a small Mac. Does **not** make it render. |
-| `LTX_H3_DENSE_10S` | unset | re-adds the pre-chaining dense 10 s tier (36 min) for A/B work |
+| `LTX_H3_DENSE_10S` | **dead — not read anywhere in the code (H3-15)** | the dense 10 s tier ("10s single pass") ships `"offered": True` unconditionally; this var does nothing. Kept documented so a future re-gate has somewhere to land, not because it currently works. |
 | `LTX_H3_WIDE_DRAFT` | unset | adds an experimental **512×288 16:9 draft** (~2 min). Off because 0.15 MP is below anything this campaign has measured — see Tiers. |
 
 **Set them in `ENVIRONMENT`, not in your shell.** An `export` in a terminal reaches
@@ -159,14 +159,36 @@ shape; the campaign checkout uses the first.
 `H3_TIERS` in `mlx_ltx_panel.py` is the single source of truth — the UI renders
 its chips from `/status.h3.tiers`, so a tier change is one Python edit.
 
-| Tier | Geometry | Aspect | Windows | Sigma points | Wall time |
-|---|---|---|---|---|---|
-| Draft · 3s | 640×384 · 73f | 5:3 | 1 | 9 (8 forwards) | ~3 min |
-| HQ · 3s | 768×448 · 73f | 12:7 | 1 | 9 (8 forwards) | ~4-5 min |
-| HQ · 5s | 768×448 · 124f | 12:7 | 1 | 9 (8 forwards) | ~8 min |
-| **Wide / High · 5s** | **1024×576 · 124f** | **16:9** | 1 | **16 (15 forwards)** since 2026-09-16 | **~34 min** (was ~19 at 8 forwards) |
-| Long · 10s | 768×448 · 243f | 12:7 | **2 × 124f chained** | 9 (8 forwards) | ~17 min |
-| Long · 15s | 768×448 · 362f | 12:7 | **3 × 124f chained** | 9 (8 forwards) | ~27 min · batch |
+The table below uses the CURRENT names — two independent axes, Quality
+(canvas) × Length (duration) — the same ones `/status.h3.tiers` and the UI's
+chips use. H3-31: this table used to be written entirely in the RETIRED
+fixed-tier vocabulary (HQ / Wide / Long), which the UI dropped for the
+two-axis picker; `H3_TIER_ALIASES` (mlx_ltx_panel.py) still resolves those old
+composite keys for a sidecar written before the split — **HQ → Standard**,
+**Wide → High**, **Long → the chained lengths (10s/15s) at any quality** — but
+they are not choices in the UI, and this table should not have kept reading
+as if they were.
+
+| Quality | Length | Geometry | Aspect | Windows | Sigma points | Wall time |
+|---|---|---|---|---|---|---|
+| Draft | 3s | 640×384 · 73f | 5:3 | 1 | 9 (8 forwards) | ~3 min |
+| Standard | 3s | 768×448 · 73f | 12:7 | 1 | 9 (8 forwards) | ~4-5 min |
+| Standard | 5s | 768×448 · 124f | 12:7 | 1 | 9 (8 forwards) | ~8 min |
+| **High** | **5s** | **1024×576 · 124f** | **16:9** | 1 | **16 (15 forwards)** since 2026-09-16 | **~34 min** (was ~19 at 8 forwards) |
+| Standard | 10s | 768×448 · 243f | 12:7 | **2 × 124f chained** | 9 (8 forwards) | ~17 min |
+| Standard | 15s | 768×448 · 362f | 12:7 | **3 × 124f chained** | 9 (8 forwards) | ~27 min · batch |
+
+Legacy composite key → current two-axis key, for reading an old sidecar:
+
+| Legacy key | Current key |
+|---|---|
+| `hq_3s` | `standard_3s` |
+| `hq_5s` | `standard_5s` |
+| `wide_5s` | `high_5s` |
+| `long_10s` | `standard_10s` |
+| `long_15s` | `standard_15s` |
+| `long_10s_dense` | `standard_10s_dense` |
+| `wide_draft_3s` | `preview_3s` |
 
 ### Aspect — why one tier is 16:9 and the rest are not (2026-08-06)
 
@@ -342,7 +364,9 @@ and `make_job` falls back to `H3_TIER_FINISH_DEFAULT` (`hq_5s`) rather than
 failing a queued job — named explicitly, because the old "last single-pass row
 in the table" scan started meaning the ~19 min `wide_5s` the day a tier was
 appended, and a fallback nobody asked for has to be the cheap one.
-`LTX_H3_DENSE_10S=1` restores the old dense 10 s tier for A/B work.
+The dense 10 s tier ("10s single pass") ships visible by default, always —
+`LTX_H3_DENSE_10S` is not read anywhere and restores nothing; see the
+constants table above.
 
 ### Export pass — the same post-process LTX renders get
 
@@ -499,21 +523,24 @@ existing wrapper rather than nesting one — nesting hid the quantized base's
 `scales` from `plan()` and skipped every module (`tests/test_lora_stack.py`
 in the engine tree pins this).
 
-**Key layouts.** Three exist in the wild and only two work:
+**Key layouts.** Four exist in the wild; three load, one is refused:
 
 | Layout | Keys | What happens |
 |---|---|---|
 | bare | `blocks.N.attn.qkv_proj.lora_A/B.weight` | loads as-is |
 | ComfyUI repack | the same, namespaced under `diffusion_model.` | **converted in place** at install time — a safetensors *header* rewrite (the offsets are relative to the tensor buffer, so every tensor byte is untouched), recorded in the sidecar as `lora_layout` / `lora_converted_prefix` |
+| kohya / sd-scripts | `lora_down`/`lora_up` + `.alpha` | **converted in place** (2026-09-06) — the character LoRAs people actually train for H3 come out of kohya-style trainers in exactly this shape, and the two things the runner can't read (the naming, the `.alpha` scalar) are both mechanical: `_h3_lora_convert_kohya` renames the keys onto the runner's `lora_A`/`lora_B` and folds alpha/rank into `lora_B`, so strength 1.0 means "as trained" — same as every other file. Recorded in the sidecar as `lora_layout: "kohya"`. |
 | diffusers / PEFT | split `to_q`/`to_k`/`to_v`, `ff.net.*` | **refused, by design** |
-| kohya | `lora_down`/`lora_up` + `.alpha` | **refused, by design** |
 
-The refusals are not laziness. A diffusers-namespace adapter needs a runtime
+The diffusers refusal is not laziness. That adapter needs a runtime
 `alpha / rank` multiplier that **is not in the file** — LightX2V's is
 `8 / 128 = 0.0625`, supplied externally by its own inference script — and
 applying it at 1.0 renders coloured noise, not a slightly-off clip. See
 `LIGHTX2V_LORA_FIX.md` and `scripts/convert_lightx2v_lora.py` in the engine
-repo for the manual path. The panel says exactly this in the error.
+repo for the manual path. The panel says exactly this in the error, and
+since a diffusers-layout file trained for LTX is the file people most often
+try here by mistake, the import UI also tells them it looks like an LTX
+LoRA and won't run on H3.
 
 **CivitAI.** The browser's video context has family pills (`ltx` / `h3`),
 preselected from the active engine, so an LTX user's default view is unchanged.

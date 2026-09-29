@@ -390,7 +390,8 @@ var AUDIO_STUDIO = {busy: false, audioPath: null, audioName: null, audioDuration
 window = globalThis; window.PHOSPHENE_CAP_TIER = 'q8';
 const els = {};
 function el(id, v) { return els[id] = {id, value: v === undefined ? '' : v, style: {}, dataset: {},
-                                         innerHTML: '', textContent: '', disabled: false, open: false}; }
+                                         innerHTML: '', textContent: '', disabled: false, open: false,
+                                         scrollIntoView(){}, classList: {add(){}, remove(){}, toggle(){}, contains(){ return false; }}}; }
 ['audioStudioPrompt', 'audioStudioStatus', 'audioStudioGenBtn', 'audioStudioDurationVal',
  'audioStudioDurationWarn', 'audioConditioningScaleVal', 'audioConditioningScaleHint',
  'mvOneShotDetails', 'a2v_image'].forEach(i => el(i));
@@ -400,6 +401,7 @@ const document = { getElementById: id => els[id] || null };
 function audioModeSet(m) { calls.push('audioMode:' + m); }
 function workflowSwitch(w) { calls.push('workflow:' + w); }
 function audioStudioRenderSlots() {}
+function audioStudioRenderLoraNote() {}
 function pickerSetImage(k, v) { if (k === 'a2v_image') els.a2v_image.value = v; calls.push('picker:' + k + '=' + v); }
 function _restoreLoraPicker(l) { calls.push('loras:' + l.length); _activeLoras = l; }
 function setMode(m) { calls.push('setMode:' + m); }
@@ -488,6 +490,7 @@ function _mk(id, v) {
 }
 var document = {getElementById: id => _els[id] || _mk(id), querySelector: () => null,
                   querySelectorAll: () => [], body: {dataset: {}, classList: {toggle(){}}}};
+var window = globalThis;
 var BOOT = {ltx: {qualities: [{key: 'balanced', pipeline: 'distilled'}]}}, currentMode = 't2v',
     activePath = '/x.mp4', FPS = 24;
 _mk('mode', 't2v'); _mk('quality', 'balanced'); _mk('frames', '481');
@@ -508,12 +511,23 @@ class WindowedClipsReloadAsWindowed(unittest.TestCase):
         src = panel_source()
         fns = ("_qualityUsesHq", "temporalModeAllowed", "setTemporalMode",
                "windowPromptsInput", "loadParams")
+        # VA-18: the per-window text moved from a synchronous textarea to
+        # dynamically-rendered boxes built from an async /ltx/windows_plan
+        # fetch (_renderWindowsSlotsFromPlan, not extracted here — it needs
+        # a real DOM's innerHTML/querySelectorAll, which this hand-rolled
+        # _mk()-based shim cannot simulate). What THIS harness can still
+        # prove synchronously: loadParams restores temporal_mode and
+        # window_invariants correctly, and stashes the sidecar's
+        # window_prompts array in window._pendingWindowPromptsRestore for
+        # the (untested-here) render step to consume. The full render is
+        # covered structurally in test_lipsync_mode.py's
+        # SlidingWindowsOffByOne class.
         js = LOOSE_SHIM + "with (SHIM) {\n" + "\n".join(
             extract_function(n, src) for n in fns) + """
 globalThis.fetch = async () => ({ok: true, json: async () => (%s)});
 loadParams().then(() => console.log(JSON.stringify({
   temporal: document.getElementById('temporal_mode').value,
-  prompts: document.getElementById('window_prompts').value,
+  pendingRestore: (typeof window !== 'undefined' ? window._pendingWindowPromptsRestore : null),
   invariants: document.getElementById('window_invariants').value})),
   e => { console.error(e); process.exit(1); });
 }""" % json.dumps({"output": "/x.mp4", "params": params})
@@ -530,8 +544,11 @@ loadParams().then(() => console.log(JSON.stringify({
         self.assertEqual(saved["long_mode"], "windows")
         got = self._load(saved)
         self.assertEqual(got["temporal"], "windows")
+        self.assertEqual(got["invariants"], "same pond, same dusk light")
+        # The exact array from the sidecar, staged for the render step.
+        self.assertEqual(got["pendingRestore"], ["opening", "", "the hen jumps", "landing"])
         again = P.make_job({**form, "temporal_mode": got["temporal"],
-                            "window_prompts": got["prompts"],
+                            "window_prompts": json.dumps(got["pendingRestore"]),
                             "window_invariants": got["invariants"]})["params"]
         self.assertEqual(again["long_mode"], "windows")
         self.assertEqual(again["window_prompts"], saved["window_prompts"])
@@ -541,7 +558,7 @@ loadParams().then(() => console.log(JSON.stringify({
         saved = P.make_job({"mode": "t2v", "prompt": "x", "frames": "121"})["params"]
         got = self._load(saved)
         self.assertEqual(got["temporal"], "native")
-        self.assertEqual(got["prompts"], "")
+        self.assertIsNone(got["pendingRestore"])
         self.assertEqual(got["invariants"], "")
 
 

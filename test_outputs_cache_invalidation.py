@@ -28,7 +28,7 @@ const B = process.argv[1] + '/webapp/js/boot.js', Q = process.argv[1] + '/webapp
 let server = ['/o/new.mp4', '/o/old1.mp4', '/o/old2.png', '/o/hideme.mp4'];
 const ctx = {
   window: {}, console, out: {}, Set, Promise, URLSearchParams, JSON, String, Array,
-  currentOutputs: [], mainOutputsFilter: 'all', activePath: null,
+  currentOutputs: [], mainOutputsFilter: 'all', activePath: null, filterMode: 'visible',
   confirm: () => true, phosToast: () => {}, renderCarousel: () => {}, paintOutputsCount: () => {},
   outputKind: () => 'video',
   document: {getElementById: () => null},

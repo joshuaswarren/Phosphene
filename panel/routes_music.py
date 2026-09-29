@@ -651,6 +651,22 @@ def _shot_rows(shots: list) -> list:
     return rows
 
 
+
+
+def _board_title_from_song(raw) -> str:
+    """A song's name as a BOARD title (4.17): never its file extension
+    ("song40.wav"), the upload's millisecond prefix ("1790123456789_take 3")
+    or the composer's "music_YYYYMMDD_HHMMSS_" stamp — the client strips the
+    same three (music.js _songNameFromFile), this is the authoritative copy
+    for any caller that posts a raw filename."""
+    import re as _re                                              # noqa: PLC0415
+    t = str(raw or "").strip()
+    t = t.rsplit("/", 1)[-1]
+    t = _re.sub(r"\.(wav|mp3|m4a|flac|aac|ogg|opus|aiff?)$", "", t, flags=_re.I)
+    t = _re.sub(r"^\d{10,}_", "", t)
+    t = _re.sub(r"^music_\d{8}_\d{6}_", "", t)
+    return t.replace("_", " ").strip()
+
 @post("/music/video/plan")
 def post_music_video_plan(h, path, qs, ctype) -> None:
     """Song + pictures -> a storyboard board, and the shot list to show.
@@ -693,8 +709,9 @@ def post_music_video_plan(h, path, qs, ctype) -> None:
         h._json({"error": f"the vocal stem is not a file this panel has "
                           f"({vocal_stem_raw!r}). {_where_to_put_files()}"}, 400)
         return
-    title = _one(form, "title").strip() or (_sidecar(str(song)) or {}).get("title") \
-        or song.stem
+    title = _board_title_from_song(
+        _one(form, "title").strip() or (_sidecar(str(song)) or {}).get("title")
+        or song.stem) or "Music video"
     meta = _sidecar(str(song)) or {}
     sections_raw = _one(form, "sections").strip()
     lyrics = _one(form, "lyrics")
@@ -734,6 +751,34 @@ def post_music_video_plan(h, path, qs, ctype) -> None:
                 lyrics=lyrics if lyrics.strip() else meta.get("lyrics"),
                 score_abc=score_abc if score_abc.strip() else meta.get("score_abc"),
                 beats=beats)
+            # FILM-12: a real 40 s vocal track with a Singer picture cast
+            # planned "0 singing shots · 8 identical B-roll" and said
+            # nothing — the band-energy classifier is crude (one ratio
+            # against the track's own median) and got this one wrong with
+            # no way for the user to notice before the render was spent.
+            # Only fires for the CLASSIFIER's own guess (no explicit
+            # `sections`/lyrics/score — those are the user's own word on
+            # it) and only when a Singer is actually cast — an
+            # instrumental-only cast is correctly all B-roll and must not
+            # be nagged. `plan_anyway` is the escape hatch once the user
+            # has seen the sections and still wants to proceed as-is.
+            plan_anyway = _one(form, "plan_anyway").strip().lower() in ("1", "on", "true", "yes")
+            has_singer = any(isinstance(im, dict)
+                             and str(im.get("role") or "").strip().lower() == "singer"
+                             for im in images)
+            no_lyrics_or_score = not (lyrics.strip() or score_abc.strip()
+                                      or meta.get("lyrics") or meta.get("score_abc"))
+            if (has_singer and no_lyrics_or_score and not plan_anyway
+                    and not any(str(r.get("kind") or "").strip().lower() == "vocal"
+                               for r in sections)):
+                h._json({
+                    "error": "I heard no singing in this track, so nobody "
+                             "would be filmed singing — mark the sung parts "
+                             "below, or plan it as B-roll only.",
+                    "no_vocal_detected": True,
+                    "sections": sections,
+                }, 409)
+                return
         note = mv.tempo_disagreement(
             beats, (score_abc if score_abc.strip() else meta.get("score_abc")) or "")
         if note:
@@ -745,9 +790,34 @@ def post_music_video_plan(h, path, qs, ctype) -> None:
         # QUALITY too — the table's own `qualities` column says the 20 s cell
         # is Quick-only, and a 481-frame a2v shot on the standard 1024×576
         # canvas dies around frame 454.
+        #
+        # FILM-43: re-planning (a new song, a cast change, "Plan again"
+        # after marking sections) used to mint a brand-new board every
+        # time — the board list filled up with identically-named copies of
+        # the same music video instead of the plan just updating. A caller
+        # that names an EXISTING music-video board (`board_id`, the id
+        # /music/video/plan itself returned last time) gets that board
+        # UPDATED in place; anything else — a fresh plan, or a board_id
+        # that turns out not to be a music-video board at all — still gets
+        # a new one, exactly as before.
+        reuse_id = _one(form, "board_id").strip()
+        if reuse_id:
+            try:
+                existing = P.storyboard.load_storyboard(P.STATE_DIR, reuse_id)
+            except Exception:                                       # noqa: BLE001
+                existing = None
+            if not (isinstance(existing, dict) and existing.get("music_video")):
+                reuse_id = ""
+        if reuse_id:
+            # BOARD-1: never swap a board out from under its own render.
+            busy = P._sb_board_busy_reason(reuse_id, existing)
+            if busy:
+                h._json({"error": busy, "busy": True}, 409)
+                return
+        board_id = reuse_id or P._sb_new_id(title)
         out = mv.plan_music_video(
             sections, images, style=style, bpm_grid=beats, song=str(song),
-            title=title, board_id=P._sb_new_id(title), quality=quality,
+            title=title, board_id=board_id, quality=quality,
             shot_prompts=shot_prompts, shot_images=shot_images,
             vocal_stem=str(vocal_stem) if vocal_stem else "",
             cells=mv.cells_from_lengths(P.LTX_LENGTHS, quality=quality))
@@ -757,6 +827,11 @@ def post_music_video_plan(h, path, qs, ctype) -> None:
         h._json({"error": f"could not plan that video: {exc}"}, 500); return
 
     board = out["board"]
+    if reuse_id:
+        # The board is being UPDATED, not born — keep its original
+        # "created" time; `updated_at` (set by _sb_normalize below) is
+        # what moves it to the top of a Recent sort.
+        board["created_at"] = existing.get("created_at") or board["created_at"]
     # The pass policy is the user's saved Quality, exactly as a planned film
     # gets it — `new_storyboard` hands back the module default, which ignores
     # this machine's canvas cap.
@@ -766,7 +841,37 @@ def post_music_video_plan(h, path, qs, ctype) -> None:
     board["music_video"]["notes"] = list(out["notes"]) + notes
     board["music_video"]["quality"] = quality
     P._sb_normalize(board)
-    P.storyboard.save_storyboard(P.STATE_DIR, board)
+    with P._SB_LOCK:
+        if reuse_id:
+            # BOARD-1: re-checked under the lock the render route claims its
+            # slot with, and held through the save — a render started while
+            # this plan was being computed wins, and the old board stays.
+            try:
+                current = P.storyboard.load_storyboard(P.STATE_DIR, reuse_id)
+            except Exception:                                   # noqa: BLE001
+                current = existing
+            busy = P._sb_board_busy_reason(reuse_id, current)
+            if busy:
+                h._json({"error": busy, "busy": True}, 409)
+                return
+        P.storyboard.save_storyboard(P.STATE_DIR, board)
+    if reuse_id:
+        # BOARD-7: the Editor's timeline was cut from the OLD plan, and
+        # Export prefers a saved timeline over the shots — it would have
+        # assembled the previous version. It is kept as a draft of its own;
+        # the new plan starts a fresh timeline.
+        try:
+            aside = P._sbe_import().set_aside_for_replan(
+                P._sbe_board_dir(board["id"]),
+                time.strftime("%b %d %H:%M"))
+        except Exception as exc:                                # noqa: BLE001
+            aside = None
+            P.push(f"[music video] could not set the old timeline aside: {exc}")
+        if aside:
+            board["music_video"]["notes"].append(
+                f"Your earlier Editor timeline is kept as the draft "
+                f"“{aside['kept']}” — the new plan starts a fresh one.")
+            P.storyboard.save_storyboard(P.STATE_DIR, board)
     P.push(f"[music video] {out['summary']} — {title}")
     h._json({"ok": True, "board_id": board["id"], "title": title,
              "summary": out["summary"], "quality": quality,
@@ -810,12 +915,27 @@ def post_music_video_film(h, path, qs, ctype) -> None:
         h._json({"error": "that film was not planned as a music video, so "
                           "there is no song to lay under it"}, 409)
         return
-    song = _panel_file(block.get("song"))
-    if song is None:
-        h._json({"error": f"the song is no longer at {block.get('song')!r}"},
-                404)
-        return
+    # BOARD-8: A SAVED TIMELINE OWNS THE FILM'S AUDIO. Somebody who changed
+    # the soundtrack or chose the "under" mix in the Editor made the film's
+    # sound decisions there; forcing the planning song and `replace` here
+    # made Storyboard Export and Editor Render two different films. The
+    # board's song is the fallback only when no timeline with clips exists —
+    # `_sb_export` then hands the timeline to `_sbe_render_edit`, which reads
+    # the soundtrack and the mode off the document, exactly as Render does.
+    try:
+        edit = P._sbe_import().load_edit(P._sbe_board_dir(board.get("id") or ""))
+    except Exception:                                          # noqa: BLE001
+        edit = None
+    timeline_owns_audio = bool(edit and (edit.get("clips") or []))
+    music, music_mode = None, None
+    if not timeline_owns_audio:
+        song = _panel_file(block.get("song"))
+        if song is None:
+            h._json({"error": f"the song is no longer at {block.get('song')!r}"},
+                    404)
+            return
+        music, music_mode = str(song), "replace"
     auto = _one(form, "auto_edit") in ("1", "true", "on", "yes")
     P._analytics_feature("music_video_film")
-    h._json(P._sb_export(board, auto_edit=auto, music=str(song),
-                         music_mode="replace"))
+    h._json(P._sb_export(board, auto_edit=auto, music=music,
+                         music_mode=music_mode))

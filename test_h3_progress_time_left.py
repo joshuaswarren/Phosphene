@@ -25,12 +25,23 @@ QUEUE = (ROOT / "webapp" / "js" / "queue.js").read_text(encoding="utf-8")
 
 class H3ProgressSaysTimeLeft(unittest.TestCase):
     def _h3_progress_block(self) -> str:
-        i = PANEL.index('"window_total": tot_windows')
-        return PANEL[i - 2500:i]
+        # Anchored on a stable start marker rather than a fixed lookback
+        # offset from the end — a fixed offset silently truncates the
+        # window's START as unrelated code grows between the two (it did,
+        # for H3-04's pace-warning addition).
+        i = PANEL.index('win_span = 87.0 / float(tot_windows)')
+        j = PANEL.index('"window_total": tot_windows', i)
+        return PANEL[i:j]
 
     def test_h3_progress_carries_remaining_sec(self):
+        # H3-23: remaining_sec used to be None until the first denoise step
+        # landed (eta if last_step else None) — the load phase (staged
+        # weight loads, which can take minutes on a 48 GB Mac) showed no ETA
+        # at all. It is now populated unconditionally: eta is seeded from
+        # the cell's own estimate during load, then replaced by real
+        # per-step extrapolation once denoising starts.
         self.assertRegex(self._h3_progress_block(),
-                         r'"remaining_sec":\s*eta if last_step else None')
+                         r'"remaining_sec":\s*eta,')
 
     def test_later_windows_pay_their_loads(self):
         block = self._h3_progress_block()

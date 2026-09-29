@@ -351,6 +351,57 @@ def _apply_vae_streaming_decision(num_frames: int) -> None:
         # Long clip: let the patched decoder default ("auto") pick streaming.
         os.environ.pop("LTX_VAE_STREAMING", None)
 
+
+def _source_fps(video_path: str, fallback=None) -> float:
+    """The frame rate a source clip really has (ffprobe via the engine's own
+    probe_video_info — the call Retake/Extend encode the source with);
+    `fallback` (the panel's delivery rate) only when the probe fails."""
+    try:
+        from ltx_core_mlx.utils.ffmpeg import probe_video_info
+        fps = float(probe_video_info(video_path).fps)
+        if fps > 0:
+            return fps
+    except Exception:                                             # noqa: BLE001
+        pass
+    try:
+        return float(fallback) if fallback and float(fallback) > 0 else 24.0
+    except (TypeError, ValueError):
+        return 24.0
+
+
+def _retake_latent_window(start_sec: float, end_sec: float, fps: float,
+                          source_frames: int) -> dict:
+    """Seconds on the source clip -> RetakePipeline's LATENT frame interval.
+
+    retake.py's contract (pinned engine): the source is cut to
+    `1 + 8k` pixel frames, k = (num_frames - 1) // 8, and
+    compute_video_latent_shape() gives (pixels + 7) // 8 = k + 1 latent
+    frames — latent 0 is pixel 0 alone, latent j >= 1 is pixels
+    8(j-1)+1 .. 8j. start_frame is inclusive, end_frame exclusive, both
+    latent indices in [0, k + 1]. LIPSYNC-5: the old `(num_frames-1)//8`
+    count was one short, so the last latent frame could never be retaken.
+
+    The window COVERS the requested seconds: every latent that holds a
+    requested pixel frame is regenerated (latents are 8 frames wide, so the
+    edges round outward, never inward)."""
+    k = max(1, (int(source_frames) - 1) // 8)
+    pixels = 1 + 8 * k
+    latents = (pixels + 7) // 8
+    fps = float(fps) if fps and float(fps) > 0 else 24.0
+    start_sec = max(0.0, float(start_sec))
+    end_sec = max(start_sec, float(end_sec))
+    px_start = min(pixels - 1, int(math.floor(start_sec * fps + 1e-6)))
+    px_end = max(px_start + 1, min(pixels, int(math.ceil(end_sec * fps - 1e-6))))
+
+    def _lat(px: int) -> int:
+        return 0 if px <= 0 else (px - 1) // 8 + 1
+
+    start_frame = _lat(px_start)
+    end_frame = min(latents, _lat(px_end - 1) + 1)
+    return {"start_frame": start_frame, "end_frame": end_frame,
+            "latent_frames": latents, "pixel_frames": pixels, "fps": fps}
+
+
 _real_stdout = sys.stdout
 _emit_lock = threading.Lock()
 
@@ -1424,6 +1475,33 @@ def _attach_loras(pipe, loras: list[dict] | None) -> None:
     pipe._pending_loras = pairs
 
 
+def _a2v_anchor_images(p: dict, num_frames: int):
+    """Multi-anchor image conditioning for a2v: ``anchors`` = [{path, frame_idx, strength}].
+
+    The engine's A2V pipelines take ``images=[ImageConditioningInput]`` —
+    frame_idx 0 replaces the first latent frame, any other PIXEL frame index
+    appends a keyframe there (the same mechanism as Keyframe interpolation).
+    Returns None when the job carries no anchors, so the legacy single
+    ``image`` path is untouched.
+    """
+    raw = p.get("anchors")
+    if not raw:
+        return None
+    from ltx_pipelines_mlx.utils.args import ImageConditioningInput
+    out = []
+    for a in raw:
+        path = a.get("path") if isinstance(a, dict) else None
+        if not path or not os.path.exists(path):
+            raise RuntimeError(f"anchor image not found: {path}")
+        idx = int(a.get("frame_idx", 0))
+        if idx < 0 or idx >= num_frames:
+            raise RuntimeError(f"anchor frame_idx {idx} out of range [0, {num_frames - 1}]")
+        out.append(ImageConditioningInput(path=path, frame_idx=idx,
+                                          strength=float(a.get("strength", 1.0))))
+    out.sort(key=lambda c: c.frame_idx)
+    return out
+
+
 def _a2v_pad_audio_to(audio_path: str, need_s: float,
                       start_s: float = 0.0) -> tuple[str, bool]:
     """(path, padded). When `audio_path` from `start_s` runs out before
@@ -2199,6 +2277,26 @@ def _build_live_preview(kwargs: dict):
         emit({"event": "log",
               "line": f"live preview could not start ({exc}) — rendering without it."})
         return None
+
+
+def _thread_live_preview(p: dict, kwargs: dict) -> None:
+    """VA-27: the best-effort live-preview wiring shared by Keyframe and A2V
+    (generate_keyframe / generate_a2v / generate_a2v_distilled) — the same
+    contract the t2v/i2v `generate` action already used (see the inline copy
+    of these three lines there, kept separate on purpose since that call
+    site also emits its own "live preview on" log line at a different point
+    in its flow). Mutates `kwargs` in place. The `live_preview` key this adds
+    is dropped by the caller's own `_filter_unsupported_kwargs(pipe.
+    generate_and_save, kwargs)` if the installed pipeline build doesn't
+    accept it — this function never raises and never blocks the render."""
+    for _k in ("live_preview_dir", "live_preview_tae", "live_preview_every"):
+        if p.get(_k) is not None:
+            kwargs[_k] = p[_k]
+    kwargs["live_preview"] = _build_live_preview(kwargs)
+    if kwargs["live_preview"] is not None:
+        emit({"event": "log",
+              "line": f"live preview on — every {kwargs.get('live_preview_every', 1)} "
+                      f"estimate(s) → {p.get('live_preview_dir')}"})
 
 
 def _generate_latents(pipe, *, needs_image: bool, kwargs: dict):
@@ -3489,7 +3587,11 @@ for line in sys.__stdin__:
             # deallocator chain. See the same comment in the `generate`
             # action above.
             # FIX 2026-05-14: upstream made frame_rate= keyword-only required.
-            pipe._decode_and_save_video(video_lat, audio_lat, p["output_path"], frame_rate=float(p.get("frame_rate", 24.0)))
+            # LIPSYNC-3 (same class as Retake): extend_from_video encodes the
+            # source at ITS OWN rate, so decode at it too — a 12-fps native
+            # render saved at the panel's 24 played twice as fast.
+            pipe._decode_and_save_video(video_lat, audio_lat, p["output_path"],
+                                        frame_rate=_source_fps(video_path, p.get("frame_rate")))
             elapsed = round(time.time() - t0, 2)
             _last_activity = time.time()
             emit({
@@ -3505,6 +3607,131 @@ for line in sys.__stdin__:
             # non-extend call (or extend with enable=False) doesn't
             # inherit a stale state.
             _EXTEND_TC_CONFIG = None
+            _is_busy = False
+        continue
+
+    if action == "retake_segment":
+        # Segment Retake (VA-26): regenerate ONE interior stretch of a clip
+        # while the rest is preserved — the engine's RetakePipeline.retake()
+        # / retake_from_video(), already the Extend backend (`ExtendPipeline
+        # = RetakePipeline`, same get_pipe("extend") cache slot and weights).
+        # "Fix just the bad two seconds" instead of re-rendering the whole
+        # clip. NEEDS RENDER CHECK (see ledger_lipsync.txt): this action has
+        # not been exercised against a real GPU render — the seconds-to-
+        # latent-frame conversion (_retake_latent_window) is written against
+        # retake.py's own contract (start_frame/end_frame are LATENT indices;
+        # the source is cut to 1 + 8k pixel frames = k + 1 latent frames) and
+        # pinned by a pure test, but unverified end-to-end. Every failure mode here (bad frame math, a signature
+        # the installed pipeline build doesn't have, an OOM) surfaces as an
+        # ordinary job error — the same try/except every other action uses
+        # — never a helper crash.
+        job_id = msg.get("id", "?")
+        p = msg.get("params", {}) or {}
+        seed = int(p.get("seed", -1))
+        if seed == -1:
+            seed = random.randint(0, 2**31 - 1)
+        _is_busy = True
+        try:
+            t0 = time.time()
+            _mlx_mem_reset_run()
+            configure_acceleration("off")
+            video_path = p.get("video_path") or ""
+            if not video_path or not os.path.exists(video_path):
+                raise RuntimeError(f"source video not found: {video_path}")
+            loras = p.get("loras") or []
+            ret_model_dir = p.get("model_dir")
+            # Same pipeline class + cache slot as Extend — RetakePipeline is
+            # both APIs on one object (retake() and extend()), so a user
+            # bouncing between Retake and Extend on the same session never
+            # pays a second pipeline load.
+            pipe = get_pipe("extend", loras=loras, model_dir=ret_model_dir,
+                            dev_transformer=p.get("dev_transformer"))
+            # Probe the source for its real fps + frame count, so the seconds
+            # the user dragged on the scrubber land on the right latent
+            # indices (_retake_latent_window: retake.py's own 1 + 8k cut and
+            # k + 1 latent frames). The actual encode still happens inside
+            # retake_from_video, which probes the same file. LIPSYNC-3: the
+            # probed fps is ALSO the decode rate below — a 12-fps native
+            # render (Long Clip Boost's raw) saved at the panel's 24 played
+            # twice as fast and drifted off its preserved audio.
+            try:
+                from ltx_core_mlx.utils.ffmpeg import probe_video_info
+                info = probe_video_info(video_path)
+                fps = float(info.fps) or 0.0
+                src_frames = int(info.num_frames)
+                src_w, src_h = int(info.width), int(info.height)
+            except Exception as exc:                              # noqa: BLE001
+                fps = float(p.get("frame_rate") or 24.0)
+                emit({"event": "log",
+                      "line": f"[retake] source probe failed ({exc}); assuming {fps:g}fps."})
+                src_frames = int(p.get("frames", 121))
+                src_w = src_h = 0
+            if not fps or fps <= 0:
+                fps = float(p.get("frame_rate") or 24.0)
+            start_sec = max(0.0, float(p.get("retake_start_sec", 0.0)))
+            end_sec = max(start_sec + 0.1, float(p.get("retake_end_sec", start_sec + 1.0)))
+            win = _retake_latent_window(start_sec, end_sec, fps, src_frames)
+            start_frame, end_frame = win["start_frame"], win["end_frame"]
+            k = win["latent_frames"]
+            cfg_scale = float(p.get("cfg_scale", 1.0))
+            num_steps = int(p.get("steps", 8))
+            # Default False: KEEP the original sound. A user retaking a
+            # visual moment (a warped hand, a flat expression) does not
+            # expect the audio to change under them; True is the explicit
+            # "new sound too" opt-in the UI's "keep sound / new sound"
+            # choice sends.
+            regenerate_audio = (p.get("retake_audio_action") == "regenerate")
+            _apply_vae_streaming_decision(win["pixel_frames"])
+            emit({
+                "event": "log",
+                "line": (
+                    f"step:retake_segment latent[{start_frame}:{end_frame}] of {k} "
+                    f"({start_sec:.1f}s-{end_sec:.1f}s at {fps:.1f}fps) "
+                    f"steps={num_steps} cfg={cfg_scale} "
+                    f"audio={'regenerate' if regenerate_audio else 'keep original'}"
+                ),
+            })
+            with _override_default_negative_prompt(p.get("negative_prompt")) as neg_active:
+                if neg_active:
+                    emit({"event": "log", "line": "Avoid terms active via native CFG negative prompt."})
+                video_lat, audio_lat = pipe.retake_from_video(
+                    prompt=p["prompt"],
+                    video_path=video_path,
+                    start_frame=start_frame,
+                    end_frame=end_frame,
+                    seed=seed,
+                    num_steps=num_steps,
+                    cfg_scale=cfg_scale,
+                    regenerate_audio=regenerate_audio,
+                )
+            # Decode + save — identical shape to the "extend" action above.
+            from ltx_core_mlx.utils.memory import aggressive_cleanup
+            if pipe.low_memory:
+                pipe.dit = None
+                pipe.text_encoder = None
+                pipe.feature_extractor = None
+                pipe._loaded = False
+                aggressive_cleanup()
+            pipe._load_decoders()
+            pipe._decode_and_save_video(video_lat, audio_lat, p["output_path"],
+                                        frame_rate=fps)
+            elapsed = round(time.time() - t0, 2)
+            _last_activity = time.time()
+            emit({
+                "event": "done", "id": job_id,
+                "output": p["output_path"], "elapsed_sec": elapsed,
+                "seed_used": seed,
+                "retake_start_frame": start_frame, "retake_end_frame": end_frame,
+                # What was actually written (LIPSYNC-11): the source's own
+                # rate, its 1 + 8k frame cut and its size — the panel's
+                # sidecar records these instead of make_job's defaults.
+                "fps": fps, "frames": win["pixel_frames"],
+                "width": src_w, "height": src_h,
+            })
+        except Exception as exc:
+            _last_activity = time.time()
+            emit({"event": "error", "id": job_id, "error": str(exc), "trace": traceback.format_exc()})
+        finally:
             _is_busy = False
         continue
 
@@ -3803,6 +4030,7 @@ for line in sys.__stdin__:
             with _override_default_negative_prompt(p.get("negative_prompt")) as neg_active:
                 if neg_active:
                     emit({"event": "log", "line": "Avoid terms active via native CFG negative prompt."})
+                _thread_live_preview(p, kwargs)          # VA-27
                 kwargs = _filter_unsupported_kwargs(pipe.generate_and_save, kwargs)
                 out_path = pipe.generate_and_save(**kwargs)
             elapsed = round(time.time() - t0, 2)
@@ -3896,6 +4124,12 @@ for line in sys.__stdin__:
                 if not os.path.exists(ref_image):
                     raise RuntimeError(f"reference image not found: {ref_image}")
                 kwargs["image"] = ref_image
+            _anchors = _a2v_anchor_images(p, num_frames)
+            if _anchors:
+                kwargs["images"] = _anchors
+                kwargs.pop("image", None)
+                emit({"event": "log", "line": "[a2v] anchors: " + ", ".join(
+                    f"{os.path.basename(a.path)}@{a.frame_idx}" for a in _anchors)})
             # audio_max_duration defaults inside the pipeline to
             # num_frames / frame_rate when omitted. The form may pin a
             # tighter clamp (e.g. user dragged a 30 s mp3 but only wants 5 s).
@@ -3940,6 +4174,7 @@ for line in sys.__stdin__:
             with _override_default_negative_prompt(p.get("negative_prompt")) as neg_active:
                 if neg_active:
                     emit({"event": "log", "line": "Avoid terms active via native CFG negative prompt."})
+                _thread_live_preview(p, kwargs)          # VA-27
                 kwargs = _filter_unsupported_kwargs(pipe.generate_and_save, kwargs)
                 out_path = pipe.generate_and_save(**kwargs)
             elapsed = round(time.time() - t0, 2)
@@ -4010,6 +4245,12 @@ for line in sys.__stdin__:
                 if not os.path.exists(ref_image):
                     raise RuntimeError(f"reference image not found: {ref_image}")
                 kwargs["image"] = ref_image
+            _anchors = _a2v_anchor_images(p, num_frames)
+            if _anchors:
+                kwargs["images"] = _anchors
+                kwargs.pop("image", None)
+                emit({"event": "log", "line": "[a2v] anchors: " + ", ".join(
+                    f"{os.path.basename(a.path)}@{a.frame_idx}" for a in _anchors)})
             amd = p.get("audio_max_duration")
             if amd is not None:
                 try:
@@ -4027,6 +4268,7 @@ for line in sys.__stdin__:
                     f"{' image=' + os.path.basename(ref_image) if ref_image else ''}"
                 ),
             })
+            _thread_live_preview(p, kwargs)          # VA-27
             kwargs = _filter_unsupported_kwargs(pipe.generate_and_save, kwargs)
             out_path = pipe.generate_and_save(**kwargs)
             elapsed = round(time.time() - t0, 2)
@@ -4583,6 +4825,12 @@ for line in sys.__stdin__:
         if not isinstance(preserve_tokens, list):
             preserve_tokens = []
         preserve_tokens = [str(t).strip() for t in preserve_tokens if str(t).strip()]
+        # VC-13: the "Translate to English" toggle. True (the shipped
+        # default, unchanged) keeps the upstream system prompt's own
+        # instruction to answer in English. False adds an addendum line
+        # overriding it — the panel's prompt-box toggle only shows once a
+        # non-Latin-script prompt is typed, so this only ever fires there.
+        translate = bool(p.get("translate", True))
         if not user_prompt:
             emit({"event": "error", "id": job_id, "error": "empty prompt"})
             continue
@@ -4609,6 +4857,14 @@ for line in sys.__stdin__:
                 "- Audio sentence stays as one trailing line that begins",
                 "  with 'Audio:'.",
             ]
+            if not translate:
+                addendum_lines += [
+                    "",
+                    "#### Language (overrides the base instruction above):",
+                    "- Write the enhanced prompt in the SAME language the",
+                    "  user's original prompt is written in. Do NOT",
+                    "  translate it to English.",
+                ]
             if preserve_tokens:
                 addendum_lines += [
                     "",

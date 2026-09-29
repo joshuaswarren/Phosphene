@@ -96,14 +96,19 @@ class ClosedVocabulary(unittest.TestCase):
     def test_no_signature_or_fingerprint_rides_along(self):
         """Stated as a rule in docs/ANALYTICS.md: an install-time error line
         is the likeliest place in the product for a username-bearing path to
-        survive scrubbing, and the class answers the question on its own."""
+        survive scrubbing, and the class answers the question on its own.
+
+        ram_gb (SYS-16) is the one deliberate addition beyond that: not a
+        leak (already sent on app_installed/render_completed), just the
+        hardware signal that lets first_queue be sliced "per tier" the same
+        way render_completed's first_render already can be."""
         with _FreshInstall(), _Capture() as cap:
             P._analytics_install_step("engine_env", "failed", "venv_broken")
             props = cap.events("install_step")[0]
             self.assertNotIn("error_signature", props)
             self.assertNotIn("error_fingerprint", props)
             self.assertEqual(sorted(props),
-                             ["error_class", "outcome", "step", "version"])
+                             ["error_class", "outcome", "ram_gb", "step", "version"])
 
 
 class DidTheUpdateLand(unittest.TestCase):

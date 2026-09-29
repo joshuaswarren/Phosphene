@@ -114,7 +114,11 @@ Returns `{"ok": true}`.
 
 ### `POST /queue/clear`
 
-Empty the queue. Returns `{"ok": true, "cleared": <count>}`.
+Empty the queue. Returns `{"cleared": <count>, "ids": [...], "undo_token": "<hex>"|null}`.
+The token undoes THIS clear once, for 60 s (`POST /queue/restore` with
+`{"token": "<hex>"}` puts back exactly the removed jobs, original ids included,
+ahead of anything queued since). A later clear supersedes it; an expired or
+spent token answers `410`.
 
 ### `POST /queue/pause`, `POST /queue/resume`
 
@@ -122,7 +126,10 @@ Pause/resume the queue dispatcher (does not affect a job already running).
 
 ### `POST /stop`
 
-Request the running job to stop. Returns `{"ok": true}`.
+Request the running job to stop. Returns `{"ok": true}`. Optional `?id=<job id>`
+(what the panel sends): stop only if that job is still the one running —
+otherwise `409 {"stale": true}` and nothing is stopped. `/stop/after_part`
+takes the same `id`.
 
 ### `POST /queue/batch`
 

@@ -181,7 +181,10 @@ class ConditioningAudioIsNotAlwaysTheSoundtrack(unittest.TestCase):
             got, note = P.a2v_conditioning_audio(
                 {"audio_stem_auto": "on"}, str(self.song))
         self.assertEqual(got, str(self.song))
-        self.assertIn("stems extra", note)
+        # VA-21: the note used to claim a Pinokio sidebar entry that does not
+        # exist (a2v_stems_deps.sh has no pinokio.js menu item). Reworded to
+        # name the real path — running the script directly.
+        self.assertIn("a2v_stems_deps.sh", note)
 
     def test_auto_that_fails_mid_separation_never_fails_the_job(self):
         with mock.patch.object(P, "_resolve_demucs",

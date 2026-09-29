@@ -172,6 +172,11 @@ function h3FinishFieldsFromSidecar(p, tierKey) {
     // verbatim; on t2v it is deliberately empty — H3 ignores it and leaving a
     // stale path in the picker would misrepresent what was queued.
     image: (mode === 'i2v' && typeof p.image === 'string') ? p.image : '',
+    // The crop framing is part of the recipe (VC-29/H3-01): a face kept by a
+    // Top or dragged crop in the draft must be kept in the finish too. Older
+    // sidecars predate it — they rendered centred.
+    // (Inline, not _cropFocusFromParams: this function stays pure/self-contained.)
+    image_crop_focus: ((v) => (isFinite(v) && v >= 0 && v <= 1) ? v : 0.5)(parseFloat(p.image_crop_focus)),
   };
   if (mode === 'i2v' && !fields.image) return null;
   return fields;
@@ -204,12 +209,31 @@ function _syncH3FinishAffordance(o) {
   // its own "·" ("High · 10s"), which is flattened to "High 10s" so the one dot
   // left separates the shape from its cost.
   const name = String(target.label).replace(/\s*·\s*/g, ' ').trim();
-  if (label) label.textContent = `Finish at ${name} · ${target.eta}`;
-  if (btn) {
-    btn.title = `Re-render this ${srcTier.quality_label} clip at `
-              + `${target.label} (${target.spec}, ${target.eta}) — same `
-              + `${target.length_label} length, same prompt, same seed, same `
-              + `first frame`;
+  // H3-21: this offered "Finish at Standard 5s · ~6 min" on a Mac without H3
+  // at all — the tier/target math above is pure client-side registry lookup,
+  // no install check anywhere in it. Clicking only raised a toast AFTER the
+  // fact ("Finish needs the Hailuo H3 engine"). Say it up front and route
+  // the click at the install card instead of a doomed render attempt.
+  const h3NotHere = !(H3 && H3.available);
+  if (h3NotHere) {
+    if (label) label.textContent = 'Finish · needs Hailuo H3';
+    if (btn) {
+      btn.title = `Finishing this clip needs the Hailuo H3 engine, which `
+                + `isn't installed on this Mac. Click for how to set it up.`;
+      btn.onclick = (ev) => { ev.preventDefault(); openH3InstallCard(); };
+    }
+  } else {
+    if (label) label.textContent = `Finish at ${name} · ${target.eta}`;
+    if (btn) {
+      btn.title = `Re-render this ${srcTier.quality_label} clip at `
+                + `${target.label} (${target.spec}, ${target.eta}) — same `
+                + `${target.length_label} length, same prompt, same seed, same `
+                + `first frame`;
+      // Restore the normal handler — a prior sync on a different clip (or
+      // before H3 finished installing) may have pointed this at the install
+      // card instead.
+      btn.onclick = () => h3FinishActive();
+    }
   }
   if (sel) {
     const opts = h3FinishTargets(srcTier)
@@ -303,6 +327,7 @@ async function h3FinishActive() {
     } else {
       document.getElementById('image').value = fields.image;
     }
+    if (typeof _setCropFocus === 'function') _setCropFocus('image', fields.image_crop_focus);
   }
   if (fields.h3_upscale && typeof setH3Upscale === 'function') setH3Upscale(fields.h3_upscale);
   // The source's adapters, not whatever the picker holds now (an empty list
@@ -329,6 +354,7 @@ async function h3FinishActive() {
   // Seed after the shape for the same reason it comes last in loadParams:
   // nothing downstream may quietly re-randomise it.
   document.getElementById('seed').value = fields.seed;
+  if (typeof _syncSeedLockChip === 'function') { try { _syncSeedLockChip(); } catch (e) {} }
   if (typeof updateCustomizeSummary === 'function') { try { updateCustomizeSummary(); } catch (e) {} }
   if (typeof updateDerived === 'function') { try { updateDerived(); } catch (e) {} }
   const formPane = document.querySelector('aside.form-pane');
@@ -337,6 +363,301 @@ async function h3FinishActive() {
   // ---- queue it ---------------------------------------------------------
   // requestSubmit(), not submit(): the latter bypasses the submit listener
   // that owns the double-click guard and the prompt modifiers.
+  const form = document.getElementById('genForm');
+  if (!form || typeof form.requestSubmit !== 'function') {
+    if (typeof phosToast === 'function') {
+      phosToast('Finish: form not ready — press Generate.', { kind: 'danger' });
+    }
+    return;
+  }
+  if (typeof phosToast === 'function') {
+    phosToast(`Finishing at ${target.label} · ${target.eta} · seed ${fields.seed}`,
+              { kind: 'success' });
+  }
+  form.requestSubmit();
+}
+
+// ============================================================================
+// LTX Draft → Finish (VC-18/37) — the mirror of H3's Finish above, built on
+// LTX's own two-axis table (BOOT.ltx.qualities/lengths/tiers, VC-28) instead
+// of H3's tier keys. Same instinct, same "SAME LENGTH, HIGHER QUALITY"
+// contract, same Load-Params-then-submit mechanism — deliberately NOT a
+// generic engine-agnostic abstraction over both: H3's shape carries concepts
+// (chain_prompts, orientation, a separate lora_scale_v convention, tristep)
+// that don't exist on LTX, and forcing a shared function would either drop
+// fields silently or grow a pile of H3-only branches inside what looks like
+// one LTX-neutral function. Two short, honest functions beat one long,
+// engine-guessing one — same trade the tier-chip factory already made
+// differently (there, the per-cell SHAPE really is uniform enough to share).
+//
+// Scope: t2v/i2v only, matching H3's own Finish restriction (line ~126
+// above) — Extend and Keyframe don't carry a "same length, higher quality"
+// concept the way a fixed-duration T2V/I2V render does.
+
+function ltxTierByKeyExact(key) {
+  if (!key) return null;
+  return ((BOOT.ltx || {}).tiers || []).find(t => t.key === key) || null;
+}
+
+// The length KEY for a raw frame count — the mirror of ltxCurrentLength()'s
+// own lookup, applied to a clip's OWN sidecar frame count instead of the
+// live form. null for an off-axis (custom) duration: Finish has nothing to
+// offer there, same as it has nothing to offer a length H3's table doesn't
+// carry.
+function _ltxLengthKeyForFrames(frames) {
+  const f = parseInt(String(frames == null ? '' : frames), 10);
+  if (!Number.isFinite(f)) return null;
+  const hit = ((BOOT.ltx || {}).lengths || []).find(l => Number(l.frames) === f);
+  return hit ? hit.key : null;
+}
+
+// The cells a clip can be finished at: same length, every quality above the
+// one it was rendered at, offered and available on this install.
+function ltxFinishTargets(srcCell) {
+  if (!srcCell) return [];
+  const order = ((BOOT.ltx || {}).qualities || []).map(q => q.key);
+  const from = order.indexOf(srcCell.quality);
+  if (from < 0) return [];
+  return order.slice(from + 1)
+    .map(q => ltxCellFor(q, srcCell.length))
+    .filter(c => c && c.available !== false);
+}
+
+function ltxFinishTierKey(srcCell) {
+  const targets = ltxFinishTargets(srcCell);
+  if (!targets.length) return null;
+  let saved = null;
+  try { saved = localStorage.getItem('phos_ltx_finish_quality'); } catch (e) {}
+  const hit = saved && targets.find(t => t.quality === saved);
+  return (hit || targets[0]).key;
+}
+
+function ltxFinishSetTier(key) {
+  const cell = ltxTierByKeyExact(key);
+  if (!cell) return;
+  try { localStorage.setItem('phos_ltx_finish_quality', cell.quality); } catch (e) {}
+  _syncFinishAffordance(findOutputByPath(activePath));
+}
+
+// PURE — same contract as h3FinishFieldsFromSidecar: given a completed LTX
+// render's sidecar params and the tier to finish at, the exact #genForm
+// field→value map that reproduces the clip at the new quality, or null when
+// the sidecar isn't a finishable LTX t2v/i2v draft.
+function ltxFinishFieldsFromSidecar(p, tierKey) {
+  if (!p || typeof p !== 'object') return null;
+  if (p.engine && p.engine !== 'ltx') return null;
+  if (!tierKey) return null;
+  const target = ltxTierByKeyExact(tierKey);
+  if (!target) return null;
+  // Codex UI-2: only a plain t2v/i2v draft has a "same shot, more detail"
+  // re-render. Every other mode (keyframe, extend, a2v, i2v_clean_audio,
+  // remix...) used to fall through to 't2v' here, so Finish on a Keyframe
+  // clip queued a text-to-video that threw its keyframe images away.
+  // No recorded mode = an old t2v sidecar.
+  if (p.mode && p.mode !== 't2v' && p.mode !== 'i2v') return null;
+  const mode = (p.mode === 'i2v') ? 'i2v' : 't2v';
+  // Codex UI-3: the source's orientation is part of the recipe. Finish used
+  // whatever the FORM's aspect was (a landscape clip finished as portrait when
+  // the form was left on Portrait). Read it off the clip's own canvas.
+  const sw = Number(p.width) || 0, sh = Number(p.height) || 0;
+  const aspect = !(sw > 0 && sh > 0) ? ''
+    : (sw === sh) ? 'square'
+    : (sh > sw) ? ((Math.abs(sw / sh - 0.8) < 0.02) ? 'portrait_4_5' : 'vertical')
+    : 'landscape';
+  // Same seed contract as H3's Finish and Manual's own loadParams: the
+  // RESOLVED seed_used, never '-1' (which would hand the finish render a
+  // fresh roll of the dice instead of the same shot at more detail).
+  const seedRaw = (p.seed_used != null && String(p.seed_used) !== ''
+                   && String(p.seed_used) !== '-1')
+    ? p.seed_used
+    : p.seed;
+  const seed = (seedRaw == null || String(seedRaw) === '') ? '-1' : String(seedRaw);
+  const fields = {
+    mode, engine: 'ltx',
+    quality: target.quality,
+    length: target.length,
+    width: target.width, height: target.height, frames: target.frames,
+    prompt: String(p.prompt || ''),
+    negative_prompt: String(p.negative_prompt || ''),
+    seed,
+    // The export pass and the speed dial are part of the recipe: a draft
+    // judged with turbo, or with a 720p fit export, should be finished with
+    // the same choices — a Finish that silently dropped them would be a
+    // different recipe as well as a different canvas.
+    upscale: (typeof p.upscale === 'string' && p.upscale) ? p.upscale : '',
+    upscale_method: (typeof p.upscale_method === 'string' && p.upscale_method) ? p.upscale_method : '',
+    aspect,
+    accel: (typeof p.accel === 'string' && p.accel) ? p.accel : 'off',
+    image: (mode === 'i2v' && typeof p.image === 'string') ? p.image : '',
+    // The crop framing is part of the recipe (VC-29/H3-01): a face kept by a
+    // Top or dragged crop in the draft must be kept in the finish too. Older
+    // sidecars predate it — they rendered centred.
+    // (Inline, not _cropFocusFromParams: this function stays pure/self-contained.)
+    image_crop_focus: ((v) => (isFinite(v) && v >= 0 && v <= 1) ? v : 0.5)(parseFloat(p.image_crop_focus)),
+    loras: Array.isArray(p.loras)
+      ? p.loras.filter(l => l && l.path)
+          .map(l => ({ path: String(l.path),
+                       strength: (typeof l.strength === 'number') ? l.strength : 1.0 }))
+      : [],
+  };
+  if (mode === 'i2v' && !fields.image) return null;
+  return fields;
+}
+
+// Show/hide + re-label the shared Finish control for an LTX clip. Mirrors
+// _syncH3FinishAffordance exactly — same wrap/label/button/select ids, one
+// toolbar slot shared by both engines (dispatched by _syncFinishAffordance
+// below), because "commit this draft at higher quality" is one user concept
+// regardless of which engine rendered the draft.
+function _syncLtxFinishAffordance(o) {
+  const wrap = document.getElementById('h3FinishWrap');
+  if (!wrap) return false;
+  const label = document.getElementById('h3FinishLabel');
+  const btn = document.getElementById('h3FinishBtn');
+  const sel = document.getElementById('h3FinishTier');
+  const lengthKey = o ? _ltxLengthKeyForFrames(o.frames) : null;
+  const srcTier = (o && o.engine === 'ltx' && lengthKey && _ltxFinishableMode(o.mode))
+    ? ltxCellFor(o.quality, lengthKey) : null;
+  const targetKey = srcTier ? ltxFinishTierKey(srcTier) : null;
+  const target = targetKey ? ltxTierByKeyExact(targetKey) : null;
+  if (!srcTier || !target) return false;
+  wrap.style.display = '';
+  const name = String(target.label).replace(/\s*·\s*/g, ' ').trim();
+  if (label) label.textContent = `Finish at ${name} · ${target.eta}`;
+  if (btn) {
+    btn.title = `Re-render this ${srcTier.quality_label} clip at `
+              + `${target.label} (${target.delivered_spec || target.spec}, ${target.eta}) — same `
+              + `${target.length_label} length, same prompt, same seed`;
+    btn.onclick = ltxFinishActive;
+  }
+  if (sel) {
+    const opts = ltxFinishTargets(srcTier)
+      .map(t => `<option value="${escapeHtml(t.key)}"${t.key === target.key ? ' selected' : ''}>`
+              + `${escapeHtml(t.label)} · ${escapeHtml(t.eta)}</option>`)
+      .join('');
+    if (sel.dataset.built !== opts) {
+      sel.innerHTML = opts;
+      sel.dataset.built = opts;
+    }
+    sel.value = target.key;
+    sel.onchange = () => ltxFinishSetTier(sel.value);
+  }
+  return true;
+}
+
+// UI-2: the modes LTX Finish can re-render (see ltxFinishFieldsFromSidecar).
+// An output with no recorded mode is an old t2v clip.
+function _ltxFinishableMode(mode) {
+  return !mode || mode === 't2v' || mode === 'i2v';
+}
+
+// One toolbar slot, two engines. Tries H3 first (unchanged), then LTX; a
+// clip that is neither hides the control. `btn.onclick`/`sel.onchange` are
+// re-pointed by whichever branch matches so the SAME button always commits
+// whatever is currently labelled on it — never a stale handler left over
+// from the previously selected clip's engine.
+function _syncFinishAffordance(o) {
+  if (o && o.engine === 'h3') {
+    const btn = document.getElementById('h3FinishBtn');
+    const sel = document.getElementById('h3FinishTier');
+    if (btn) btn.onclick = h3FinishActive;
+    if (sel) sel.onchange = () => h3FinishSetTier(sel.value);
+    _syncH3FinishAffordance(o);
+    return;
+  }
+  if (_syncLtxFinishAffordance(o)) return;
+  const wrap = document.getElementById('h3FinishWrap');
+  if (wrap) wrap.style.display = 'none';
+}
+
+// Commit the selected LTX clip at a higher quality — the mirror of
+// h3FinishActive, restoring through the same Load-Params-then-submit path.
+async function ltxFinishActive() {
+  if (!activePath) return;
+  const o = findOutputByPath(activePath);
+  const lengthKey = o ? _ltxLengthKeyForFrames(o.frames) : null;
+  const srcTier = (o && o.engine === 'ltx' && lengthKey && _ltxFinishableMode(o.mode))
+    ? ltxCellFor(o.quality, lengthKey) : null;
+  if (!srcTier) return;                     // button shouldn't be visible
+  const targetKey = ltxFinishTierKey(srcTier);
+  const target = targetKey ? ltxTierByKeyExact(targetKey) : null;
+  if (!target) return;
+
+  let p = null;
+  try {
+    const r = await fetch('/sidecar?path=' + encodeURIComponent(activePath));
+    if (!r.ok) throw new Error('no sidecar (older output?)');
+    const data = await r.json();
+    p = data && data.params;
+  } catch (e) {
+    if (typeof phosToast === 'function') {
+      phosToast('Finish: ' + (e.message || 'failed to read sidecar'), { kind: 'danger' });
+    }
+    return;
+  }
+  const fields = ltxFinishFieldsFromSidecar(p, target.key);
+  if (!fields) {
+    if (typeof phosToast === 'function') {
+      phosToast('Finish: this clip\'s sidecar is missing what the re-render needs.',
+                { kind: 'danger' });
+    }
+    return;
+  }
+
+  if (typeof workflowSwitch === 'function') { try { workflowSwitch('manual'); } catch (e) {} }
+  setMode(fields.mode);
+  if (fields.mode === 'i2v') {
+    const i2vSel = document.getElementById('i2vMode');
+    if (i2vSel) i2vSel.value = 'i2v';
+    document.getElementById('mode').value = 'i2v';
+  }
+  // setMode() re-applies the persisted engine via _syncEngineForMode(), so
+  // LTX has to be forced AFTER it — same ordering reason h3FinishActive
+  // forces 'h3' after setMode() above.
+  const engine = (typeof setEngine === 'function') ? setEngine('ltx') : 'ltx';
+  if (engine !== 'ltx') {
+    const note = (document.getElementById('engineRowNote') || {}).textContent || '';
+    if (typeof phosToast === 'function') {
+      phosToast('Finish needs the LTX engine. ' + note, { kind: 'danger' });
+    }
+    return;
+  }
+  document.getElementById('prompt').value = fields.prompt;
+  document.getElementById('negative_prompt').value = fields.negative_prompt;
+  if (typeof syncAvoidRowFromValue === 'function') { try { syncAvoidRowFromValue(); } catch (e) {} }
+  if (fields.image) {
+    if (typeof pickerSetImage === 'function') {
+      pickerSetImage('image', fields.image, { snapAspect: false });
+    } else {
+      document.getElementById('image').value = fields.image;
+    }
+    if (typeof _setCropFocus === 'function') _setCropFocus('image', fields.image_crop_focus);
+  }
+  // Adapters before the shape, same ordering h3FinishActive uses.
+  _restoreLoraPicker(fields.loras);
+  const accelEl = document.getElementById('accel');
+  if (accelEl) accelEl.value = fields.accel;
+  // UI-3: the source's orientation BEFORE the shape — setQuality() (called by
+  // _ltxApplyShape) derives width/height from the form's #aspect.
+  if (fields.aspect && typeof setAspect === 'function') setAspect(fields.aspect);
+  // Shape LAST of the LTX controls — _ltxApplyShape is the one place the
+  // form's LTX shape is written, so anything geometry-related set after it
+  // would be fighting the source of truth. Quality AND length together,
+  // not setLtxQuality() alone: that reads the form's CURRENT length, which
+  // may not be this clip's.
+  if (typeof _ltxApplyShape === 'function') _ltxApplyShape(target.quality, target.length);
+  // UI-3: the export row AFTER the shape — setQuality() re-arms the target
+  // preset's own upscale default, which silently dropped the clip's export
+  // (a 720p-exported draft finished with export off). Method rides along.
+  if (fields.upscale && typeof setUpscale === 'function') setUpscale(fields.upscale);
+  if (fields.upscale_method && typeof setUpscaleMethod === 'function') setUpscaleMethod(fields.upscale_method);
+  document.getElementById('seed').value = fields.seed;
+  if (typeof _syncSeedLockChip === 'function') { try { _syncSeedLockChip(); } catch (e) {} }
+  if (typeof updateCustomizeSummary === 'function') { try { updateCustomizeSummary(); } catch (e) {} }
+  if (typeof updateDerived === 'function') { try { updateDerived(); } catch (e) {} }
+  const formPane = document.querySelector('aside.form-pane');
+  if (formPane) formPane.scrollTop = 0;
+
   const form = document.getElementById('genForm');
   if (!form || typeof form.requestSubmit !== 'function') {
     if (typeof phosToast === 'function') {
@@ -378,7 +699,7 @@ function setEngine(engine, opts) {
       target = fallback.id;
       // The lowest lane's floor, not the bf16 one and not a literal 64.
       reason = e.label + ' needs '
-             + (st.ram_floor_gb || st.min_ram_gb || 46) + ' GB unified memory.';
+             + (st.ram_floor_gb || st.min_ram_gb || 36) + ' GB unified memory.';
     } else if (!st.available) {
       target = fallback.id;
       // Distinguish "you never installed this" from "you DID install this and
@@ -528,6 +849,32 @@ function _syncEnginePromptTools() {
            || pill.getAttribute('data-title-ltx');
     if (t) pill.title = t;
   }
+  // H3-07: #h3PromptHelper isn't registered as any engine's `strip`/`hint`
+  // (the generic ENGINES.forEach toggle in setEngine), so it needs its own
+  // switch here — the one place both engines' prompt-tool state already
+  // gets reconciled on every engine change.
+  const helper = document.getElementById('h3PromptHelper');
+  if (helper) helper.hidden = (eng !== 'h3');
+  const promptEl = document.getElementById('prompt');
+  if (promptEl) {
+    // H3-07: the placeholder was LTX's audio-cue example unconditionally —
+    // no hint anywhere that H3 needs a structured field + a <d>…</d> tag to
+    // get spoken dialogue at all.
+    promptEl.placeholder = (eng === 'h3')
+      ? 'integrated_multimodal_description: [Shot 1] Who/what, the setting, '
+        + 'what happens. A line of dialogue goes ONLY inside a tag: '
+        + 'GEORGE says: <d>[English] I thought it was ashwagandha!</d> then '
+        + 'his mouth settles closed. Click Structure or + Line above to '
+        + 'insert the skeleton.\n\noverall_soundscape: ambience, sound '
+        + 'effects.\n\nnon_diegetic_music: N/A or a description.'
+      : 'Describe the scene AND the sound — e.g. wizard in a forest '
+        + 'clearing, fireflies spiraling up · low whispered chant, ember '
+        + 'crackle, distant owl. Audio is generated jointly with video; '
+        + 'without sound cues the model outputs near-silent ambient.';
+  }
+  if (eng === 'h3' && typeof h3SyncPromptHelper === 'function') {
+    try { h3SyncPromptHelper(); } catch (e) {}
+  }
 }
 
 function currentEngine() {
@@ -590,12 +937,14 @@ function updateH3Availability(s) {
   }
   if (changed) {
     setEngine(currentEngine(), { persist: false });
-    // The Finish button's label and its picker are both derived from H3.tiers,
-    // so a pack install/repair that changes the offered tiers has to re-label
-    // the currently-selected clip's affordance too — otherwise it keeps
-    // advertising a tier this install just stopped (or started) offering.
-    if (typeof _syncH3FinishAffordance === 'function') {
-      try { _syncH3FinishAffordance(findOutputByPath(activePath)); } catch (e) {}
+    // The Finish button's label and its picker are both derived from the
+    // engine's own tier table, so a pack install/repair that changes the
+    // offered tiers has to re-label the currently-selected clip's
+    // affordance too — otherwise it keeps advertising a tier this install
+    // just stopped (or started) offering. Dispatches to whichever engine
+    // rendered the selected clip (VC-18/37).
+    if (typeof _syncFinishAffordance === 'function') {
+      try { _syncFinishAffordance(findOutputByPath(activePath)); } catch (e) {}
     }
   }
 }
@@ -653,10 +1002,26 @@ function openH3InstallCard(source) {
           + 'Re-cloning it takes about a minute.'
         : 'What broke: ' + (_missing[0] || 'a component the probe lists below')
           + '.';
+    // H3-05: "repairable" covers two different real situations and they
+    // need two different CTAs. missing_q8_dit means every weight is present
+    // and only the local compact build is missing — pinokio.js shows ONLY a
+    // Build entry for that state, no Repair entry at all, so telling the
+    // user to click "Repair Hailuo H3" sent them looking for a button that
+    // doesn't exist (the exact 48 GB rescue scenario recent releases tried
+    // to fix). venv/runner actually broken is the real repair case.
+    const needsBuildOnly = H3.reason === 'missing_q8_dit';
+    const fixMenuText = needsBuildOnly
+      ? 'Build Hailuo H3 compact engine (weights kept — no re-download)'
+      : 'Repair Hailuo H3 (weights kept — no re-download)';
+    const fixBlurb = needsBuildOnly
+      ? `<b>Hailuo H3 is installed — it just needs its compact engine built.</b>
+         Your weights (~75 GB) are already on disk; the build downloads
+         nothing.`
+      : `<b>Hailuo H3 is installed — it just needs repairing.</b> Your weights
+         (~75 GB) are still on disk and are <em>not</em> re-downloaded.`;
     const intro = H3.repairable ? `
       <p style="margin:0 0 10px">
-        <b>Hailuo H3 is installed — it just needs repairing.</b> Your weights
-        (~75 GB) are still on disk and are <em>not</em> re-downloaded.
+        ${fixBlurb}
       </p>
       <p style="margin:0 0 10px;color:var(--muted)">
         ${diagnosis}
@@ -666,18 +1031,18 @@ function openH3InstallCard(source) {
       </p>
       <p style="margin:0 0 10px">
         Fix it from Pinokio: open the <b>Phosphene</b> entry in the Pinokio
-        sidebar and click <b>“Repair Hailuo H3”</b> (it appears in place of the
-        install entry). The step is idempotent — it skips every weight already
-        on disk. The panel picks the engine back up within a couple of seconds,
-        no restart.
+        sidebar and click <b>“${escapeHtml(fixMenuText)}”</b> (it appears in
+        place of the install entry). The step is idempotent — it skips every
+        weight already on disk. The panel picks the engine back up within a
+        couple of seconds, no restart.
       </p>` : `
       <p style="margin:0 0 10px">
         <b>Hailuo H3 is Phosphene's second video engine</b>, a peer of LTX
         rather than an add-on to it: one prompt in, video <em>and</em> synced
         dialogue <em>and</em> sound out, in a single pass. It runs fully
         locally and sits beside LTX in the engine switcher — installing it
-        changes nothing about your existing renders, and either engine can
-        drive any render you start.
+        changes nothing about your existing renders. H3 covers Text and
+        Image; LTX still covers every other mode.
       </p>
       <p style="margin:0 0 10px;color:var(--muted)">
         ${escapeHtml(H3.size_note || '')}
@@ -703,6 +1068,15 @@ function openH3InstallCard(source) {
         <summary>Details for troubleshooting</summary>
         <p>Currently missing: ${escapeHtml(missing.join('; '))}</p>
       </details>` : ''}`;
+    // H3-39: the title was a static "Hailuo H3 · 75 GB" in the markup,
+    // unconditionally — including the build-only and repair cases, where
+    // nothing downloads. Say what this click actually costs.
+    const title = document.getElementById('h3InstallTitle');
+    if (title) {
+      title.textContent = needsBuildOnly ? 'Build the compact engine · ~5 min, no download'
+        : H3.repairable ? 'Repair Hailuo H3 · no download'
+        : 'Hailuo H3 · 75 GB';
+    }
   }
   if (m) m.style.display = 'flex';
   _h3CardSeen = true;
@@ -740,8 +1114,14 @@ function _h3NudgeEngineOffer() {
   // inside a 480px cap, so a sentence that runs long is not a long toast, it
   // is a truncated one — "…install it from the Phosphene entry i…" was the
   // first draft, and it clipped exactly where the instruction lived.
-  const el = phosToast('Hailuo H3 · 75 GB — install from the Pinokio sidebar.',
-                       { icon: 'ph-info', duration: 5000 });
+  // H3-39: same "· 75 GB" default the modal title had, wrong whenever this is
+  // a build-only or repair nudge — nothing downloads in either case.
+  const nudgeMsg = (H3.reason === 'missing_q8_dit')
+    ? 'Hailuo H3 · build the compact engine, no download — from the Pinokio sidebar.'
+    : H3.repairable
+      ? 'Hailuo H3 · repair, no download — from the Pinokio sidebar.'
+      : 'Hailuo H3 · 75 GB — install from the Pinokio sidebar.';
+  const el = phosToast(nudgeMsg, { icon: 'ph-info', duration: 5000 });
   if (!el) return;
   const a = document.createElement('a');
   a.href = '#';
@@ -764,7 +1144,9 @@ async function enhancePrompt() {
   // an inline ph-sparkle-fill SVG that textContent would strip.
   const originalLabel = btn.innerHTML;
   btn.disabled = true;
-  btn.innerHTML = '<svg class="ph" aria-hidden="true" style="margin-right:6px;vertical-align:-2px"><use href="#ph-sparkle-fill"/></svg>Loading Gemma… (~15s on cold start)';
+  // VC-23: "Gemma" is the internal model name and means nothing to most
+  // users — "the prompt helper" says what it DOES instead.
+  btn.innerHTML = '<svg class="ph" aria-hidden="true" style="margin-right:6px;vertical-align:-2px"><use href="#ph-sparkle-fill"/></svg>Loading the prompt helper… (~15s on cold start)';
   let res;
   try {
     // Collect trigger tokens to preserve case-exact through enhance.
@@ -788,6 +1170,10 @@ async function enhancePrompt() {
     if (charIdEl && charIdEl.value) preserveTokens.push(charIdEl.value);
     const fd = new URLSearchParams({ prompt: original, mode });
     if (preserveTokens.length) fd.set('preserve_tokens', JSON.stringify(preserveTokens));
+    // VC-13: the language-hint toggle, when it's showing (a non-Latin
+    // prompt). Absent/checked = translate (unchanged default behaviour).
+    const translateEl = document.getElementById('translateToEnglish');
+    fd.set('translate', (!translateEl || translateEl.checked) ? '1' : '0');
     const r = await fetch('/prompt/enhance', { method: 'POST', body: fd });
     res = await r.json();
   } catch (e) {
@@ -796,15 +1182,75 @@ async function enhancePrompt() {
     return;
   }
   btn.disabled = false; btn.innerHTML = originalLabel;
-  if (res.error) { alert('Enhance failed: ' + res.error); return; }
-  // Show diff in a confirm so the user can decide whether to accept.
-  const accept = confirm(
-    `Original:\n${res.original}\n\nEnhanced:\n${res.enhanced}\n\nReplace your prompt with the enhanced version?`
-  );
-  if (accept) {
-    ta.value = res.enhanced;
-    ta.dispatchEvent(new Event('input', { bubbles: true }));
+  if (res.error) {
+    // VC-16: a GPU-busy refusal (409) names what's rendering instead of a
+    // flat "a render is using the GPU" — show it inline, not a blocking
+    // alert(), so it reads the same register as everything else in this
+    // panel and doesn't demand a click to dismiss.
+    phosToast(res.error, { kind: 'danger', duration: 8000 });
+    return;
   }
+  showEnhancePanel(res.original, res.enhanced, !!res.translated);
+}
+
+// VC-13: a light, reliable "not Latin script" signal — mirrors
+// prompt_looks_non_latin() server-side exactly (same ranges), so the hint
+// and the toggle it feeds never disagree with what Enhance itself checks.
+function promptLooksNonLatin(text) {
+  return /[぀-ヿ㐀-䶿一-鿿가-힯Ѐ-ӿ؀-ۿ֐-׿฀-๿]/.test(text || '');
+}
+function updateLangHint() {
+  const ta = document.getElementById('prompt');
+  const hint = document.getElementById('langHint');
+  if (!ta || !hint) return;
+  hint.hidden = !promptLooksNonLatin(ta.value);
+}
+
+// VC-16: the inline Enhance result — Accept / Undo / Keep mine, replacing
+// the old native confirm() (no edit, no diff, no undo, and it broke ⌘Z by
+// overwriting the textarea programmatically). Two states in one panel:
+// "review" shows the fresh result; "applied" (after Accept) offers Undo.
+function showEnhancePanel(original, enhanced, translated) {
+  const panel = document.getElementById('enhancePanel');
+  if (!panel) return;
+  panel.dataset.original = original;
+  panel.dataset.enhanced = enhanced;
+  // VC-13: "Enhance states that it translated" — set once, up front, not
+  // buried behind Accept, so it's visible while still reviewing.
+  panel.dataset.translated = translated ? '1' : '';
+  document.getElementById('enhanceOriginalText').textContent = original;
+  document.getElementById('enhanceEnhancedText').textContent = enhanced;
+  document.getElementById('enhanceAcceptBtn').hidden = false;
+  document.getElementById('enhanceKeepBtn').hidden = false;
+  document.getElementById('enhanceUndoBtn').hidden = true;
+  document.getElementById('enhancePanelNote').textContent = translated ? 'Translated to English.' : '';
+  panel.hidden = false;
+}
+function _setPromptValue(text) {
+  const ta = document.getElementById('prompt');
+  if (!ta) return;
+  ta.value = text;
+  ta.dispatchEvent(new Event('input', { bubbles: true }));
+}
+function acceptEnhance() {
+  const panel = document.getElementById('enhancePanel');
+  if (!panel || panel.hidden) return;
+  _setPromptValue(panel.dataset.enhanced || '');
+  document.getElementById('enhanceAcceptBtn').hidden = true;
+  document.getElementById('enhanceKeepBtn').hidden = true;
+  document.getElementById('enhanceUndoBtn').hidden = false;
+  document.getElementById('enhancePanelNote').textContent =
+    (panel.dataset.translated ? 'Translated to English. ' : '') + 'Applied.';
+}
+function undoEnhance() {
+  const panel = document.getElementById('enhancePanel');
+  if (!panel || panel.hidden) return;
+  _setPromptValue(panel.dataset.original || '');
+  panel.hidden = true;
+}
+function keepMineEnhance() {
+  const panel = document.getElementById('enhancePanel');
+  if (panel) panel.hidden = true;
 }
 
 // Extend duration: user types seconds, we convert to latent frames behind
@@ -822,9 +1268,20 @@ function syncExtendDuration() {
   const latents = Math.max(1, Math.ceil(seconds * 24 / 8));
   const actualSec = (latents * 8 / 24);
   hidden.value = String(latents);
-  hint.textContent = `≈ ${actualSec.toFixed(2)} s of new content (${latents} latent frames × 8 video frames at 24 fps)`;
+  // VC-23: "6 latent frames × 8 video frames at 24 fps" is the panel's own
+  // math, not something a user needs to read to understand "this adds
+  // about 2 seconds" — kept as a tooltip for anyone who does want it.
+  hint.textContent = `Adds ${actualSec.toFixed(2)} s`;
+  hint.title = `${latents} latent frames × 8 video frames at 24 fps`;
+  // VC-25: the sticky footer's derived line has its own Extend-aware branch
+  // (updateDerived()) that reads this same #extend_seconds/#extend_direction
+  // pair — refresh it here too, or it keeps showing whatever it last said
+  // (the wrong job's T2V geometry, or a stale Extend seconds value) until
+  // something ELSE happens to call updateDerived().
+  if (typeof updateDerived === 'function') { try { updateDerived(); } catch (e) {} }
 }
 document.getElementById('extend_seconds').addEventListener('input', syncExtendDuration);
+document.getElementById('extend_direction').addEventListener('change', syncExtendDuration);
 syncExtendDuration();   // initialize on load
 document.getElementById('i2vMode').addEventListener('change', () => {
   document.getElementById('audioSection').classList.toggle('show', document.getElementById('i2vMode').value === 'i2v_clean_audio');
@@ -834,19 +1291,99 @@ document.getElementById('i2vMode').addEventListener('change', () => {
   updateDerived();
 });
 
+// VC-39: 1:1 and 4:5 are their own measured cells (ASPECTS.square /
+// ASPECTS.portrait_4_5), fixed regardless of the quality tier — unlike
+// landscape/vertical, which are a rotation of whatever canvas the CURRENT
+// quality preset already renders at (Balanced 1024×576, Standard 1280×704,
+// ...). Shared by applyAspect (here) and setQuality (characters.js) so the
+// two can't drift into disagreeing about what a given (aspect, quality)
+// pair renders at — published below.
+function _aspectDims(aspectKey, qualityKey) {
+  const fixed = ASPECTS[aspectKey];
+  if (fixed && (aspectKey === 'square' || aspectKey === 'portrait_4_5')) {
+    return { w: fixed.w, h: fixed.h };
+  }
+  const preset = QUALITY_PRESETS[qualityKey] || QUALITY_PRESETS['standard'];
+  const vertical = (aspectKey === 'vertical' && qualityKey !== 'quick');
+  return vertical ? { w: preset.h, h: preset.w } : { w: preset.w, h: preset.h };
+}
+// VA-20: the I2V "external audio" (mux) slot — was a raw path text box, the
+// only non-picker file input on the video form. This is deliberately a
+// smaller drop/click zone than the full .picker component (no recent-uploads
+// strip, no image preview machinery — none of that applies to audio), but
+// the same interaction shape as the Lip-sync tab's audio slot.
+function i2vAudioRenderSlot(path) {
+  const hint = document.getElementById('i2vAudioSlotHint');
+  if (!hint) return;
+  if (path) {
+    const name = String(path).split('/').pop();
+    hint.innerHTML = '<svg class="ph" aria-hidden="true" style="width:16px;height:16px;vertical-align:-3px;margin-right:6px;"><use href="#ph-music-notes"/></svg>'
+      + escapeHtml(name)
+      + '<div class="hint" style="margin-top:4px"><a href="#" onclick="event.stopPropagation();event.preventDefault();i2vAudioSet(\'\');">Remove</a></div>';
+  } else {
+    hint.textContent = 'Drop a WAV / MP3 / M4A / FLAC here, or click to pick a file.';
+  }
+}
+function i2vAudioSet(path) {
+  const el = document.getElementById('audio');
+  if (el) el.value = path || '';
+  i2vAudioRenderSlot(path);
+  updateDerived();
+}
+async function i2vAudioUpload(file) {
+  if (!file) return;
+  const hint = document.getElementById('i2vAudioSlotHint');
+  if (hint) hint.textContent = `Uploading ${file.name}…`;
+  try {
+    const fd = new FormData();
+    fd.append('audio', file);
+    const r = await fetch('/upload', { method: 'POST', body: fd });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || 'upload failed');
+    i2vAudioSet(data.path);
+  } catch (e) {
+    i2vAudioRenderSlot(document.getElementById('audio')?.value || '');
+    if (typeof phosToast === 'function') {
+      phosToast('Audio upload failed: ' + (e.message || e), { kind: 'danger' });
+    } else {
+      alert('Audio upload failed: ' + (e.message || e));
+    }
+  }
+}
+(function wireI2vAudioSlot() {
+  const slot = document.getElementById('i2vAudioSlot');
+  const input = document.getElementById('i2vAudioFileInput');
+  if (!slot || !input) return;
+  slot.addEventListener('click', () => input.click());
+  slot.addEventListener('dragover', (e) => { e.preventDefault(); slot.classList.add('drop-active'); });
+  slot.addEventListener('dragleave', () => slot.classList.remove('drop-active'));
+  slot.addEventListener('drop', (e) => {
+    e.preventDefault();
+    slot.classList.remove('drop-active');
+    if (e.dataTransfer?.files?.[0]) i2vAudioUpload(e.dataTransfer.files[0]);
+  });
+  input.addEventListener('change', () => {
+    if (input.files?.[0]) i2vAudioUpload(input.files[0]);
+  });
+  // boot.js runs before this module and already set #audio.value to
+  // BOOT.default_audio — pick that up so the slot doesn't show an empty
+  // state for a field that already has a value.
+  i2vAudioRenderSlot(document.getElementById('audio')?.value || '');
+})();
+
 function applyAspect(key) {
   if (!ASPECTS[key]) return;
   document.getElementById('aspect').value = key;
   // Aspect controls dimensions only when the active preset has a choice
-  // (Standard / High at 1280×704 vs 704×1280). Quick is fixed 4:3 and
-  // ignores the aspect picker (the row is hidden in that state, so this
-  // path normally won't fire — defensive in case of programmatic calls).
+  // (Standard / High at 1280×704 vs 704×1280, or the fixed 1:1 / 4:5
+  // cells). Quick is fixed 4:3 and ignores the aspect picker (the row is
+  // hidden in that state, so this path normally won't fire — defensive in
+  // case of programmatic calls).
   const q = document.getElementById('quality').value;
   if (q === 'quick') return;
-  const preset = QUALITY_PRESETS[q] || QUALITY_PRESETS['standard'];
-  const vertical = (key === 'vertical');
-  document.getElementById('width').value  = vertical ? preset.h : preset.w;
-  document.getElementById('height').value = vertical ? preset.w : preset.h;
+  const dims = _aspectDims(key, q);
+  document.getElementById('width').value  = dims.w;
+  document.getElementById('height').value = dims.h;
   updateCustomizeSummary();
   updateDerived();
 }
@@ -895,12 +1432,144 @@ function snapFramesTo8kPlus1() {
   }
 }
 
+// VC-15: the Avoid box takes input on every quality, but the distilled Q4
+// lane (Quick/Balanced/Standard T2V+I2V) has no unconditional branch to run
+// it against — the box's own hint said so in 10px grey text, but nothing on
+// the box ITSELF, or on its collapsed toggle, showed it. Reads the same
+// registry facts as everything else that draws this line (_qualityUsesHq),
+// so "does Avoid work right now" can never disagree with the quality chips.
+function avoidIsIgnored() {
+  const mode = (document.getElementById('mode') || {}).value || 't2v';
+  if (currentMode === 'extend' || currentMode === 'keyframe' || mode === 'a2v') return false;
+  if (mode !== 't2v' && mode !== 'i2v' && mode !== 'i2v_clean_audio') return false;
+  const quality = (document.getElementById('quality') || {}).value || 'balanced';
+  return typeof _qualityUsesHq === 'function' ? !_qualityUsesHq(quality) : false;
+}
+function updateAvoidIgnoredState() {
+  const note = document.getElementById('avoidIgnoredNote');
+  const ta = document.getElementById('negative_prompt');
+  const qLabel = document.getElementById('avoidIgnoredQuality');
+  const lbl = document.getElementById('avoidToggleLabel');
+  const row = document.getElementById('avoidRow');
+  if (!note || !ta) return;
+  const ignored = avoidIsIgnored();
+  note.hidden = !ignored;
+  ta.classList.toggle('is-ignored', ignored);
+  if (qLabel) {
+    let cell = (typeof ltxCurrentCell === 'function') ? ltxCurrentCell() : null;
+    qLabel.textContent = (cell && cell.quality_label) || 'this quality';
+  }
+  if (lbl && row) {
+    const open = row.classList.contains('show');
+    lbl.textContent = open ? 'Avoid −'
+      : (ignored ? `Avoid + (off at ${(qLabel && qLabel.textContent) || 'this quality'})` : 'Avoid +');
+  }
+}
+
 let _h3DerivedMode = null;
+// VA-11 / VA-12: keyframe and extend each run a DIFFERENT pipeline than
+// whatever the Quality strip's w/h/steps form fields say — keyframe always
+// renders Q8 two-stage at this Mac's clamped canvas, extend runs its own
+// step count at its own clamp. Pricing those off the raw form fields (what
+// updateDerived did for every other mode) is exactly the bug: the summary
+// showed the Quality pill's number for a render that was never going to be
+// that size, that quality, or that fast. Both prices are computed
+// server-side (ltx_mode_price_card, BOOT.tier / /status tier) and read here
+// verbatim — the browser prices nothing of its own (Structure Law §6).
+// 4.17 Codex EST-7: BOOT's keyframe card is priced at 5 s on the default
+// canvas. The shape the form actually holds (duration, aspect) is priced by
+// GET /keyframe/estimate — debounced, sequence-guarded, cached per shape —
+// and both readers (this footer and the Shot setup summary) repaint when
+// it lands. Returns {card, pending}: card is null only when keyframe isn't
+// available on this Mac; pending means the eta is still being priced.
+const _kfPriceCache = {};
+let _kfPriceSeq = 0;
+let _kfPriceTimer = null;
+function keyframePriceFor() {
+  const tier = (typeof BOOT !== 'undefined' && BOOT.tier) || {};
+  const base = tier.keyframe_price || null;
+  if (!base) return { card: null, pending: false };
+  const num = (id) => parseInt((document.getElementById(id) || {}).value || 0, 10) || 0;
+  const frames = num('frames'), w = num('width'), h = num('height');
+  const key = `${frames}|${w}|${h}`;
+  if (_kfPriceCache[key]) return { card: _kfPriceCache[key], pending: false };
+  clearTimeout(_kfPriceTimer);
+  const seq = ++_kfPriceSeq;
+  _kfPriceTimer = setTimeout(async () => {
+    try {
+      const r = await fetch(`/keyframe/estimate?frames=${frames}&width=${w}&height=${h}`);
+      const d = await r.json();
+      if (!d || !d.ok) return;
+      _kfPriceCache[key] = d;
+      if (seq !== _kfPriceSeq) return;
+      const modeEl = document.getElementById('mode');
+      if (modeEl && modeEl.value === 'keyframe') updateDerivedForClampedMode('keyframe');
+      if (typeof updateShotSetupSummary === 'function') { try { updateShotSetupSummary(); } catch (e) {} }
+    } catch (e) { /* the pending line stays; the next change retries */ }
+  }, 150);
+  return { card: base, pending: true };
+}
+function updateDerivedForClampedMode(mode) {
+  const tier = (typeof BOOT !== 'undefined' && BOOT.tier) || {};
+  const derivedFooter = document.getElementById('derivedFooter');
+  let card = null, line = '';
+  if (mode === 'keyframe') {
+    const kp = keyframePriceFor();
+    card = kp.card;
+    line = card
+      ? (kp.pending
+        ? `${escapeHtml(card.pipeline_note)} · pricing…`
+        : `${escapeHtml(card.pipeline_note)} · <strong>${card.width}×${card.height}</strong> · ${escapeHtml(card.eta)}`)
+      : 'Needs more memory than this Mac has for keyframe (FFLF) rendering.';
+    if (kp.pending) card = null;   // the canvas below is not known yet either
+  } else if (mode === 'extend') {
+    const proOn = (document.getElementById('extend_steps') || {}).value === '30';
+    card = proOn ? tier.extend_price_pro : tier.extend_price_draft;
+    // VC-25: the seconds actually being added (rounded up to the
+    // 8-video-frame latent grid, same arithmetic as syncExtendDuration())
+    // and the direction — never the T2V width/height/frames fields, which
+    // describe a shot Extend isn't building. VA-12: the canvas is this
+    // Mac's Extend clamp and the ETA is priced server-side per latent count.
+    const secEl = document.getElementById('extend_seconds');
+    const dirEl = document.getElementById('extend_direction');
+    const sec = secEl ? (parseFloat(secEl.value) || 0) : 0;
+    const latents = Math.max(1, Math.ceil(sec * 24 / 8));
+    const actualSec = (latents * 8 / 24).toFixed(1);
+    const dir = (dirEl && dirEl.value === 'before') ? 'before' : 'after';
+    const eta = card ? ((card.eta_by_latents || {})[String(latents)] || card.eta) : '';
+    line = card
+      ? `<strong>+${actualSec}s ${dir} · Q8</strong> · ≤${Math.max(card.width, card.height)} px · ${escapeHtml(eta)}`
+      : 'Needs more memory than this Mac has for Extend.';
+  }
+  if (derivedFooter) derivedFooter.innerHTML = line;
+  const qualityMeta = document.getElementById('qualityMeta');
+  if (qualityMeta && card) qualityMeta.textContent = `${card.width}×${card.height}`;
+}
 function updateDerived() {
   // The per-window hint counts windows for the CURRENT length, so it has to
   // move when the length does, not only when the pill is clicked.
   if (typeof windowPromptsInput === 'function') { try { windowPromptsInput(); } catch (e) {} }
+  // VA-13: the Extend clamp note has to repaint on every mode switch (BOOT
+  // data doesn't change, but the note is only relevant — and only in the
+  // DOM's visible path — while Extend is the active mode).
+  if (typeof refreshExtendClampNote === 'function') { try { refreshExtendClampNote(); } catch (e) {} }
+  // VC-29/H3-01/VA-02: the crop-preview overlay tracks whatever the render
+  // canvas currently is (#width/#height for 'image' — LTX or H3, since both
+  // engines mirror their resolved canvas into those same fields — and A2V's
+  // own width/height for 'a2v_image'), so it has to repaint on every change
+  // that could move that canvas: quality/length/orientation pills, custom
+  // W×H edits, and a fresh image pick. Routing through here (updateDerived
+  // is already the one function all of those call) is the single point
+  // that covers every trigger without threading a new hook to each one.
+  if (typeof refreshPickerCropOverlays === 'function') { try { refreshPickerCropOverlays(); } catch (e) {} }
   const mode = document.getElementById('mode').value;
+  // VA-11/12: keyframe and extend price a pipeline the Quality strip does
+  // not describe, so their summary comes from the server's price card
+  // (updateDerivedForClampedMode) — but that must not RETURN from here:
+  // everything below the footer (which form sections show for this mode,
+  // the keyframe slots, the frames gate) still has to run, or switching to
+  // Extend / Keyframe would leave the previous mode's sections on screen.
+  const clampedMode = (mode === 'keyframe' || currentMode === 'extend');
   const w = parseInt(document.getElementById('width').value || 0);
   const h = parseInt(document.getElementById('height').value || 0);
   const f = parseInt(document.getElementById('frames').value || 0);
@@ -931,7 +1600,17 @@ function updateDerived() {
     temporalText = ` · LTX ${sourceFrames}f @ 12fps → ${FPS}fps`;
   }
 
-  document.getElementById('derived').innerHTML = `Duration <strong>${dur}s</strong> @ ${FPS}fps${temporalText} · ${finalRes} · Steps ${document.getElementById('steps').value}${accelText}`;
+  // VC-27: this used to ALSO write the identical numbers into a standalone
+  // "Duration ... · ... · Steps ..." box (#derived) that sat unconditionally
+  // between the Advanced disclosure and the sticky footer — a plain
+  // Balanced 5s render showed the same duration/resolution three times at
+  // once (the collapsed Shot-setup summary, this box, and the footer line
+  // below). #derived carried no information the footer's own line didn't
+  // already have, and unlike the two `<summary>` texts it was never a
+  // disclosure's collapsed-state indicator (nothing lived inside a
+  // `<details>` to reveal), so there was nothing to preserve by keeping it.
+  // Dropped outright; see the enhanced footer line below, which is now the
+  // one place this information lives.
 
   // Compact derived line in the sticky action footer — same info, tighter
   // typography. Lets the user see what they're about to render WITHOUT
@@ -939,13 +1618,42 @@ function updateDerived() {
   // summary style (just dimensions + duration; full details stay in the
   // expanded Customize body).
   const derivedFooter = document.getElementById('derivedFooter');
-  if (derivedFooter) {
+  if (clampedMode) {
+    updateDerivedForClampedMode(currentMode === 'extend' ? 'extend' : 'keyframe');
+  } else if (derivedFooter) {
     const onH3 = typeof currentEngine === 'function' && currentEngine() === 'h3'
       && typeof h3EstimateLine === 'function';
     // H3: the speed, the shape, the optional Face Fix, and what it all costs.
     const h3Line = onH3 ? h3EstimateLine() : '';
+    // VC-27: "one live summary line directly above Generate, including the
+    // ETA" — the footer line is that one line now. T2V/I2V read the same
+    // quality cell the chip strip renders from (ltxCurrentCell / ltxCellEta,
+    // engines.js), so the label and the ETA can never disagree with what
+    // the chips themselves show. Scoped to t2v/i2v on purpose: every other
+    // mode (Restore, Control, Ingredients, Upscale...) doesn't sit on the
+    // quality ladder the same way, and keeps the plain dimensions+duration
+    // line it always had.
+    const ltxLine = (!onH3
+                     && (currentMode === 't2v' || currentMode === 'i2v')
+                     && typeof ltxCurrentCell === 'function')
+      ? (() => {
+          const cell = ltxCurrentCell();
+          if (!cell || !cell.quality_label) return null;
+          let deliveredRes = `${w}×${h}`;
+          if (upscale === 'fit_720p') {
+            deliveredRes = (w >= h) ? '1280×720' : '720×1280';
+          } else if (upscale === 'x2') {
+            deliveredRes = `${w * 2}×${h * 2}`;
+          }
+          const eta = (typeof ltxCellEta === 'function') ? ltxCellEta(cell) : '';
+          return `${cell.quality_label} · ${dur}s · ${deliveredRes}`
+               + (eta ? ` · ${eta}` : '');
+        })()
+      : null;
     derivedFooter.innerHTML = h3Line
       ? `<strong>${escapeHtml(h3Line)}</strong> · ${dur}s`
+      : ltxLine
+      ? `<strong>${escapeHtml(ltxLine)}</strong>`
       : `<strong>${dur}s</strong> · ${finalRes}${temporalText}${accelText}`;
     // The Fast estimate depends on the mode (Image mode encodes a keyframe),
     // so a mode switch re-prices the H3 cards.
@@ -958,7 +1666,7 @@ function updateDerived() {
   // Also update the Quality strip's right-side meta line (e.g. "5s · 1024×576")
   // so the Quality picker block reads as a self-contained summary.
   const qualityMeta = document.getElementById('qualityMeta');
-  if (qualityMeta) {
+  if (qualityMeta && !clampedMode) {
     const qBare = `${w}×${h}`;
     qualityMeta.textContent = `${dur}s · ${qBare}`;
   }
@@ -1063,11 +1771,43 @@ function updateDerived() {
   const dimsRow = document.getElementById('dimsRow');
   if (dimsRow) dimsRow.style.display = '';
 
+  if (typeof updateAvoidIgnoredState === 'function') { try { updateAvoidIgnoredState(); } catch (e) {} }
+
   // Image previews are now part of the picker component itself — the
   // preview <img> + clear button live inside .picker-drop and are toggled
   // by pickerSetImage(). No per-mode preview management here anymore;
   // the old imagePreview / startImagePreview / endImagePreview elements
   // are gone.
+  _updateKeyframeFramesGate();
+}
+
+// VA-25: FFLF/Keyframes needs both a start and an end frame, and used to say
+// so only in a native alert() AFTER Generate was clicked (Generate stayed
+// enabled the whole time). Same inline-reason pattern as stage.js's
+// invalidReason and the Q8/pack-blocked gates just above updateDerived() —
+// disable the button and explain why in its title, rather than let the user
+// find out after the click. Runs on every updateDerived() (which already
+// fires on every picker change via pickerSetImage → updateDerived()).
+const _KF_FRAMES_REASON = 'Pick both a start frame and an end frame before generating.';
+function _updateKeyframeFramesGate() {
+  const genBtn = document.getElementById('genBtn');
+  if (!genBtn) return;
+  if (currentMode !== 'keyframe') {
+    if (genBtn.disabled && genBtn.title === _KF_FRAMES_REASON) {
+      genBtn.disabled = false;
+      genBtn.title = '';
+    }
+    return;
+  }
+  const startImg = (document.getElementById('start_image')?.value || '').trim();
+  const endImg = (document.getElementById('end_image')?.value || '').trim();
+  if (!startImg || !endImg) {
+    genBtn.disabled = true;
+    genBtn.title = _KF_FRAMES_REASON;
+  } else if (genBtn.disabled && genBtn.title === _KF_FRAMES_REASON) {
+    genBtn.disabled = false;
+    genBtn.title = '';
+  }
 }
 
 ['width','height','frames','duration'].forEach(id => {
@@ -1113,14 +1853,83 @@ document.getElementById('keyframe_mid_seconds')?.addEventListener('input', () =>
 // via pickerSetImage(), which already calls updateDerived(). No per-input
 // listeners needed.
 
+// VA-13: say Extend's hardware clamp BEFORE Generate, not only in the log
+// once the 6-16 min render has already finished softer than the source. The
+// number is BOOT.tier.extend_max_dim — the same one run_job_inner enforces
+// (tier_max_dim("extend")) — so the two can never disagree.
+function refreshExtendClampNote() {
+  const el = document.getElementById('extendClampNote');
+  if (!el) return;
+  if (currentMode !== 'extend') { el.hidden = true; return; }
+  const tier = (BOOT && BOOT.tier) || {};
+  const cap = Number(tier.extend_max_dim || 0);
+  if (!cap) {
+    // 0 = unclamped on this Mac's tier (Roomy carries its own 1024 cap —
+    // still worth a line; Studio is the only truly uncapped one).
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  el.textContent = `On this Mac (${tier.label || 'this tier'}), Extend renders `
+    + `at up to ${cap}px on the longer side — a bigger source clip is `
+    + `downscaled to fit before the new frames are added.`;
+}
+
 // Auto-snap the aspect picker based on an image's actual dimensions.
 // Avoids the 16:9-source-cropped-to-9:16-strip footgun.
+//
+// H3-01: H3's Image mode shares this SAME picker (key='image') and used to
+// carry no orientation signal from the picture at all — a 900x1600 portrait
+// upload left H3's own Orientation row on whatever it was last (often
+// "Landscape", the default), so the server centre-cropped a portrait photo
+// onto a landscape canvas and kept the torso, not the face. Both engines'
+// orientation state are driven from the same probed aspect now, so a picked
+// image always sets the right one for whichever engine is active.
 function snapAspectToImage(path) {
   const probe = new Image();
   probe.onload = () => {
     const r = probe.naturalWidth / probe.naturalHeight;
     const target = r >= 1 ? 'landscape' : 'vertical';
     if (document.getElementById('aspect').value !== target) setAspect(target);
+    if (currentEngine() === 'h3' && typeof setH3Orientation === 'function') {
+      setH3Orientation(r >= 1 ? 'landscape' : 'portrait');
+    }
+  };
+  probe.src = '/image?path=' + encodeURIComponent(path);
+}
+
+// VA-02: A2V kept its own free-form Width/Height fields fixed at whatever
+// the user last typed (default 1024x576) no matter what picture was
+// dropped in — so a 9:16 phone selfie, the single most common A2V input,
+// rendered at 1024x576 and the vendored encoder's hardcoded centre crop
+// kept the forehead and lost the mouth and chin (the report's own overlay:
+// 24b-a2v-portrait-vs-frame0.png). Snaps toward the picture's aspect while
+// keeping roughly the SAME render cost (area held constant, so this isn't
+// also silently making the job bigger or slower) — the same spirit as
+// snapAspectToImage's flip, just over free-form fields instead of a preset
+// pair. Snapped to 32px (the field's own step) like audioStudioGenerate()
+// already does at submit time.
+function snapA2VSizeToImage(path) {
+  const wEl = document.getElementById('audioStudioWidth');
+  const hEl = document.getElementById('audioStudioHeight');
+  if (!wEl || !hEl) return;
+  const probe = new Image();
+  probe.onload = () => {
+    const r = probe.naturalWidth / probe.naturalHeight;
+    if (!(r > 0) || !isFinite(r)) return;
+    const area = Math.max(1, parseInt(wEl.value || '1024', 10))
+               * Math.max(1, parseInt(hEl.value || '576', 10));
+    let newH = Math.sqrt(area / r);
+    let newW = area / newH;
+    const snap32 = (v) => Math.max(256, Math.min(1920, Math.round(v / 32) * 32));
+    wEl.value = String(snap32(newW));
+    hEl.value = String(snap32(newH));
+    if (typeof audioStudioDurationChanged === 'function') {
+      try { audioStudioDurationChanged(); } catch (e) {}
+    }
+    if (typeof refreshPickerCropOverlays === 'function') {
+      try { refreshPickerCropOverlays(); } catch (e) {}
+    }
   };
   probe.src = '/image?path=' + encodeURIComponent(path);
 }
@@ -1204,12 +2013,21 @@ function pickerSetImage(key, path, opts = {}) {
     }
     // FFLF anchors framing on the start frame; I2V anchors on its single
     // image. End frame doesn't drive aspect (would override the start
-    // frame). a2v_image lives in the Audio→Video tab which has its own
-    // width/height inputs — calling snapAspectToImage would change the
-    // GLOBAL #aspect selector, not the A2V one, so skip it for a2v_image
-    // to avoid silently mutating an unrelated mode.
+    // frame). a2v_image lives in the Audio→Video tab, which has its own
+    // free-form width/height fields rather than the global #aspect
+    // selector (VA-02: snapA2VSizeToImage sets THOSE instead, so this
+    // still can't reach an unrelated mode's state).
     if ((key === 'image' || key === 'start_image') && opts.snapAspect !== false) {
       snapAspectToImage(path);
+    } else if (key === 'a2v_image' && opts.snapAspect !== false) {
+      snapA2VSizeToImage(path);
+    }
+    // Open-mouth anchor check (build item 3, "Keyframe + lip-sync"): only
+    // the lip-sync picture matters here — FFLF/Keyframe anchors are a
+    // different contract (VA-02/size-faces owns the crop preview on this
+    // same tile; this only adds the openness verdict line under it).
+    if (key === 'a2v_image' && typeof audioStudioMouthCheck === 'function') {
+      audioStudioMouthCheck(path);
     }
   } else {
     // Drop the handler with the pick, or a later `removeAttribute('src')`
@@ -1222,6 +2040,9 @@ function pickerSetImage(key, path, opts = {}) {
     els.drop.classList.remove('has-image');
     if (els.recentStrip) {
       els.recentStrip.querySelectorAll('img').forEach(img => img.classList.remove('selected'));
+    }
+    if (key === 'a2v_image' && typeof audioStudioMouthCheck === 'function') {
+      audioStudioMouthCheck('');
     }
   }
   updateDerived();
@@ -1257,9 +2078,12 @@ async function pickerUploadFile(key, file) {
 function pickerWire(key) {
   const els = pickerEls(key);
   if (!els.drop) return;
-  // Click → file dialog. Skip when the click came from the clear button.
+  // Click → file dialog. Skip when the click came from the clear button —
+  // or from the crop preview (4.17 Codex EST-8): the overlay lives INSIDE
+  // this tile, so the click that ends a crop drag bubbled here and opened
+  // the file chooser on top of the framing the user had just set.
   els.drop.addEventListener('click', (e) => {
-    if (e.target.closest('.picker-clear')) return;
+    if (e.target.closest('.picker-clear, .crop-overlay, .crop-overlay-controls')) return;
     els.file.click();
   });
   els.file.addEventListener('change', () => {
@@ -1279,7 +2103,213 @@ function pickerWire(key) {
     const f = e.dataTransfer.files && e.dataTransfer.files[0];
     if (f) pickerUploadFile(key, f);
   });
+  // VC-29/H3-01/VA-02: naturalWidth/Height (needed for the crop-preview
+  // overlay's math) aren't available until the <img> actually decodes —
+  // updateDerived() alone can fire before that, so also refresh on load.
+  if (_pickerCropSupported(key)) {
+    els.preview.addEventListener('load', () => _renderCropOverlay(key));
+  }
 }
+
+// ====== Crop-preview overlay (VC-29 / H3-01 / VA-02) ========================
+// "Faces survive every crop": the server cover-crops a reference image onto
+// whatever canvas the render will use, and until this landed it always
+// centred that crop with no way to see it coming — a portrait photo lost its
+// mouth or its head with no warning, discovered only after a 3-25 minute
+// render. This draws the crop the SERVER will actually apply (same math as
+// _cover_crop_image in mlx_ltx_panel.py — kept in sync deliberately, see the
+// comment on that function) directly on the reference thumbnail, warns when
+// more than a quarter of the picture is going to be cut, and lets the user
+// drag the kept window to a centre / top / bottom (or left / right)
+// position before ever pressing Generate. The chosen position is sent as
+// `image_crop_focus` (0..1) and consumed server-side by
+// _job_crop_focus()/_cover_crop_image().
+//
+// Two pickers support it today — 'image' (T2V/I2V AND H3's Image mode
+// share this one picker) and 'a2v_image' (Audio → Video's reference slot).
+// Both keep the ONE crop bug class fixed the same way rather than each
+// growing its own bespoke overlay.
+const CROP_OVERLAY_KEYS = ['image', 'a2v_image'];
+function _pickerCropSupported(key) { return CROP_OVERLAY_KEYS.indexOf(key) !== -1; }
+
+// The canvas THIS render will actually use, for whichever engine/mode reads
+// this picker. 'image' is shared by LTX (T2V/I2V) and H3 — both mirror
+// their resolved canvas into the same #width/#height fields (H3 via
+// _h3ApplyShape), so one read covers both. 'a2v_image' reads A2V's own
+// free-form fields. Returns null when the canvas isn't known yet (or is
+// zero — an empty/loading form), meaning "don't draw an overlay".
+function _pickerCropTargetCanvas(key) {
+  let w, h;
+  if (key === 'a2v_image') {
+    w = parseInt((document.getElementById('audioStudioWidth') || {}).value || '0', 10);
+    h = parseInt((document.getElementById('audioStudioHeight') || {}).value || '0', 10);
+  } else {
+    w = parseInt((document.getElementById('width') || {}).value || '0', 10);
+    h = parseInt((document.getElementById('height') || {}).value || '0', 10);
+  }
+  if (!(w > 0) || !(h > 0)) return null;
+  return { w, h };
+}
+
+function _pickerCropFocusEl(key) {
+  return document.getElementById(key === 'a2v_image' ? 'a2v_image_crop_focus' : 'image_crop_focus');
+}
+
+// Re-render every supported picker's overlay. Called from updateDerived()
+// (the one function every relevant state change already routes through:
+// quality/length/orientation pills, custom W×H edits, a fresh image pick)
+// so no caller has to remember to refresh this on its own.
+function refreshPickerCropOverlays() {
+  CROP_OVERLAY_KEYS.forEach(k => { try { _renderCropOverlay(k); } catch (e) {} });
+}
+
+// Geometry: a line-for-line mirror of _cover_crop_image's max-scale cover
+// crop. Returns null when there's effectively no crop (aspect already
+// matches, or dims aren't known yet).
+function _cropGeometry(key) {
+  const els = pickerEls(key);
+  if (!els.hidden || !els.hidden.value || !els.preview) return null;
+  const nw = els.preview.naturalWidth, nh = els.preview.naturalHeight;
+  if (!(nw > 0) || !(nh > 0)) return null;
+  const target = _pickerCropTargetCanvas(key);
+  if (!target) return null;
+  const scale = Math.max(target.w / nw, target.h / nh);
+  const scaledW = nw * scale, scaledH = nh * scale;
+  // The window, as a FRACTION of the natural (rendered) image — this is
+  // what "percent of the picture the crop keeps" means, and it's the same
+  // fraction whether measured in natural or scaled-cover pixels.
+  const fracW = Math.min(1, target.w / scaledW);
+  const fracH = Math.min(1, target.h / scaledH);
+  const axis = fracW < fracH ? 'x' : (fracH < fracW ? 'y' : null);
+  const cutFraction = axis === 'x' ? (1 - fracW) : axis === 'y' ? (1 - fracH) : 0;
+  return { axis, fracW, fracH, cutFraction };
+}
+
+function _cropQuickButtonsHtml(axis) {
+  const labels = axis === 'x'
+    ? [['0', 'Left'], ['0.5', 'Center'], ['1', 'Right']]
+    : [['0', 'Top'], ['0.5', 'Center'], ['1', 'Bottom']];
+  return labels.map(([v, l]) =>
+    `<button type="button" class="crop-quick-btn" data-crop-focus="${v}">${l}</button>`).join('');
+}
+
+function _renderCropOverlay(key) {
+  const els = pickerEls(key);
+  const overlay = document.getElementById(`picker_crop_${key}`);
+  const controls = document.getElementById(`picker_crop_controls_${key}`);
+  if (!overlay) return;
+  const geo = _cropGeometry(key);
+  if (!geo || !geo.axis || geo.cutFraction < 0.01) {
+    // No meaningful crop (aspect already matches, or nothing picked/known
+    // yet) — nothing to warn about and nothing to drag.
+    overlay.hidden = true;
+    overlay.innerHTML = '';
+    if (controls) { controls.hidden = true; controls.innerHTML = ''; }
+    return;
+  }
+  // `.picker-preview` is `max-width:100%;max-height:240px`, so at most
+  // aspect ratios it does NOT fill `.picker-drop` (which stretches to the
+  // full composer width) — it's letterboxed and centred. The overlay is a
+  // SIBLING of the <img>, not its child, so it has to be placed over the
+  // image's own rendered box in pixels rather than assuming inset:0 covers
+  // it; percentages inside the overlay then map correctly onto the actual
+  // photo regardless of how much empty space surrounds it.
+  if (els.drop && els.preview) {
+    const dropRect = els.drop.getBoundingClientRect();
+    const imgRect = els.preview.getBoundingClientRect();
+    overlay.style.left = Math.round(imgRect.left - dropRect.left) + 'px';
+    overlay.style.top = Math.round(imgRect.top - dropRect.top) + 'px';
+    overlay.style.width = Math.round(imgRect.width) + 'px';
+    overlay.style.height = Math.round(imgRect.height) + 'px';
+  }
+  const focusEl = _pickerCropFocusEl(key);
+  const focus = Math.min(1, Math.max(0, parseFloat((focusEl && focusEl.value) || '0.5')));
+  const axis = geo.axis;
+  const frac = axis === 'x' ? geo.fracW : geo.fracH;
+  const startPct = (focus * (1 - frac) * 100).toFixed(2);
+  const sizePct = (frac * 100).toFixed(2);
+  const warn = geo.cutFraction > 0.25;
+  const maskStyle = axis === 'x'
+    ? `left:0;top:0;width:${startPct}%;height:100%`
+    : `left:0;top:0;width:100%;height:${startPct}%`;
+  const maskStyle2 = axis === 'x'
+    ? `right:0;top:0;width:${(100 - parseFloat(startPct) - parseFloat(sizePct)).toFixed(2)}%;height:100%`
+    : `right:0;bottom:0;width:100%;height:${(100 - parseFloat(startPct) - parseFloat(sizePct)).toFixed(2)}%`;
+  const winStyle = axis === 'x'
+    ? `left:${startPct}%;top:0;width:${sizePct}%;height:100%`
+    : `left:0;top:${startPct}%;width:100%;height:${sizePct}%`;
+  overlay.hidden = false;
+  overlay.className = 'crop-overlay crop-axis-' + axis + (warn ? ' crop-overlay-warn' : '');
+  overlay.innerHTML = `
+    <div class="crop-mask" style="${maskStyle}"></div>
+    <div class="crop-mask" style="${maskStyle2}"></div>
+    <div class="crop-window" style="${winStyle}"></div>
+    ${warn ? `<div class="crop-warn">Crops out ${Math.round(geo.cutFraction * 100)}% of the photo</div>` : ''}
+  `;
+  _wireCropDrag(overlay, key, axis);
+  if (controls) {
+    controls.hidden = false;
+    controls.innerHTML = _cropQuickButtonsHtml(axis);
+    controls.querySelectorAll('.crop-quick-btn').forEach(b => {
+      b.classList.toggle('active', Math.abs(parseFloat(b.dataset.cropFocus) - focus) < 0.01);
+      b.onclick = (e) => { e.stopPropagation(); _setCropFocus(key, parseFloat(b.dataset.cropFocus)); };
+    });
+  }
+}
+
+// A sidecar's crop framing (0 = top/left … 1 = bottom/right), 0.5 for any
+// render made before the crop preview existed — they were all centred.
+function _cropFocusFromParams(p) {
+  const v = parseFloat(p && p.image_crop_focus);
+  return (isFinite(v) && v >= 0 && v <= 1) ? v : 0.5;
+}
+
+function _setCropFocus(key, focus) {
+  const focusEl = _pickerCropFocusEl(key);
+  if (focusEl) focusEl.value = String(Math.min(1, Math.max(0, focus)));
+  _renderCropOverlay(key);
+}
+
+// Drag the crop window along whichever axis is actually being cropped.
+// Pointer Events cover mouse + touch + pen in one listener set; capture
+// keeps the drag tracking even if the pointer leaves the overlay's bounds
+// mid-gesture (a fast drag near the edge of a small thumbnail otherwise
+// drops the gesture).
+function _wireCropDrag(overlay, key, axis) {
+  const onMove = (e) => {
+    const rect = overlay.getBoundingClientRect();
+    const dim = axis === 'x' ? rect.width : rect.height;
+    if (!(dim > 0)) return;
+    const pos = axis === 'x' ? (e.clientX - rect.left) : (e.clientY - rect.top);
+    // The window's CENTRE follows the pointer; invert to the focus fraction
+    // the server uses (0 = window at the leading edge, 1 = trailing edge).
+    const geo = _cropGeometry(key);
+    if (!geo) return;
+    const frac = axis === 'x' ? geo.fracW : geo.fracH;
+    const centerFrac = Math.min(1, Math.max(0, pos / dim));
+    const denom = Math.max(0.0001, 1 - frac);
+    const focus = (centerFrac - frac / 2) / denom;
+    _setCropFocus(key, focus);
+  };
+  overlay.onpointerdown = (e) => {
+    e.preventDefault();
+    try { overlay.setPointerCapture(e.pointerId); } catch (err) {}
+    onMove(e);
+    overlay.onpointermove = onMove;
+  };
+  overlay.onpointerup = overlay.onpointercancel = () => { overlay.onpointermove = null; };
+}
+
+// The overlay is positioned in PIXELS against the image's rendered box
+// (see _renderCropOverlay), so a window resize — or the composer column
+// reflowing at a narrower pane width — leaves it pointing at the wrong
+// rectangle until something else happens to call updateDerived(). Debounced
+// so a drag-resize doesn't thrash layout reads every frame.
+let _cropOverlayResizeTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(_cropOverlayResizeTimer);
+  _cropOverlayResizeTimer = setTimeout(refreshPickerCropOverlays, 120);
+});
 
 globalThis._uploadsCache = [];   // last fetched list, kept module-level so all
                           //   three pickers render the same source data.
@@ -1493,6 +2523,15 @@ function fmtMemTitle(m) {
   return [`${used} of ${tot} GB in use`, pr, sw].filter(Boolean).join(' · ');
 }
 function fmtMin(s) { if (!s || s < 0) return '—'; const m = Math.floor(s/60); const sec = Math.round(s%60); return m > 0 ? `${m}m ${sec}s` : `${sec}s`; }
+// VC-26: compact "~N min" for a queue row/badge — same "~" convention the
+// server's own _fmt_eta uses for the tier chips, so a queue row and the
+// chip it was submitted from never read as two different formatting
+// styles for the same kind of number.
+function fmtEtaCompact(sec) {
+  if (!sec || sec <= 0) return '';
+  const m = Math.round(sec / 60);
+  return m < 1 ? '~1 min' : `~${m} min`;
+}
 function snippet(s, n = 70) { if (!s) return ''; s = s.replace(/\s+/g,' ').trim(); return s.length > n ? s.slice(0, n-1)+'…' : s; }
 function escapeHtml(s) { if (!s) return ''; return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
@@ -1537,9 +2576,14 @@ async function api(path, method = 'GET', body = null) {
     // Prefer the SERVER'S sentence. /models/remove's three refusals are
     // carefully written ("That's the model this build renders with.") and
     // throwing a bare status turned every one of them into "…: 400".
-    let msg = '';
-    try { msg = ((await r.json()) || {}).error || ''; } catch (e) {}
-    throw new Error(msg || `${path}: ${r.status}`);
+    let msg = '', code = '';
+    try { const b = (await r.json()) || {}; msg = b.error || ''; code = b.code || ''; } catch (e) {}
+    const err = new Error(msg || `${path}: ${r.status}`);
+    // A refusal the SERVER wrote (EST-10) — callers tell it apart from an
+    // unreachable panel by these, and act on `code` (pack_missing -> Models).
+    err.status = r.status;
+    err.code = code;
+    throw err;
   }
   return r.status === 409 ? { error: 'busy' } : r.json().catch(() => ({}));
 }
@@ -1559,7 +2603,38 @@ globalThis._POLL_FAILS = 0;
 // read it can recover the message after the fact. Cheap insurance.
 window._panelBannerLog = window._panelBannerLog || [];
 
+// SYS-10a: clicking Generate while the panel is offline used to do nothing
+// visible — an uncaught `Failed to fetch` in the console, no toast, and the
+// Now card kept reading "Idle" forever. Mirrors applyPackIncompleteGate's
+// shape (disable genBtn, one-line reason in #engineRowNote, own dataset flag
+// so it can't collide with the pack-incomplete gate's own note/clear).
+function _applyOfflineGate(offline) {
+  const genBtn = document.getElementById('genBtn');
+  const note = document.getElementById('engineRowNote');
+  if (!genBtn) return;
+  if (offline) {
+    genBtn.disabled = true;
+    genBtn.title = "Phosphene can't reach its own server right now — restart it from Pinokio.";
+    genBtn.dataset.offlineBlocked = '1';
+    if (note) {
+      note.innerHTML = escapeHtml(
+        "Phosphene is offline — restart it from Pinokio before rendering.");
+      note.hidden = false;
+      note.dataset.offlineNote = '1';
+    }
+  } else if (genBtn.dataset.offlineBlocked === '1') {
+    genBtn.disabled = false;
+    genBtn.removeAttribute('title');
+    delete genBtn.dataset.offlineBlocked;
+    if (note && note.dataset.offlineNote === '1') {
+      note.hidden = true; note.innerHTML = '';
+      delete note.dataset.offlineNote;
+    }
+  }
+}
+
 function _setOfflineBanner(visible, msg) {
+  _applyOfflineGate(visible);
   let bar = document.getElementById('panelOfflineBanner');
   if (visible) {
     const text = msg || "uploads, chat & renders are paused";
@@ -1567,8 +2642,14 @@ function _setOfflineBanner(visible, msg) {
       bar = document.createElement('div');
       bar.id = 'panelOfflineBanner';
       bar.className = 'panel-offline-banner';
+      // SYS-10a: this used to be an <img src="/assets/favicon-64.png">, but
+      // the whole POINT of this banner is that the server can't be reached
+      // -- so the image request failed too and users saw a broken-image
+      // glyph instead of an icon. The `ph-warning-fill` symbol is already
+      // inlined in the page's own SVG sprite (index.html <head>), so it
+      // renders with no network round trip.
       bar.innerHTML =
-        '<span class="icon"><img src="/assets/favicon-64.png" alt=""></span>' +
+        '<span class="icon"><svg class="ph" aria-hidden="true"><use href="#ph-warning-fill"/></svg></span>' +
         '<span class="label">Phosphene offline</span>' +
         '<span class="text"></span>' +
         '<span class="hint">restart from Pinokio</span>';
@@ -1755,17 +2836,53 @@ async function repairModel(key) {
 // memory-pressured Macs: the helper subprocess gets killed by the OS for using
 // too much RAM and we never get an event back. Tell the user how to recover
 // instead of leaving them with the engine wording.
-function friendlyJobError(raw) {
+// H3-22: strip an absolute local path out of a user-facing hint. The backend
+// deliberately carries "metrics at /Users/.../state/....json" in the RAW
+// error — that string is what the log and a bug report quote — but a path
+// under the user's home directory (often their real name, on macOS) has no
+// business in a toast/card the user reads on screen. Keep it in the log
+// (`raw` is unredacted there); only the display copy gets this.
+function _redactLocalPaths(text) {
+  return String(text || '').replace(/\((?:see the log above; )?metrics at [^)]+\)/gi, '')
+    .replace(/\/Users\/[^\s)]+/g, '(see Logs)')
+    .replace(/\s{2,}/g, ' ').trim();
+}
+function friendlyJobError(raw, engine) {
   raw = raw || 'unknown error';
   if (/music engine isn't installed|YuE2 needs about|YuE2 weights.*repair/i.test(raw)) {
     return { friendly: 'Stopped before generating — the music engine is not ready.',
       hint: 'Install or repair it from the Phosphene sidebar in Pinokio. Everything else in the panel is unaffected.' };
   }
   const rawLower = String(raw).toLowerCase();
+  // SYS-07: these two are the #1 and #3 fleet failures (54 + 23 installs in
+  // 30 days) and the message used to ask for a crashlog/bug report instead
+  // of saying what to change. Rewritten action-first, per the fix: a
+  // headline naming what happened, a "Try:" line with the levers that
+  // actually work, and the crashlog ask demoted to Details (SYS-07 asks
+  // for the offer of a smaller retry too — `smaller: true` flags the Now
+  // card to add a "Retry smaller" action next to plain Retry).
+  // H3-22: the advice must fit the engine — H3 has no Quick tier, and
+  // "Retry smaller" steps an LTX quality/canvas/frame count an H3 job does
+  // not use, so it is offered on LTX only.
+  const onH3 = engine === 'h3';
   if (rawLower.includes('sigkill')) {
-    return { friendly: 'Helper killed by the OS — out of memory (jetsam).',
-             hint: 'Close memory-heavy apps (Chrome, Slack, iOS Simulator) and try again, ' +
-                   'or switch Quality to Quick (about half the RAM).' };
+    // VC-08/VC-23: say it in plain terms (no "Helper", no "jetsam" up
+    // front — that lives in Details); the card's own "Retry smaller" button
+    // is the actionable step on LTX (SYS-07, H3-22 above).
+    return {
+      friendly: 'Your Mac ran out of memory.',
+      hint: onH3
+        ? 'Close other apps (Chrome, Slack, iOS Simulator) and retry, or '
+          + 'try Fast, a shorter length, or Draft (all use less memory).'
+        : 'Retry smaller usually fits — or close memory-heavy apps (Chrome, '
+          + 'Slack, iOS Simulator) and retry as is, or switch Quality to Quick '
+          + '(about half the RAM).',
+      ...(onH3 ? {} : { smaller: true }),
+      details: 'jetsam (the macOS memory killer) ended the render; returncode -9. '
+              + 'If this keeps happening on the lightest setting, this Mac may be '
+              + 'too tight on RAM for this mode.',
+      docsAnchor: 'memory',
+    };
   }
   if (rawLower.includes('sigsegv') || rawLower.includes('sigbus')) {
     return { friendly: 'Helper crashed at the native level (MLX/Metal fault).',
@@ -1773,6 +2890,28 @@ function friendlyJobError(raw) {
                    'on github.com/mrbizarro/phosphene/issues so we can fix it.' };
   }
   if (rawLower.includes('sigabrt')) {
+    // The watchdog signature (kIOGPUCommandBufferCallbackErrorTimeout) is
+    // the specific, common case on M1/M2-class GPUs; anything else that
+    // aborts at the C level still gets the crashlog ask, just demoted.
+    const isWatchdog = rawLower.includes('gpu watchdog') || rawLower.includes('gpu timeout')
+      || rawLower.includes('commandbuffercallbackerrortimeout');
+    if (isWatchdog) {
+      return {
+        friendly: 'macOS stopped the render — this Mac ran out of GPU time.',
+        hint: (onH3 ? 'Try: Fast or a shorter length' : 'Try: Quick or a 3 s clip')
+            + ' · close other apps using the GPU '
+            + '(browser video, games, another AI app) · restart the Mac if it '
+            + 'keeps happening.',
+        ...(onH3 ? {} : { smaller: true }),
+        details: 'The macOS GPU watchdog killed a Metal command buffer that ran '
+                + 'too long (kIOGPUCommandBufferCallbackErrorTimeout), seen on '
+                + 'M1/M2-class GPUs. If it keeps happening on Quick at 3 s, please '
+                + 'open an issue with your chip + macOS version and the crashlog at '
+                + '~/Library/Logs/DiagnosticReports/python3.11_*.ips to '
+                + 'github.com/mrbizarro/phosphene/issues/44.',
+        docsAnchor: 'gpu-watchdog',
+      };
+    }
     return { friendly: 'Helper hit a C-level assertion and aborted.',
              hint: 'Share the crashlog at ~/Library/Logs/DiagnosticReports/python3.11_*.crash ' +
                    'on github.com/mrbizarro/phosphene/issues.' };
@@ -1782,6 +2921,19 @@ function friendlyJobError(raw) {
     return { friendly: 'Helper exited unexpectedly.',
              hint: 'Check the log for the last "step:*" breadcrumb (tells us which ' +
                    'phase died). If memory-pressured, close other apps and retry.' };
+  }
+  // SYS-31: the generic "training exited with code N" case (no known
+  // signature to name a more specific cause for — the watchdog/OOM/canvas
+  // cases above it already have their own specific RuntimeError text
+  // server-side). Points at the Logs tab and the new troubleshooting
+  // section rather than leaving "see Logs for stack trace" to stand alone.
+  if (/training (exited|aborted)/i.test(raw)) {
+    return {
+      friendly: 'Training stopped before finishing.',
+      hint: raw.replace(/^training /i, '').replace(/^\w/, c => c.toUpperCase())
+          + ' Check the Logs tab (bottom pane) for the trainer\'s own error.',
+      docsAnchor: 'training-failed',
+    };
   }
   // Layer 2. Layer 1 (applyPackIncompleteGate) should have stopped this before
   // the render started; this fires when it could not — a file removed while the
@@ -1795,13 +2947,43 @@ function friendlyJobError(raw) {
       friendly: 'Stopped before rendering — the model weights are incomplete.',
       hint: (m ? 'Missing: ' + m[1].trim() + '. ' : '')
           + 'Rendering with a file missing produces garbled "mosaic" video rather '
-          + 'than an error, so Phosphene stops instead. Settings → Models → Resume.',
+          + 'than an error, so Phosphene stops instead.',
+      // SYS-11: a plain Retry here re-queues the identical job, which fails
+      // instantly the same way — the fix is finishing the download, not
+      // trying again. `action: 'models'` swaps the Now-card's Retry button
+      // for one that actually does that.
+      action: 'models',
     };
   }
-  if (rawLower.includes('q8') || rawLower.includes('keyframe')) {
+  // VC-24: this used to check the lowercased text for the two bare
+  // substrings "q8" and "keyframe" — a traceback or file path for ANY
+  // error on the High/Extend/Keyframe lanes routinely contains one of
+  // them (`ltx-2.5-mlx-q8/…` in a path, `keyframe_pipeline.py` in a
+  // stack frame), so an unrelated OOM or shape error on those lanes was
+  // reported as "This mode needs the Q8 model" — sending a user who
+  // already has Q8 installed to re-download it. Every REAL "needs Q8"
+  // refusal (make_job's RenderRefused for Extend / Keyframe / High) says
+  // one of two things verbatim, so match those instead of a bare
+  // substring: "(the Q8 model)" when the pack isn't downloaded, or
+  // "… hardware tier —" when the Mac can't run it at all.
+  if (/\(the q8 model\)|hardware tier\s*—/i.test(raw)) {
     return { friendly: 'This mode needs the Q8 model.', hint: raw };
   }
-  return { friendly: 'Job failed.', hint: raw };
+  // H3-22: neither "H3 render timed out — no output for 20 minutes" nor
+  // "H3 render exited with code N" matches any branch above (no signal, no
+  // "helper exited from"), so both fell to the generic fallback below — the
+  // exit-code one WITH its raw metrics_path (an absolute local path, often
+  // containing the user's real name on macOS) shown verbatim on screen.
+  if (/h3 render (timed out|exited with code)/i.test(raw)) {
+    return {
+      friendly: rawLower.includes('timed out')
+        ? 'H3 stopped — no progress for 20 minutes.'
+        : 'H3 render failed.',
+      hint: _redactLocalPaths(raw) ||
+        'Try Fast, a shorter length, or Draft; quit Chrome/Slack if memory is tight.',
+    };
+  }
+  return { friendly: 'Job failed.', hint: _redactLocalPaths(raw) || raw };
 }
 
 // ---- Completion alerts ------------------------------------------------------
@@ -1822,6 +3004,15 @@ function notifyJobsDone(s) {
   for (const j of hist) {
     if (!j || !j.id || !now.has(j.id) || _doneSeen.has(j.id)) continue;
     if (on) notifyOneJob(j);
+    // SYS-35: a finished training run had no bridge back to Video — the
+    // only pointer was a link at the bottom of the Train tab (which a
+    // user watching the Now card for their training to finish would
+    // never be looking at). Announce it right where the completion
+    // itself is already detected.
+    if (j.status === 'done' && j.params && j.params.mode === 'train'
+        && typeof _trainAnnounceReady === 'function') {
+      _trainAnnounceReady(j);
+    }
   }
   _doneSeen = now;
 }
@@ -1912,14 +3103,22 @@ async function poll() {
   const memPill = document.getElementById('memPill');
   memPill.innerHTML = `<span class="dot"></span>${fmtMem(m)}`;
   memPill.title = fmtMemTitle(m);
-  // 2026-05-20: color the badge by real pressure, not by sticky swap.
-  // Same reason fmtMem dropped swap from the visible label — swap is
-  // a high-water mark that only decreases on reboot, so keying the
-  // danger/warn colors off it kept the badge red long after pressure
-  // had fully recovered.
+  // SYS-19: this used to color by pressure_pct (active+wired+compressed /
+  // total) — a USED ratio. macOS routinely sits at 75-90% "used" by that
+  // measure while completely idle (it fills RAM with reclaimable cache on
+  // purpose), so on an 8-16 GB Mac the chip read amber/red almost all day,
+  // including during every healthy render. Colors by pressure_level now
+  // (kern.memorystatus_vm_pressure_level — the same signal macOS itself
+  // uses to decide whether to reclaim/compress/jetsam-kill: 1 normal, 2
+  // warning, 3 critical), and a render in progress downgrades a mere
+  // "warning" to the good color — elevated pressure while actively
+  // rendering is the expected state, not a problem; level 3 (critical,
+  // real jetsam risk) still shows regardless, render or not.
+  const rendering = !!(s.running && s.current);
+  const lvl = Number(m.pressure_level || 1);
   let memCls = 'pill-good';
-  if (m.pressure_pct > 90) memCls = 'pill-danger';
-  else if (m.pressure_pct > 75) memCls = 'pill-warn';
+  if (lvl >= 3) memCls = 'pill-danger';
+  else if (lvl === 2 && !rendering) memCls = 'pill-warn';
   memPill.className = 'pill ' + memCls;
   // The chip DERIVES from the pills, so it must refresh after the colour
   // classes land — calling it before memCls kept the chip one poll stale.
@@ -1948,19 +3147,23 @@ async function poll() {
     if (comfyToggle) comfyToggle.checked = false;
   }
 
-  // Helper
+  // Engine (the "helper" subprocess — mlx_warm_helper.py — from a
+  // creator's chair this row just answers "can I render right now").
+  // SYS-19: was "helper warm"/"helper idle" -- internal-process language,
+  // and "idle" reads as a problem when it's actually the normal
+  // after-timeout state.
   const hp = document.getElementById('helperPill');
   if (s.helper && s.helper.alive) {
-    hp.innerHTML = `<span class="dot"></span>helper warm`;
+    hp.innerHTML = `<span class="dot"></span>engine ready`;
     hp.className = 'pill pill-good';
-    hp.title = 'Helper subprocess is loaded with pipelines and ready.';
+    hp.title = 'The render engine is loaded and ready.';
   } else {
     // Helper auto-respawns on the next job (see WarmHelper._ensure). "Cold"
     // is normal after the idle timeout, not an error — first job after a
     // cold start eats a ~30s pipeline-load cost.
-    hp.innerHTML = `<span class="dot"></span>helper idle`;
+    hp.innerHTML = `<span class="dot"></span>engine resting`;
     hp.className = 'pill';
-    hp.title = 'Helper is idle (auto-exited after the idle timeout). The next queued job will respawn it; expect a one-time ~30s pipeline-load delay.';
+    hp.title = 'The render engine unloaded after being idle — normal, not a problem. The next render reloads it, a one-time ~30s delay.';
   }
 
   // Tier pill — what this Mac's RAM tier allows. Click to open the
@@ -1984,10 +3187,10 @@ async function poll() {
 
   // Models pill — roll-up status: base ready / Q8 ready, plus active download.
   // Renders as one of:
-  //   "models ↓ Q4 12%"   while a download streams (live progress, last hf line)
-  //   "models 3/3"        all on disk
-  //   "models 2/3"        base ready, Q8 missing → warn color
-  //   "models 0/3"        base incomplete → bad color
+  //   "models ↓ Q4 12%"        while a download streams (live progress, last hf line)
+  //   "models ✓"               everything relevant is on disk
+  //   "models ✓ (1 optional not installed)"   base + Q8 core ready, an extra isn't
+  //   "models 0/3"             base incomplete → bad color, still a raw count
   const mp = document.getElementById('modelsPill');
   const dl = s.download && s.download.active ? s.download : null;
   if (dl) {
@@ -1996,18 +3199,31 @@ async function poll() {
     mp.className = 'pill pill-running';
     mp.title = `Downloading ${dl.repo_id} — ${dl.last_line || 'starting…'}`;
   } else {
-    // Per-repo ready/total counts, matches what the modal shows (3 rows by
-    // default: Q4 + Gemma + Q8). base_available is a roll-up bool that
-    // honors the HF-id env-var short-circuit; we use it for the color
-    // hint, not the count itself.
+    // Per-repo ready/total counts, scoped server-side (VC-32) to repos that
+    // are actually relevant to THIS generation — never another generation's
+    // base pack, so a complete 2.5 install can't read "models 4/12" just
+    // because 2.3's own trio and four IC-LoRA extras sit in the same
+    // manifest. base_available is a roll-up bool that honors the HF-id
+    // env-var short-circuit; we use it for the color hint, not the count.
     const baseOk = s.base_available;
     const q8Ok = s.q8_available;
     const ready = s.repos_ready ?? 0;
     const total = s.repos_total ?? 0;
-    mp.innerHTML = `<span class="dot"></span>models ${ready}/${total}`;
+    // SYS-19 / VC-32: "models 3/12" read as "25% ready" even on a
+    // perfectly healthy install — the denominator counts every OPTIONAL
+    // add-on too. Plain outcome instead; the fraction survives in the
+    // tooltip for anyone who wants it.
+    // (VC-32's phrasing: the raw fraction survives only in the one case it
+    // is the right shape — the base itself is incomplete.)
+    const missingOptional = Math.max(0, total - ready);
+    mp.innerHTML = (baseOk && missingOptional === 0)
+      ? `<span class="dot"></span>models ✓`
+      : baseOk
+      ? `<span class="dot"></span>models ✓ (${missingOptional} optional not installed)`
+      : `<span class="dot"></span>models ${ready}/${total}`;
     mp.className = 'pill ' + (!baseOk ? 'pill-warn' : (q8Ok ? 'pill-good' : ''));
     mp.title = !baseOk
-      ? 'Base models incomplete — click to download'
+      ? `Base models incomplete (${ready}/${total} on disk) — click to download`
       : (q8Ok ? 'All models on disk' : 'Q8 not installed (optional — needed for High quality + FFLF)');
   }
   // If the modal is open, refresh its rows on each poll so progress updates.
@@ -2025,6 +3241,16 @@ async function poll() {
   if (typeof applyPackIncompleteGate === 'function') {
     try { applyPackIncompleteGate(s); } catch (e) {}
   }
+  // SYS-03: also re-checked every poll (not just on tab-open) so a Train
+  // tab opened before the first /status response resolves still gates
+  // itself the moment RAM data arrives, and so the gate applies even if
+  // trainInit() hasn't run yet in this session.
+  if (typeof trainApplyRamGate === 'function') {
+    try { trainApplyRamGate(); } catch (e) {}
+  }
+  if (typeof applyFirstRunCard === 'function') {
+    try { applyFirstRunCard(s); } catch (e) {}
+  }
 
   // Queue pill + tab badge. Animate the bottom-pane Queue badge with
   // a brief scale-up "pop" when the count goes up — draws the eye to
@@ -2037,7 +3263,12 @@ async function poll() {
   const qb = document.getElementById('queueBadge');
   const prevQueueLen = window._lastQueueLen ?? 0;
   if (s.queue.length) {
-    qb.textContent = s.queue.length;
+    // VC-26: "a queue total in the tab badge ('10 · 27 min')". s.eta_sec is
+    // the server's own sum of each row's priced/averaged ETA — never
+    // recomputed client-side, so this can't drift from the per-row numbers.
+    const etaTxt = fmtEtaCompact(s.eta_sec);
+    qb.textContent = etaTxt ? `${s.queue.length} · ${etaTxt.replace('~', '')}` : String(s.queue.length);
+    qb.title = etaTxt ? `${s.queue.length} queued, about ${etaTxt} total` : `${s.queue.length} queued`;
     qb.style.display = '';
     if (s.queue.length > prevQueueLen) {
       qb.classList.remove('bump');
@@ -2053,6 +3284,23 @@ async function poll() {
   }
   window._lastQueueLen = s.queue.length;
 
+  // SYS-10d / SYS-37: Stop was red and clickable at all times, including
+  // while nothing was running or queued — clicking it then was a silent
+  // no-op (`/stop` with nothing to stop). Disable every Stop button (six
+  // copies, one per tab) whenever there is nothing for it to do.
+  // Integration note: VC-05 (safety) disables Stop on the same poll via
+  // [data-role="stop-btn"]; both classes sit on the same six buttons, so the
+  // rule lives here once. requestStop() needs a CURRENT job — a queue that is
+  // only waiting (paused, or between jobs) has nothing for Stop to stop;
+  // Clear queue is its control.
+  const stopActive = !!(s.running && s.current);
+  document.querySelectorAll('.js-stop-btn').forEach(btn => {
+    btn.disabled = !stopActive;
+    btn.title = stopActive
+      ? (s.queue.length ? `Stop the current render (${s.queue.length} more queued)` : 'Stop the current render')
+      : 'Nothing is rendering';
+  });
+
   // Job pill
   const jp = document.getElementById('jobPill');
   if (s.running && s.current) {
@@ -2067,6 +3315,22 @@ async function poll() {
   }
 
   document.getElementById('pauseBtn').textContent = s.paused ? 'Resume queue' : 'Pause queue';
+  _syncDestructiveQueueButtons(s);
+  _syncHiddenFilterToggle(s);
+
+  // SYS-32: show the breaker's reason (if any) right above Generate. A
+  // manual Pause has no "cause" (paused_reason is null then) and gets no
+  // notice — only the breaker's automatic pause does.
+  const breakerNotice = document.getElementById('breakerNotice');
+  if (breakerNotice) {
+    if (s.paused && s.paused_reason) {
+      document.getElementById('breakerNoticeText').textContent =
+        `Queue paused: ${s.paused_reason}. Fix the cause, then Resume.`;
+      breakerNotice.hidden = false;
+    } else {
+      breakerNotice.hidden = true;
+    }
+  }
 
   // Q8 / High enable.
   //
@@ -2219,11 +3483,43 @@ async function poll() {
     const shape = [cur.width && cur.height ? `${cur.width}×${cur.height}` : null,
                    (cur.frames != null && cur.frames !== '') ? `${cur.frames}f` : null]
                   .filter(Boolean).join(' · ');
+    // H3-04: Fast/Best used to be invisible the moment Generate was
+    // pressed — the Now card showed mode/shape/time only. prog.h3_speed is
+    // the server's own record of what this render is ACTUALLY running
+    // (set from the render loop itself, not guessed from a form field that
+    // could be stale); h3JobShapeLabel/h3JobSpeedLabel fall back to the
+    // submitted params when prog hasn't reported yet (the load phase's
+    // very first tick).
+    const isH3 = cur.engine === 'h3';
+    const h3Speed = isH3
+      ? ((prog && prog.h3_speed) ? (prog.h3_speed === 'fast' ? 'Fast' : 'Best')
+                                  : (typeof h3JobSpeedLabel === 'function' ? h3JobSpeedLabel(cur) : ''))
+      : '';
+    const h3Shape = isH3 && typeof h3JobShapeLabel === 'function' ? h3JobShapeLabel(cur) : '';
     const baseMeta = (cur.mode === 'image')
       ? `image · ${cur.aspect || '?'} · n=${cur.n || '?'} · ${cur.engine_override || 'auto'} · ${timing}`
-      : [cur.mode, shape, timing].filter(Boolean).join(' · ');
-    nowCard.querySelector('.meta').innerHTML = phaseLabel
-      ? `${baseMeta}<br><span style="color:var(--muted)">${escapeHtml(phaseLabel)}</span>`
+      : isH3
+        ? [h3Shape, h3Speed, timing].filter(Boolean).join(' · ')
+        : [cur.mode, shape, timing].filter(Boolean).join(' · ');
+    // The pace warning (server-computed: measured per-step vs. this
+    // shape's own model, H3-04) rides under phaseLabel the same way a
+    // phase note already does, so it never competes with the timing line
+    // for space and never needs its own layout slot.
+    const paceNote = (prog && prog.h3_pace_warning) || '';
+    // VC-02(c): a clamp is a fact about the render that just started, not a
+    // detail that only shows up in the log. generation_clamp_notes carries
+    // it on the job's own params — surface it here so a smaller-than-picked
+    // canvas is said WHILE it's rendering, not discovered after the wait.
+    const clampNotes = Array.isArray(cur.generation_clamp_notes) ? cur.generation_clamp_notes : [];
+    const underline = [
+      phaseLabel ? `<span style="color:var(--muted)">${escapeHtml(phaseLabel)}</span>` : '',
+      paceNote ? `<span style="color:var(--danger, #f85149)">${escapeHtml(paceNote)}</span>` : '',
+      clampNotes.length
+        ? `<span class="now-clamp-note" title="${escapeHtml(clampNotes.join('; '))}">⚠ ${escapeHtml(clampNotes[0])}</span>`
+        : '',
+    ].filter(Boolean).join('<br>');
+    nowCard.querySelector('.meta').innerHTML = underline
+      ? `${baseMeta}<br>${underline}`
       : baseMeta;
     livePreviewData = normalizeLivePreview(s, prog);
     renderNowPreview(s, prog, livePreviewData);
@@ -2252,27 +3548,61 @@ async function poll() {
       // killed by the OS for using too much RAM and we never get an
       // event back. Tell the user how to recover instead of leaving them
       // with the engine wording.
-      const { friendly, hint } = friendlyJobError(last.error || 'unknown error');
+      const { friendly, hint, smaller, details, action, docsAnchor } = friendlyJobError(last.error || 'unknown error',
+        last.params && last.params.engine);
       nowCard.querySelector('.ttl').innerHTML =
         `<span style="color: var(--danger, #f85149)"><svg class="ph" aria-hidden="true" style="margin-right:4px;vertical-align:-2px"><use href="#ph-warning-fill"/></svg>${escapeHtml(friendly)}</span>`;
+      // SYS-07: `details` (crashlog / bug-report ask) goes behind a <details>
+      // disclosure instead of inline, so the actionable "Try:" hint isn't
+      // buried under a paragraph most people can't act on. Same pattern as
+      // the H3 install card's own "Details for troubleshooting" (queue.js
+      // _h3InstallCardContent). `details` is a fixed string we compose
+      // ourselves (never user/engine-supplied), so it's safe unescaped.
       nowCard.querySelector('.meta').innerHTML =
         `<span style="color: var(--muted)">${escapeHtml(snippet(last.params.label || last.params.prompt, 80))}</span>` +
         ` <span style="color: var(--muted)">· ${escapeHtml(last.params.mode)} · ${last.params.width}×${last.params.height}</span>` +
-        `<br><span style="color: var(--text)">${escapeHtml(hint)}</span>`;
-      // Action row: Retry (re-submit same params via /queue/retry) +
-      // Dismiss (mark this id as handled so the next idle poll clears
-      // the card). Both buttons live in a stable sibling element of
-      // .ttl so the click handlers survive every poll-driven rewrite.
-      // A single delegated listener on document (installed once at
-      // boot) catches the clicks via data-action so we never lose them
-      // to an inline-handler race.
+        `<br><span style="color: var(--text)">${escapeHtml(hint)}</span>` +
+        // SYS-33: errors rarely linked to Docs even where a section already
+        // existed. docsAnchor names one of troubleshooting.md's own anchors.
+        (details ? `<details class="h3-diag"><summary>Details for troubleshooting</summary><p>${details}` +
+          (docsAnchor ? ` <a href="#" onclick="openDocs('troubleshooting','${docsAnchor}');return false;">Learn more →</a>` : '') +
+          `</p></details>` : '');
+      // Action row: Retry (re-submit same params via /queue/retry), plus
+      // Retry smaller for failure classes a same-size retry can't fix
+      // (SYS-07: GPU watchdog timeout, OOM jetsam) + Dismiss. All three
+      // live in a stable sibling element of .ttl so the click handlers
+      // survive every poll-driven rewrite. A single delegated listener on
+      // document (installed once at boot) catches the clicks via
+      // data-action so we never lose them to an inline-handler race.
       if (actionsEl) {
         actionsEl.dataset.jobId = String(last.id);
+        // SYS-07 x VC-08: the one-click action on an OOM / GPU-watchdog card
+        // used to be "Retry" of the exact same size and length — the one
+        // guaranteed to fail again after another 10+ minutes. friendlyJobError
+        // flags `smaller` for those classes (LTX only — H3-22); the card then
+        // offers BOTH: "Retry smaller" first (server-side: one quality rung
+        // down, a grid-snapped 0.75x canvas and about half the length — the
+        // canvas is what actually frees memory, a quality step alone keeps
+        // the stored width/height) and "Retry as is" for the user who wants
+        // to try unchanged (a closed Chrome tab, a swap install).
         actionsEl.innerHTML =
-          `<button type="button" class="now-card-retry" data-action="retry" ` +
-          `title="Re-submit this job with the same params">` +
-          `<svg class="ph" aria-hidden="true"><use href="#ph-arrow-clockwise"/></svg>` +
-          `<span>Retry</span></button>` +
+          (action === 'models'
+            ? `<button type="button" class="now-card-retry" onclick="openModelsModal()" ` +
+              `title="A retry can't fix a missing file — finish the download instead">` +
+              `<svg class="ph" aria-hidden="true"><use href="#ph-download-simple"/></svg>` +
+              `<span>Open Models</span></button>`
+          : smaller
+            ? `<button type="button" class="now-card-retry" data-action="retry-smaller" ` +
+              `title="Try again smaller — one quality rung down, a smaller canvas and about half the length">` +
+              `<svg class="ph" aria-hidden="true"><use href="#ph-arrow-clockwise"/></svg>` +
+              `<span>Retry smaller</span></button>` +
+              `<button type="button" class="now-card-retry" data-action="retry" ` +
+              `title="Re-submit this job with the same params, unchanged">` +
+              `<span>Retry as is</span></button>`
+            : `<button type="button" class="now-card-retry" data-action="retry" ` +
+              `title="Re-submit this job with the same params">` +
+              `<svg class="ph" aria-hidden="true"><use href="#ph-arrow-clockwise"/></svg>` +
+              `<span>Retry</span></button>`) +
           `<button type="button" class="now-card-dismiss" data-action="dismiss" ` +
           `title="Dismiss this failure" aria-label="Dismiss this failure">` +
           `<svg class="ph" aria-hidden="true"><use href="#ph-x-bold"/></svg></button>`;
@@ -2367,6 +3697,12 @@ async function poll() {
       // A One Shot is named as one: the t2v/i2v underneath is how it is
       // rendered, not what was asked for.
       const _take = j.params.take && j.params.take.seconds;
+      // H3-04: a queued H3 job used to show only "t2v · 768x448 · 73f" —
+      // no shape name, no Fast/Best. Fast prices at a fraction of Best on
+      // the identical cell, so it's the single biggest lever on how long
+      // this row will actually take.
+      const h3Tag = (j.params.engine === 'h3' && typeof h3JobSpeedLabel === 'function')
+        ? h3JobSpeedLabel(j.params) : '';
       const params = j.params.engine === 'music'
         ? `YuE2 · ${j.params.music_quality} · max ${j.params.music_max_seconds}s`
         : (j.params.mode === 'image')
@@ -2375,7 +3711,16 @@ async function poll() {
         ? `${FACE_FIX_NAME} · 2×`
         : _take
         ? `One Shot · ${_take} s · ${j.params.width}×${j.params.height}`
+        : h3Tag
+        ? `${(typeof h3JobShapeLabel === 'function' && h3JobShapeLabel(j.params)) || 'Hailuo H3'} · ${h3Tag}`
         : `${j.params.mode} · ${j.params.width}×${j.params.height} · ${j.params.frames}f`;
+      // VC-02(c): "1024×512" in the row above with no explanation is exactly
+      // the report — the number that governs memory safety was never shown
+      // anywhere a user would see it before the render finished. A clamped
+      // job's own params carry WHY, so print it right next to the size.
+      const clampNotes = Array.isArray(j.params.generation_clamp_notes) ? j.params.generation_clamp_notes : [];
+      const clampBadge = clampNotes.length
+        ? ` <span class="clamp-note" title="${escapeHtml(clampNotes.join('; '))}">⚠ clamped</span>` : '';
       // Which film this job is a shot of. A pure function of immutable params,
       // so the qSig memoisation above needs no change.
       const sb = /^sb:([^#]+)#(\d+)$/.exec(j.params.session_tag || '');
@@ -2387,13 +3732,36 @@ async function poll() {
         ? `<span class="sb-rowtags"><span class="badge sb-badge" title="${escapeHtml(j.params.label || '')}">S${sb[2].padStart(2,'0')}/${sbTotal}</span>`
           + sbEngineChip(j.params.engine || 'ltx') + `</span>`
         : '';
+      // VC-26: an ETA per row, from the same priced number the badge total
+      // sums (routes_queue.py stamps job.eta_sec on every queue item).
+      const etaTxt = fmtEtaCompact(j.eta_sec);
+      const etaChip = etaTxt ? `<span class="q-eta">${etaTxt}</span>` : '';
+      // Reorder: plain up/down, hidden at the list's own boundaries so a
+      // click can never be a silent no-op. `stopPropagation` keeps a
+      // reorder click from also firing the row's edit-on-click below.
+      // ph-arrow-up is the only up/down glyph in the sprite; the down
+      // button reuses it rotated 180deg (.q-reorder-down in panel.css)
+      // rather than adding a near-duplicate symbol.
+      const upBtn = i > 0
+        ? `<button title="Move up" onclick="event.stopPropagation();reorderQueuedJob('${j.id}','up')"><svg class="ph" aria-hidden="true"><use href="#ph-arrow-up"/></svg></button>`
+        : '';
+      const downBtn = i < s.queue.length - 1
+        ? `<button title="Move down" class="q-reorder-down" onclick="event.stopPropagation();reorderQueuedJob('${j.id}','down')"><svg class="ph" aria-hidden="true"><use href="#ph-arrow-up"/></svg></button>`
+        : '';
+      // Edit is scoped to the plain video modes editQueuedJob() actually
+      // knows how to restore into #genForm (see its own comment) — a
+      // batch/One-Shot/image/music/upscale row stays view-only rather than
+      // silently mis-restoring into the wrong tab.
+      const editable = !j.params.take && j.params.engine !== 'music'
+        && !['image', 'train', 'upscale', 'sharp_export'].includes(j.params.mode);
       return `
-      <li>
+      <li${editable ? ` class="q-row-editable" onclick="editQueuedJob('${j.id}')" title="Click to edit this queued job"` : ''}>
         <span class="pos">#${i+1}</span>
         <span class="ttl" title="${escapeHtml(j.params.prompt)}">${escapeHtml(j.params.label || snippet(j.params.prompt, 60))}</span>
         ${sbBadge}
-        <span class="params">${params}</span>
-        <button title="Remove" onclick="removeJob('${j.id}')"><svg class="ph" aria-hidden="true"><use href="#ph-x-bold"/></svg></button>
+        <span class="params">${params}${clampBadge}${etaChip}</span>
+        <span class="q-reorder">${upBtn}${downBtn}</span>
+        <button title="Remove" onclick="event.stopPropagation();removeJob('${j.id}')"><svg class="ph" aria-hidden="true"><use href="#ph-x-bold"/></svg></button>
       </li>`;
     }).join('');
     window._lastQueueSig = qSig;
@@ -2422,7 +3790,7 @@ async function poll() {
   // here would abort the whole poll (outputs, version, banners). Guard, never
   // return, exactly like the queue memo above.
   const hSig = filterPhotos + '|' + filtered.slice(0, 20)
-    .map(j => j.id + '|' + j.status + '|' + (j.output_path || '')).join(';');
+    .map(j => j.id + '|' + j.status + '|' + (j.output_path || '') + '|' + (j.warning || '')).join(';');
   if (window._lastHistorySig !== hSig) {
   window._lastHistorySig = hSig;
   if (!filtered.length) {
@@ -2647,6 +4015,99 @@ async function poll() {
 // Scoped to the SELECTED tier on purpose. A T2V user on Balanced is not nagged
 // about weights High would need — the existing #engineRowNote contract is "the
 // one-line reason a gate fired", not a standing inventory.
+// SYS-16: "Make your first clip" -- shown when BOOT.first_run (server-
+// computed: has this install ever finished a render), hidden the moment
+// a render actually finishes in this session (not just at next page load)
+// or on manual dismiss. Re-checked every poll, same pattern as
+// applyPackIncompleteGate/trainApplyRamGate above.
+function applyFirstRunCard(s) {
+  const card = document.getElementById('firstRunCard');
+  if (!card || !BOOT.first_run) { if (card) card.style.display = 'none'; return; }
+  const dismissed = !!(s.settings && s.settings.first_run_card_dismissed);
+  const everFinished = (s.history || []).some(j => j && j.status === 'done');
+  // BOOT.first_run reads analytics_first_render_reported, which is only
+  // ever set with analytics ON — an install with analytics off that has
+  // rendered hundreds of clips would still be greeted as brand new. A
+  // gallery with anything in it is not a first run.
+  const hasOutputs = (s.outputs || []).length > 0;
+  const show = !(dismissed || everFinished || hasOutputs);
+  card.style.display = show ? '' : 'none';
+  const etaEl = document.getElementById('firstRunEta');
+  if (show && etaEl && !etaEl.textContent) {
+    const eta = _firstRunEta();
+    if (eta) etaEl.textContent = ` — about ${String(eta).replace(/^~\s*/, '')} on this Mac`;
+  }
+}
+
+async function dismissFirstRunCard() {
+  try {
+    const fd = new URLSearchParams();
+    fd.set('first_run_card_dismissed', 'true');
+    await fetch('/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: fd,
+    });
+  } catch (e) { /* best effort — UI still hides locally */ }
+  const card = document.getElementById('firstRunCard');
+  if (card) card.style.display = 'none';
+  if (LAST_STATUS && LAST_STATUS.settings) {
+    LAST_STATUS.settings.first_run_card_dismissed = true;
+  }
+}
+
+// Loads one of the three starter prompts and queues it directly, at this
+// Mac's safe default (Balanced — the server-side hardware clamp still
+// applies on a Compact-tier Mac, same as any other Balanced render).
+function useFirstRunPrompt(btn) {
+  const text = btn && btn.dataset && btn.dataset.firstRunPrompt;
+  if (!text) return;
+  try { setMode('t2v'); } catch (e) {}
+  try { setQuality('balanced'); } catch (e) {}
+  const p = document.getElementById('prompt');
+  if (p) p.value = text;
+  dismissFirstRunCard();
+  const form = document.getElementById('genForm');
+  if (form && typeof form.requestSubmit === 'function') {
+    form.requestSubmit();
+  } else if (form) {
+    form.dispatchEvent(new Event('submit', { cancelable: true }));
+  }
+}
+
+// SYS-22: jumps the form-pane to Quality/Length -- at 1280-1440px (worse
+// below) that section renders underneath the sticky footer, reachable
+// only by scrolling past it first, which most people never discover.
+// Called from the footer's own derived-summary button (index.html).
+function scrollToShotSetup() {
+  const onH3 = typeof currentEngine === 'function' && currentEngine() === 'h3';
+  const target = document.getElementById(onH3 ? 'h3QualityGroup' : 'qualityGroup');
+  const pane = document.querySelector('.form-pane');
+  if (!target || !pane) return;
+  // Quality/Length lives inside a <details class="shot-setup"> disclosure
+  // that starts CLOSED -- scrollIntoView on content inside a closed
+  // <details> is a silent no-op (nothing is actually laid out to scroll
+  // to), which is what made this jump button do nothing on first try.
+  const details = target.closest('details');
+  const wasClosed = details && !details.open;
+  if (wasClosed) details.open = true;
+  // Opening <details> changes layout asynchronously from the browser's
+  // point of view -- scrollIntoView called in the same tick used the
+  // PRE-open geometry and landed short. One rAF is enough for the reflow
+  // to settle (confirmed live: 0 rAF = old position, 1 rAF = correct).
+  const doScroll = () => {
+    // 'auto' (instant), not 'smooth': verified live that 'smooth' can
+    // silently fail to complete right after a <details> open changes
+    // layout in the same gesture -- 'auto' reliably lands, and the
+    // highlight below still gives the eye something to follow.
+    target.scrollIntoView({ behavior: 'auto', block: 'center' });
+    target.classList.add('shot-setup-jump-highlight');
+    setTimeout(() => target.classList.remove('shot-setup-jump-highlight'), 1200);
+  };
+  if (wasClosed) requestAnimationFrame(() => requestAnimationFrame(doScroll));
+  else doScroll();
+}
+
 function applyPackIncompleteGate(s) {
   const note = document.getElementById('engineRowNote');
   const genBtn = document.getElementById('genBtn');
@@ -2665,6 +4126,34 @@ function applyPackIncompleteGate(s) {
     }
   };
   if (engine !== 'ltx') { clear(); return; }
+  // VC-10: the base pack (the Q4 distilled transformer + its text encoder)
+  // is what EVERY LTX render needs, no matter which quality/pack the form
+  // is pointed at — this used to be considered "already a hard block in
+  // the models card above" (updateModelsCard's red "Base models needed"
+  // card), but that card only ever offered a Download button; it never
+  // touched #genBtn. Clicking Generate still queued the job, which then
+  // burned 15-25 minutes producing "mosaic" garbage (the server-side
+  // refusal — ltx_pack_preflight("q4", ...) in run_job_inner — only fires
+  // mid-render, after Gemma has already loaded). Check this FIRST, ahead
+  // of the q8-specific logic below, since a missing base pack blocks
+  // every quality, not one tier.
+  if (!s.base_available) {
+    const missing = s.base_missing || [];
+    const names = missing.map(f => String(f).split('/').pop());
+    const shown = names.slice(0, 2).join(', ') + (names.length > 2 ? ' …' : '');
+    const n = missing.length || 1;
+    note.innerHTML = escapeHtml(
+        `Finish the model download first (${n} file${n === 1 ? '' : 's'}`
+        + (shown ? ` — ${shown}` : '') + ').')
+      + ` <a href="#" onclick="openModelsModal();return false;">Open Models →</a>`;
+    note.hidden = false;
+    note.dataset.packNote = '1';
+    genBtn.disabled = true;
+    genBtn.title = "The base model weights aren't all downloaded yet — "
+                 + 'open Settings → Models to finish.';
+    genBtn.dataset.packBlocked = '1';
+    return;
+  }
   let cell = (typeof ltxCurrentCell === 'function') ? ltxCurrentCell() : null;
   const charId = (document.getElementById('characterIdInput') || {}).value || '';
   const charChip = charId
@@ -2681,9 +4170,8 @@ function applyPackIncompleteGate(s) {
   // #quality directly.
   const pack = (cell && cell.pack)
     || (_qualityUsesHq((document.getElementById('quality') || {}).value) ? 'q8' : 'q4');
-  // Only the q8 lane can be half-installed in a way the user can act on: an
-  // incomplete BASE pack is already a hard block in the models card above, and
-  // duplicating it here would give the same fact two voices.
+  // Base incompleteness is handled above, unconditionally (VC-10) — from
+  // here on this function only has the q8-specific case left to check.
   if (pack !== 'q8') { clear(); return; }
   const missing = [].concat(
     s.q8_missing || [],
@@ -2780,15 +4268,23 @@ document.addEventListener('DOMContentLoaded', () => {
 // reference image and the same prompt. Does NOT auto-submit; the user
 // keeps the chance to tweak prompt/seed/quality before clicking
 // Generate. Reversible (changing the image picker resets it).
-async function retryJob(jobId) {
+async function retryJob(jobId, opts) {
   // Re-submit a failed/cancelled job by its id. Server side endpoint
-  // /queue/retry takes the original job's id, copies its params verbatim
-  // into a fresh queue entry, and returns the new id. Toast on success
-  // (the Now/Queue pane will pick the new entry up on the next poll).
+  // /queue/retry takes the original job's id, copies its params into a
+  // fresh queue entry, and returns the new id. Toast on success (the
+  // Now/Queue pane will pick the new entry up on the next poll).
+  // opts.smaller (SYS-07) asks the server to step quality down one rung
+  // and shrink the canvas + roughly halve the length instead of copying
+  // the failed job's size verbatim; opts.overrides (VC-08) applies a small
+  // allowlisted set of params (quality, frames) — API callers only now.
   if (!jobId) return;
   try {
     const fd = new URLSearchParams();
     fd.set('id', jobId);
+    if (opts && opts.smaller) fd.set('smaller', '1');
+    if (opts && opts.overrides && Object.keys(opts.overrides).length) {
+      fd.set('overrides', JSON.stringify(opts.overrides));
+    }
     const r = await fetch('/queue/retry', { method: 'POST', body: fd });
     let data = {};
     try { data = await r.json(); } catch (e) { /* keep empty */ }
@@ -3006,6 +4502,68 @@ function _songCardName(o) {
              : m.cover ? 'cover' : '';
   return `${escapeHtml(title)}${chip ? ` <span class="song-badge">${chip}</span>` : ''}`;
 }
+
+// VC-36: the card's primary line — a filename ("integrated_multimodal_d…")
+// tells nobody anything; a prompt does. Songs keep their own naming
+// (_songCardName reads the title Music Studio gave it); everything else
+// prefers the server's prompt snippet (list_outputs' `prompt` field, VC-36),
+// falling back to the filename only when there isn't one (an older render,
+// or a file with no sidecar).
+function _cardTitleText(o) {
+  if (o && o.music) return _songCardName(o);
+  const p = (o && o.prompt || '').trim();
+  if (!p) return escapeHtml(o.name);
+  const words = p.split(/\s+/);
+  const head = words.slice(0, 8).join(' ');
+  return escapeHtml(head) + (words.length > 8 ? '…' : '');
+}
+
+// VC-36: the "Balanced · 1280×720" / "t2v · 1280×720" chip row — quality
+// and delivered size for an LTX clip, tier label and spec for an H3 one.
+// Reads only fields already in the /status payload (o.quality/o.frames,
+// VC-18/37's lift; o.h3_tier, already lifted) plus BOOT/H3's own tables —
+// no extra request per card.
+// Codex UI-9: /poster answers `immutable, max-age=7d` (right for a given
+// source), but its URL carried only the path — so a clip replaced at the same
+// path kept its OLD thumbnail in the browser for up to a week while playback
+// showed the new one. The URL now carries the source's version: the same
+// mtime stamp the server puts on o.url (`&v=`) plus the byte size, i.e. the
+// same (mtime, size) the server's own poster cache is keyed on.
+function _posterVersionQuery(o) {
+  const m = String((o && o.url) || '').match(/[?&]v=([^&]+)/);
+  const mb = o ? Number(o.size_mb) : NaN;
+  const parts = [];
+  if (m) parts.push(m[1]);
+  if (isFinite(mb) && mb > 0) parts.push(String(Math.round(mb * 1048576)));
+  return parts.length ? '&v=' + encodeURIComponent(parts.join('-')) : '';
+}
+
+// Codex UI-8 / EST-12: the size is the FILE's (list_outputs reads it from the
+// mp4 header), never the quality preset's or H3 tier's default canvas — those
+// labelled a square, portrait, native-export or Sharp-exported clip with the
+// preset's landscape delivery size. Unknown dimensions print no size at all.
+function _cardModeSizeChip(o) {
+  const bits = [];
+  if (o && o.mode) bits.push(o.mode);
+  const w = o ? Number(o.width) : 0, h = o ? Number(o.height) : 0;
+  if (w > 0 && h > 0) bits.push(`${w}×${h}`);
+  return bits.join(' · ');
+}
+// The default tier's own priced cell (VC-28 stamps exactly one "is_default"
+// entry) — the ETA SYS-16's "Make your first clip" card quotes, reused rather
+// than re-derived so the card can never disagree with the Quality chips.
+// (4.17: VC-41's separate empty-gallery card was folded into SYS-16's — one
+// first-run card, in the form, with this Mac's price on it.)
+function _firstRunEta() {
+  try {
+    const tiers = ((BOOT.ltx || {}).tiers) || [];
+    const cell = tiers.find(t => t.is_default) || tiers.find(t => t.key === 'balanced_5s');
+    if (!cell) return '';
+    const fr = cell.fleet_range;
+    return (fr && fr.eta_range) || cell.eta_range || cell.eta || '';
+  } catch (e) { return ''; }
+}
+
 function renderCarousel() {
   const el = document.getElementById('carousel');
   const visible = filteredMainOutputs();
@@ -3025,7 +4583,18 @@ function renderCarousel() {
               : mainOutputsFilter === 'audio' ? 'No audio outputs yet — write a song in Audio → Compose.'
               : mainOutputsFilter === 'videos' ? 'No video outputs yet.'
               : 'No outputs in this view yet.';
-    el.innerHTML = `<div class="empty-msg">${msg}</div>`;
+    // VC-40: this used to be a plain glowing blue dot (.empty-msg::before)
+    // - no motion, but blue + glow + alone above the text reads as a
+    // stuck spinner, especially on a first boot with nothing else on
+    // screen to contradict it. A real icon, picked for the view the user
+    // is actually looking at, reads as "empty" instead of "loading".
+    const icon = q ? 'ph-magnifying-glass'
+               : mainOutputsFilter === 'photos' ? 'ph-image'
+               : mainOutputsFilter === 'audio' ? 'ph-music-notes'
+               : 'ph-film-strip';
+    el.innerHTML = `<div class="empty-msg">`
+      + `<svg class="ph empty-msg-icon" aria-hidden="true"><use href="#${icon}"/></svg>`
+      + `<div>${msg}</div></div>`;
     fitStagePlayer();
     return;
   }
@@ -3049,41 +4618,25 @@ function renderCarousel() {
     const pathAttr = JSON.stringify(o.path).replace(/"/g, '&quot;');
     const isPhoto = outputKind(o) === 'image';
     const isAudio = outputKind(o) === 'audio';
-    // Thumbnail markup branches on kind. Videos use <video> with a
-    // mid-clip seek (2.5s — LTX clips are 5s at 24fps and the first
-    // half-second is often a dark fade-in, so seeking to the middle
-    // gets a representative frame). Photos use <img> directly with
+    // Thumbnail markup branches on kind. Photos use <img> directly with
     // the same /image?path=… cache-bust URL the server stamped.
     //
-    // PERF: with the auto-fetch landing 658+ entries into the carousel,
-    // `preload="metadata"` on every <video> stalled the page — each
-    // metadata fetch downloads the moov atom + enough bytes to render
-    // the t=2.5 poster frame (~hundreds of KB), and 586 of those
-    // saturate the browser's 6-connection limit. The user's click-to-
-    // play request then queues behind ~580 thumbnail fetches and looks
-    // "stuck."
-    //
-    // Fix: ship the <video> with `data-src` instead of `src`. An
-    // IntersectionObserver (wired below renderCarousel) promotes
-    // `data-src` to `src` only when the card is within the viewport's
-    // ~2-screen-tall preload margin. Off-screen cards stay completely
-    // dormant. <img> already has loading="lazy" so it's fine; we keep
-    // the existing markup for photos.
+    // VC-31/36: video cards used to BE a live <video preload="metadata">
+    // seeked to 2.5s — with a large library the first paint was black
+    // cards while each clip's moov atom downloaded (hundreds of KB per
+    // card, 586 of them saturating the browser's 6-connection limit; a
+    // click-to-play then queued behind ~580 thumbnail fetches and looked
+    // "stuck"). Now a plain <img> pointed at /poster?path=… — one cached
+    // ffmpeg-extracted JPEG frame per clip (_ensure_video_poster,
+    // generated once on first request, served from disk after that).
+    // loading="lazy" alone now does the deferred-fetch job the old
+    // data-src + IntersectionObserver dance existed for — no observer to
+    // wire up or clean up.
     const thumbHtml = isAudio
       ? `<span class="music-card-note" aria-hidden="true">♪</span><audio class="train-voice-audio music-card-player" controls preload="metadata" src="${escapeHtml(o.url)}" onclick="event.stopPropagation()"></audio>`
       : isPhoto
       ? `<img class="car-thumb" src="${_thumbUrl(o.url, 480)}" alt="${escapeHtml(o.name)}" loading="lazy">`
-      // Hover-scrub: on enter, jump to 0 and play silently at 0.6×;
-      // on leave, pause + snap back to the static 2.5s preview frame.
-      // The play() promise can reject during a fast scrub (browser
-      // says "play interrupted by pause") — swallow it.
-      // src is deferred — the IntersectionObserver below promotes
-      // data-src → src when the card scrolls into view. preload stays
-      // metadata so once src is set, the t=2.5 poster frame renders
-      // without the user having to hover.
-      : `<video data-src="${o.url}#t=2.5" preload="metadata" muted playsinline
-                onmouseenter="if (!this.src && this.dataset.src) this.src = this.dataset.src; this.currentTime=0; this.playbackRate=0.6; this.play().catch(()=>{})"
-                onmouseleave="this.pause(); this.currentTime=2.5; this.playbackRate=1"></video>`;
+      : `<img class="car-thumb" src="/poster?path=${encodeURIComponent(o.path)}${_posterVersionQuery(o)}" alt="${escapeHtml(o.name)}" loading="lazy">`;
     // Per-card actions (revealed on hover) — kept deliberately minimal:
     //   * Photos get a small "Animate" chip (turns the still into i2v).
     //   * Everything gets a delete (×) chip.
@@ -3111,9 +4664,16 @@ function renderCarousel() {
       : '';
     // Upscale & Face Fix lives on the big player only (owner 2026-09-17: on the
     // thumbnails it was clutter).
+    // Codex UI-5: the card's Enter/Space handler answers only for the CARD
+    // itself (target === currentTarget). Keydown bubbles, so without that
+    // guard Enter on a focused Info/Trash/Animate button — or Space on the
+    // audio card's own controls — selected the card and preventDefault()
+    // cancelled the button's own activation.
     return `
     <div class="car-card${o.path === activePath ? ' active' : ''}"
-         data-path="${escapeHtml(o.path)}" onclick="selectOutput(${pathAttr})">
+         data-path="${escapeHtml(o.path)}" onclick="selectOutput(${pathAttr})"
+         role="button" tabindex="0" aria-label="${escapeHtml(o.name)} — select"
+         onkeydown="if(event.target===event.currentTarget&&(event.key==='Enter'||event.key===' ')){event.preventDefault();selectOutput(${pathAttr});}">
       <div class="car-thumb-wrap">
         ${thumbHtml}
         ${o.has_sidecar
@@ -3129,11 +4689,12 @@ function renderCarousel() {
         </div>
       </div>
       <div class="info">
-        <div class="name" title="${escapeHtml(o.name)}">${_songCardName(o)}</div>
+        <div class="name" title="${escapeHtml(o.prompt || o.name)}">${_cardTitleText(o)}</div>
         <div class="sub" title="Render time · file size">
           ${o.sb ? `<span class="badge sb-badge" title="Shot ${o.sb.n} of a storyboard — click to open it"
                  onclick="event.stopPropagation(); sbOpenFromClip('${escapeHtml(o.sb.id)}')">S${String(o.sb.n).padStart(2,'0')}</span> · ` : ''}${_outputDurationLabel(o)} · ${o.size_mb.toFixed(1)} MB
         </div>
+        ${(() => { const chip = _cardModeSizeChip(o); return chip ? `<div class="card-chip-row">${escapeHtml(chip)}</div>` : ''; })()}
       </div>
     </div>`;
   }).join('');
@@ -3150,31 +4711,9 @@ function renderCarousel() {
          </button>
        </div>`);
   }
-  // Lazy-load the just-rendered video thumbnails. <img> entries already
-  // have native loading="lazy" but <video> has no equivalent, so we
-  // observe each carousel card and promote `data-src` → `src` only when
-  // it crosses into a 2-screen-tall preload margin. Without this, all
-  // 586 videos start downloading their poster-frame bytes at once when
-  // _showingAllOutputs is true, and the user's click-to-play stalls
-  // behind the queue. The observer is single-shot per card (unobserve
-  // after promotion) and uses a shared instance reset on each render
-  // so previously-observed nodes (now detached) get GC'd.
-  if (window._carThumbObserver) {
-    try { window._carThumbObserver.disconnect(); } catch (_e) {}
-  }
-  window._carThumbObserver = new IntersectionObserver((entries, obs) => {
-    for (const e of entries) {
-      if (!e.isIntersecting) continue;
-      const v = e.target.querySelector('video[data-src]');
-      if (v && !v.src) v.src = v.dataset.src;
-      obs.unobserve(e.target);
-    }
-  }, { root: el, rootMargin: '200% 0px 200% 0px', threshold: 0 });
-  el.querySelectorAll('.car-card').forEach(c => {
-    if (c.querySelector('video[data-src]:not([src])')) {
-      window._carThumbObserver.observe(c);
-    }
-  });
+  // VC-31: video thumbnails are plain <img loading="lazy"> now (see
+  // thumbHtml above) — the IntersectionObserver + data-src promotion this
+  // block used to do for live <video> elements has nothing left to do.
   fitStagePlayer();
 }
 
@@ -3453,7 +4992,13 @@ function selectOutput(path, options) {
   // clears for anything else. Runs for every selection so a click from a
   // song to a clip never leaves the previous song's score on screen.
   if (typeof songCardRender === 'function') songCardRender(o);
-  if (isAudio && o && o.engine === 'music' && typeof songHero === 'function') {
+  // VC-20: the full Music-Studio player (cover art, score, New take / Cover
+  // it / ...) is that tab's own surface. Reaching a song by filtering the
+  // VIDEO tab's own gallery to Audio is browsing, not switching studios —
+  // it used to transplant the whole Music player into the LTX tab's pane.
+  // Same content, one extra affordance to actually get to the real thing.
+  const onAudioTab = document.body.dataset.workflow === 'audio';
+  if (isAudio && o && o.engine === 'music' && onAudioTab && typeof songHero === 'function') {
     // A song is not a black rectangle with a stock control in it: the
     // surface shows the cover, the title and the style; playback is the
     // bar's, which stays put while you browse.
@@ -3464,7 +5009,13 @@ function selectOutput(path, options) {
     const _sf = wrap.closest('.player-surface');
     if (_sf) _sf.setAttribute('data-song', '');
   } else if (isAudio) {
-    wrap.innerHTML = `<audio class="train-voice-audio" controls preload="metadata"${autoplay ? ' autoplay' : ''} src="${escapeHtml(playerSrc)}"></audio>`;
+    const pathAttr = JSON.stringify(path).replace(/"/g, '&quot;');
+    const openLink = (o && o.engine === 'music')
+      ? `<button type="button" class="ghost-btn player-audio-open" onclick="openSongInAudioTab(${pathAttr})">Open in Audio tab</button>`
+      : '';
+    wrap.innerHTML = `<div class="player-audio-inline">`
+      + `<audio class="train-voice-audio" controls preload="metadata"${autoplay ? ' autoplay' : ''} src="${escapeHtml(playerSrc)}"></audio>`
+      + openLink + `</div>`;
   } else if (isPhoto) {
     wrap.innerHTML = `<img src="${escapeHtml(playerSrc)}" alt="${o ? escapeHtml(o.name) : ''}">`;
   } else if (liveBackdrop) {
@@ -3543,10 +5094,24 @@ function selectOutput(path, options) {
     const rel = o ? _relTimeFromMtime(o.mtime) : '';
     const sizeLbl = o ? `${o.size_mb.toFixed(1)} MB` : '';
     const kindLbl = isPhoto ? 'Photo' : isAudio ? 'Audio' : 'Video';
+    // VA-14: the lip-sync verdict chip, a2v clips only, only when scored.
+    // Same thresholds + wording as One Shot's per-part verdict (oneshot.js
+    // osVerdict) so the two surfaces read as one feature. "rough check" is
+    // load-bearing copy — this is a hint, never a gate, and never a reason
+    // to auto-delete anything.
+    let lipsyncChip = '';
+    if (o && o.mode === 'a2v' && o.lipsync_score !== null && o.lipsync_score !== undefined) {
+      const n = Number(o.lipsync_score);
+      const sign = n >= 0 ? '+' : '';
+      const verdict = n >= 0.25 ? { cls: 'po-ls-ok', text: `mouth follows the voice (${sign}${n.toFixed(2)})` }
+        : n >= 0.2 ? { cls: 'po-ls-mid', text: `borderline (${sign}${n.toFixed(2)})` }
+        : { cls: 'po-ls-bad', text: `weak — try another seed (${sign}${n.toFixed(2)})` };
+      lipsyncChip = `<span class="po-dot"></span><span class="${verdict.cls}" title="Lip-sync verdict — a rough check (mouth aperture vs. the audio), not a gate.">${escapeHtml(verdict.text)}</span>`;
+    }
     document.getElementById('playerOverlayMeta').innerHTML = o
       ? `<span>${kindLbl}</span><span class="po-dot"></span>` +
         `<span>${escapeHtml(rel)}</span><span class="po-dot"></span>` +
-        `<span>${sizeLbl}</span>`
+        `<span>${sizeLbl}</span>${lipsyncChip}`
       : '';
   }
   if (overlayActions) overlayActions.style.display = '';
@@ -3554,6 +5119,25 @@ function selectOutput(path, options) {
   // Load params is video-only — image sidecars use the library@1 schema
   // which doesn't carry the i2v/t2v form fields the loader expects.
   document.getElementById('loadParamsBtn').disabled = !(o && o.has_sidecar) || isPhoto || isAudio;
+  // New Take (VC-03) replays a sidecar too, so the same video-with-sidecar
+  // gate applies. Works on a One Shot clip too — the endpoint re-runs the
+  // whole take with a fresh seed (routes_queue.py post_queue_newtake).
+  const newTakeBtnEl = document.getElementById('newTakeBtn');
+  if (newTakeBtnEl) newTakeBtnEl.disabled = !(o && o.has_sidecar) || isPhoto || isAudio;
+  // VA-17 / H3-11: the recovery bar for a One Shot that stopped or failed
+  // mid-chain. `o.one_shot_unfinished` is stamped server-side (list_outputs)
+  // from the manifest run_take_job_inner's except clause writes on the last
+  // kept part — see mlx_ltx_panel.py.
+  const recBar = document.getElementById('oneShotRecoveryBar');
+  if (recBar) {
+    const show = !!(o && o.one_shot_unfinished);
+    recBar.hidden = !show;
+    if (show) {
+      recBar.dataset.path = o.path;
+      const txt = document.getElementById('oneShotRecoveryText');
+      if (txt) txt.textContent = 'This One Shot stopped early — the parts already rendered are kept.';
+    }
+  }
   // Action button row: swap "Use as Extend" for "Animate" on photo
   // entries (Extend is video-only, but the still can be the seed for
   // an i2v render).
@@ -3574,19 +5158,41 @@ function selectOutput(path, options) {
   //   /status payload as o.engine) — not the form's current engine, which is
   //   about the next render and says nothing about this clip.
   const outIsH3 = !!(o && o.engine === 'h3');
-  if (useExtBtn) useExtBtn.style.display = (isPhoto || isAudio || outIsH3) ? 'none' : '';
+  // VA-36: on an a2v (lip-sync) clip, Extend continues with LTX's OWN
+  // regenerated audio, not the song this clip was conditioned on — a
+  // singing shot would "continue" with invented gibberish. Swap Extend for
+  // "Continue the song" there instead (see /a2v/continue_song).
+  const outIsA2v = !!(o && o.mode === 'a2v');
+  if (useExtBtn) useExtBtn.style.display = (isPhoto || isAudio || outIsH3 || outIsA2v) ? 'none' : '';
+  const continueSongBtn = document.getElementById('continueSongBtn');
+  if (continueSongBtn) continueSongBtn.style.display = (outIsA2v && !isPhoto && !isAudio) ? '' : 'none';
+  // VA-26: Retake is video-only, engine-agnostic (any finished clip, H3
+  // included in principle — the pipeline call is LTX-only today, same
+  // constraint Extend already has, so scope it the same way Extend is
+  // scoped: not on H3 clips, not on photos/audio).
+  const retakeBtn = document.getElementById('retakeBtn');
+  if (retakeBtn) retakeBtn.style.display = (isPhoto || isAudio || outIsH3) ? 'none' : '';
+  // VA-38: shown only on a published Windows-partial (windows_partial set
+  // by _publish_windows_partial on a chain failure).
+  const windowsContinueBtn = document.getElementById('windowsContinueBtn');
+  if (windowsContinueBtn) {
+    const wp = o && o.windows_partial;
+    windowsContinueBtn.style.display = wp ? '' : 'none';
+    const lbl = document.getElementById('windowsContinueLabel');
+    if (lbl && wp) lbl.textContent = 'Continue (' + wp.completed + ' of ' + wp.total + ' done)';
+  }
   // Upscale & Face Fix is video-only but engine-agnostic: an H3 draft is
   // exactly the clip it was built for.
   const useUpBtn = document.getElementById('faceFixWrap');
   // …and never on a clip that is already an upscale (owner 2026-09-17).
   if (useUpBtn) useUpBtn.style.display = (isPhoto || isAudio || isUpscaledPath(o && o.path)) ? 'none' : '';
   if (animBtn) animBtn.style.display = isPhoto ? '' : 'none';
-  // "Finish at …" — for a completed H3 render that has a higher canvas to be
-  // committed at. Decided from o.engine / o.h3_tier (both sidecar-derived,
-  // already in the /status payload and resolved server-side through the legacy
-  // alias map), so no extra request rides the selection path.
-  if (typeof _syncH3FinishAffordance === 'function') {
-    try { _syncH3FinishAffordance(isPhoto ? null : o); } catch (e) {}
+  // "Finish at …" — for a completed H3 or LTX render that has a higher
+  // canvas to be committed at (VC-18/37). Decided from o.engine plus either
+  // o.h3_tier or o.quality/o.frames — all sidecar-derived, already in the
+  // /status payload — so no extra request rides the selection path.
+  if (typeof _syncFinishAffordance === 'function') {
+    try { _syncFinishAffordance(isPhoto ? null : o); } catch (e) {}
   }
 }
 
@@ -3614,6 +5220,17 @@ function openExpandLightbox() {
   if (meta) {
     const sizeLbl = `${o.size_mb.toFixed(1)} MB`;
     meta.textContent = `${o.name} · ${sizeLbl}`;
+  }
+  // VC-18/37: same clip actions as the toolbar's More menu, video-only —
+  // a still or a song has no Sharp export / last frame / etc to offer.
+  const actions = document.getElementById('expandActions');
+  if (actions) {
+    actions.innerHTML = (!isPhoto && !isAudio) ? `
+      <button type="button" class="ghost-btn" onclick="sharpExportActive()">Sharp export</button>
+      <button type="button" class="ghost-btn" onclick="useLastFrameActive()">Use last frame</button>
+      <button type="button" class="ghost-btn" onclick="openActiveInEditor()">Open in Editor</button>
+      <button type="button" class="ghost-btn" onclick="revealActive()">Reveal in Finder</button>
+    ` : '';
   }
   lb.style.display = 'flex';
 }
@@ -3672,34 +5289,86 @@ function closeExpandLightbox() {
 // Toast helper — non-blocking confirmation pattern, stacks at the
 // bottom-center of the viewport. Use for delete confirmation, "moved
 // to Trash" feedback, save success, etc. Auto-dismisses after
-// `duration` ms (default 3 s). Pass `kind: "success" | "danger"` to
-// tint the border + icon.
+// `duration` ms (default 4 s; pass `duration: 0` to keep it up until the
+// person closes it — every toast gets a close control, see below). Pass
+// `kind: "success" | "warning" | "danger"` to tint the border + icon.
+//
+// SYS-09: this used to accept only an options OBJECT, but three call
+// sites in health.js called `phosToast(message, 'warn')` /
+// `phosToast(message, 'error')` — a bare string. `opts.kind` on a string
+// is silently `undefined` (no throw), so those three failures rendered
+// as neutral "info" toasts and vanished in 3 s with no color, no icon,
+// no way to tell they were errors. Accepting the string shorthand here,
+// and normalizing the two aliases those call sites actually used ('warn'
+// -> 'warning', 'error' -> 'danger'), fixes them without having to catch
+// every future caller that reaches for the shorter form.
 function phosToast(message, opts) {
+  if (typeof opts === 'string') opts = { kind: opts };
   opts = opts || {};
+  const kindAliases = { warn: 'warning', err: 'danger', error: 'danger' };
+  const kind = kindAliases[opts.kind] || opts.kind;
   const c = document.getElementById('phosToast');
   if (!c) return null;
-  const el = document.createElement('div');
-  el.className = 'phos-toast';
-  if (opts.kind === 'success' || opts.kind === 'danger') {
-    el.classList.add('phos-toast-' + opts.kind);
-  }
-  const icon = opts.icon
-            || (opts.kind === 'success' ? 'ph-check-bold'
-            :  opts.kind === 'danger'  ? 'ph-x-circle'
-                                       : 'ph-info');
-  el.innerHTML =
-    `<svg class="ph" aria-hidden="true"><use href="#${icon}"/></svg>` +
-    `<span class="phos-toast-msg"></span>`;
-  el.querySelector('.phos-toast-msg').textContent = String(message);
-  c.appendChild(el);
-  const duration = (opts.duration === 0) ? 0 : (opts.duration || 3000);
-  if (duration > 0) {
-    setTimeout(() => {
+  const msg = String(message);
+  const duration = (opts.duration === 0) ? 0 : (opts.duration || 4000);
+  const arm = (el) => {
+    if (el._toastTimer) clearTimeout(el._toastTimer);
+    if (duration <= 0) return;
+    el._toastTimer = setTimeout(() => {
       if (!el.isConnected) return;
       el.classList.add('is-leaving');
       el.addEventListener('animationend', () => el.remove(), { once: true });
     }, duration);
+  };
+  // FILM-03: A REFUSAL REPEATED IS NOT A NEW MESSAGE. Holding ⌥→ against a
+  // clip already hard against its neighbour fired the same "nothing to
+  // give" toast once per keypress and covered the timeline in identical
+  // copies (shots_film/13_after_nudge.png). The same text still on screen
+  // gets a ×N counter and a fresh dismiss timer instead of a new stack —
+  // only while it is still THIS message; a different one still stacks.
+  const dupe = Array.prototype.find.call(c.children, (el) =>
+    el.classList && el.classList.contains('phos-toast')
+    && !el.classList.contains('is-leaving') && el.dataset.msg === msg);
+  if (dupe) {
+    const n = (parseInt(dupe.dataset.count || '1', 10) || 1) + 1;
+    dupe.dataset.count = String(n);
+    let cnt = dupe.querySelector('.phos-toast-count');
+    if (!cnt) {
+      cnt = document.createElement('span');
+      cnt.className = 'phos-toast-count';
+      dupe.appendChild(cnt);
+    }
+    cnt.textContent = '×' + n;
+    arm(dupe);
+    return dupe;
   }
+  const el = document.createElement('div');
+  el.className = 'phos-toast';
+  el.dataset.msg = msg;
+  el.dataset.count = '1';
+  if (kind === 'success' || kind === 'warning' || kind === 'danger') {
+    el.classList.add('phos-toast-' + kind);
+  }
+  const icon = opts.icon
+            || (kind === 'success' ? 'ph-check-bold'
+            :  kind === 'danger'  ? 'ph-x-circle'
+            :  kind === 'warning' ? 'ph-warning-fill'
+                                       : 'ph-info');
+  el.innerHTML =
+    `<svg class="ph" aria-hidden="true"><use href="#${icon}"/></svg>` +
+    `<span class="phos-toast-msg"></span>` +
+    `<button type="button" class="phos-toast-close" aria-label="Dismiss">&times;</button>`;
+  el.querySelector('.phos-toast-msg').textContent = msg;
+  // SYS-09: every toast can be closed by hand; FILM-03's arm() owns the
+  // auto-dismiss timer so a de-duplicated repeat can re-arm it.
+  el.querySelector('.phos-toast-close').onclick = () => {
+    if (el._toastTimer) clearTimeout(el._toastTimer);
+    if (!el.isConnected) return;
+    el.classList.add('is-leaving');
+    el.addEventListener('animationend', () => el.remove(), { once: true });
+  };
+  c.appendChild(el);
+  arm(el);
   return el;
 }
 
@@ -3729,8 +5398,27 @@ async function animateActive() {
   }
 }
 
-async function hide(path) { await fetch('/output/hide?path='+encodeURIComponent(path),{method:'POST'}); outputsCacheMutated([path]); currentOutputs = []; poll(); }
-async function unhide(path) { await fetch('/output/show?path='+encodeURIComponent(path),{method:'POST'}); outputsCacheMutated([]); currentOutputs = []; poll(); }
+// VC-04: Hide used to be a silent one-way door — no toast, no undo, no way
+// back short of a raw /output/show curl. It stays reversible on disk either
+// way (the file never moves), but the UI now says so and gives Undo right
+// where the click happened, plus a "Hidden" toggle in the Outputs filters
+// (see setHiddenFilter) for anyone who dismissed the toast.
+async function hide(path) {
+  await fetch('/output/hide?path='+encodeURIComponent(path),{method:'POST'});
+  outputsCacheMutated([path]); currentOutputs = []; poll();
+  const name = String(path).split('/').pop();
+  const el = phosToast('Hidden · ' + name, { kind: 'success', duration: 7000 });
+  if (el) {
+    const a = document.createElement('a');
+    a.href = '#'; a.className = 'phos-toast-action'; a.textContent = 'Undo';
+    a.onclick = (ev) => { ev.preventDefault(); el.remove(); unhide(path); };
+    el.appendChild(a);
+  }
+}
+async function unhide(path) {
+  await fetch('/output/show?path='+encodeURIComponent(path),{method:'POST'});
+  outputsCacheMutated([]); currentOutputs = []; poll();
+}
 
 async function deleteOutput(path) {
   // Per-card × button. Moves the media (and any sibling sidecar JSON)
@@ -3788,6 +5476,10 @@ async function openOutputsFolder() {
 function hideActive() { if (activePath) hide(activePath); }
 
 function useAsExtendSourcePath(path) {
+  // VA-09: Extend switched the mode but not the tab, so pressing it from
+  // Audio/One Shot/Images set mode=extend behind a hidden #genForm (0 px
+  // tall) — same root cause as VA-08's Load Params, same fix.
+  if (typeof workflowSwitch === 'function') { try { workflowSwitch('manual'); } catch (e) {} }
   setMode('extend');
   document.getElementById('video_path').value = path;
   document.getElementById('extendSrcSelect').value = path;
@@ -3795,6 +5487,180 @@ function useAsExtendSourcePath(path) {
   document.querySelector('aside.form-pane').scrollTop = 0;
 }
 function useAsExtendSource() { if (!activePath) return alert('Pick an output first.'); useAsExtendSourcePath(activePath); }
+
+// VA-38: hands a published Windows-partial to Extend as its source. Not a
+// byte-exact resume of the original chain's plan (that would need the
+// failure-path exception handler to thread window index / tail state back
+// out through the job dict, which this session did not build) — a
+// pragmatic equivalent built on Extend's own already-proven path: the
+// partial clip IS the finished prefix, Extend continues it.
+function windowsContinueFromPartial(path) {
+  if (!path) { alert('Pick an output first.'); return; }
+  useAsExtendSourcePath(path);
+  if (typeof phosToast === 'function') {
+    phosToast('This clip is what finished before the Windows chain stopped — '
+      + 'Extend continues it. The prompt below is the ORIGINAL clip’s; edit it '
+      + 'for what should happen next.', { duration: 7000 });
+  }
+}
+
+// "Continue the song" (VA-36 / build item 2, report_video-advanced.txt).
+// Opens the NEXT lip-sync clip anchored on THIS one's most-closed-mouth
+// frame near its end (never the literal last frame — a2v's own last frame
+// is usually mid-syllable), with Start at moved forward to where that frame
+// sits in the song. This is a new render, not a video-level "continue" —
+// Extend's job (regenerate joint LTX audio over new frames) is exactly
+// wrong here, which is why it's swapped out for a2v clips.
+async function continueSongFromClip(path) {
+  if (!path) { alert('Pick an output first.'); return; }
+  try {
+    // Restore the source clip's own recipe first (audio file, prompt,
+    // canvas, strength, LoRAs) — loadParams() reads the CURRENTLY SELECTED
+    // output's sidecar, so this only applies when the clip being continued
+    // is the one on screen (true from the player button; a defensive no-op
+    // otherwise rather than restoring the wrong clip's params).
+    if (activePath === path) await loadParams();
+    const r = await fetch('/a2v/continue_song', { method: 'POST', body: new URLSearchParams({ clip: path }) });
+    const res = await r.json();
+    if (!res.ok) {
+      const msg = res.error || 'Could not continue the song';
+      if (typeof phosToast === 'function') phosToast(msg, { kind: 'danger', duration: 6000 });
+      else alert(msg);
+      return;
+    }
+    audioModeSet('drive');
+    if (typeof workflowSwitch === 'function') workflowSwitch('audio');
+    const det = document.getElementById('mvOneShotDetails');
+    if (det) det.open = true;
+    // Override with the CONTINUATION: anchor on the closed-mouth frame,
+    // Start at moved to where it sits in the song.
+    pickerSetImage('a2v_image', res.anchor_image, { snapAspect: false });
+    const startEl = document.getElementById('audioStudioStart');
+    if (startEl) {
+      startEl.value = String(res.audio_start_time);
+      if (typeof audioStudioDurationChanged === 'function') audioStudioDurationChanged();
+    }
+    requestAnimationFrame(() => {
+      if (det) det.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    });
+    if (typeof phosToast === 'function') {
+      phosToast('Continuing from ' + res.audio_start_time.toFixed(1)
+        + 's, anchored on the last closed-mouth frame.', { kind: 'success' });
+    }
+  } catch (e) {
+    const msg = 'Continue the song failed: ' + (e.message || e);
+    if (typeof phosToast === 'function') phosToast(msg, { kind: 'danger' });
+    else alert(msg);
+  }
+}
+
+// "Retake a moment" (VA-26). Regenerates one interior stretch of a finished
+// clip via the engine's RetakePipeline (Extend's own backend), while the
+// rest of the clip is preserved. A player action, not a full Extend-style
+// mode switch — the form lives in its own small modal (retakeModal) rather
+// than taking over #genForm, since this is a one-shot fix on an existing
+// clip, not a new render recipe to keep tweaking.
+let _retakeSourcePath = null;
+// 4.17.0 render check: Retake shares Extend's size cap (tier_max_dim
+// ("extend")), so on a capped Mac a 720x1280 clip came back 416x768 while the
+// modal promised everything outside the stretch "kept exactly as it was".
+// Say the cap before the render, the way refreshExtendClampNote does for
+// Extend. PURE (tier in, text out) so it is tested by executing it.
+function retakeClampNoteText(tier) {
+  const t = tier || {};
+  const cap = Number(t.extend_max_dim || 0);
+  if (!cap) return '';
+  return `On this Mac (${t.label || 'this tier'}), Retake works at up to ${cap}px `
+    + `on the longer side: a bigger clip is downscaled first, so the new clip `
+    + `can come out smaller than this one. The original stays as it is.`;
+}
+function openRetakeModal(path) {
+  if (!path) { alert('Pick a clip first.'); return; }
+  _retakeSourcePath = path;
+  const modal = document.getElementById('retakeModal');
+  const status = document.getElementById('retakeStatus');
+  const promptEl = document.getElementById('retakePrompt');
+  const startEl = document.getElementById('retakeStart');
+  const endEl = document.getElementById('retakeEnd');
+  if (status) status.textContent = '';
+  const clampEl = document.getElementById('retakeClampNote');
+  if (clampEl) {
+    const note = retakeClampNoteText((typeof BOOT !== 'undefined' && BOOT && BOOT.tier) || {});
+    clampEl.textContent = note;
+    clampEl.hidden = !note;
+  }
+  if (promptEl) promptEl.value = '';
+  if (startEl) startEl.value = '0';
+  if (endEl) endEl.value = '1';
+  // Best-effort prefill of the clip's own prompt (so "leave blank to reuse
+  // this clip's own prompt" has something visible to confirm) and its
+  // duration (so From/To default inside the real clip length rather than
+  // an arbitrary 0-1s guess).
+  fetch('/sidecar?path=' + encodeURIComponent(path)).then(r => r.ok ? r.json() : null).then(data => {
+    if (!data || _retakeSourcePath !== path) return;
+    const p = data.params || {};
+    if (promptEl && !promptEl.value) promptEl.placeholder = String(p.prompt || data.prompt || '').slice(0, 200);
+    const o = (typeof findOutputByPath === 'function') ? findOutputByPath(path) : null;
+    if (o && o.clip_sec && endEl) endEl.value = String(Math.min(o.clip_sec, 2).toFixed(1));
+    if (o && o.clip_sec) { startEl.max = String(o.clip_sec); endEl.max = String(o.clip_sec); }
+  }).catch(() => {});
+  if (modal) modal.style.display = 'flex';
+}
+function closeRetakeModal() {
+  const modal = document.getElementById('retakeModal');
+  if (modal) modal.style.display = 'none';
+  _retakeSourcePath = null;
+}
+async function submitRetake() {
+  if (!_retakeSourcePath) { closeRetakeModal(); return; }
+  const status = document.getElementById('retakeStatus');
+  const btn = document.getElementById('retakeSubmitBtn');
+  const start = parseFloat((document.getElementById('retakeStart') || {}).value || '0') || 0;
+  const end = parseFloat((document.getElementById('retakeEnd') || {}).value || '0') || 0;
+  if (end <= start) {
+    if (status) status.textContent = 'End must be after start.';
+    return;
+  }
+  const promptEl = document.getElementById('retakePrompt');
+  let prompt = (promptEl && promptEl.value.trim()) || '';
+  if (!prompt) {
+    // Fall back to the source clip's own prompt — the server also defaults
+    // p["prompt"] from the form, but make_job's own fallback is the generic
+    // "A cinematic atmospheric scene", which is wrong here; read the
+    // source's real prompt from its sidecar placeholder we filled in above.
+    prompt = (promptEl && promptEl.placeholder) || '';
+  }
+  const keepSoundEl = document.getElementById('retakeKeepSound');
+  const keepSound = !keepSoundEl || keepSoundEl.checked;
+  if (btn) btn.disabled = true;
+  if (status) status.textContent = 'Queueing…';
+  try {
+    const fd = new URLSearchParams();
+    fd.set('mode', 'retake');
+    fd.set('video_path', _retakeSourcePath);
+    fd.set('prompt', prompt);
+    fd.set('retake_start_sec', String(start));
+    fd.set('retake_end_sec', String(end));
+    if (!keepSound) fd.set('retake_audio_action', 'regenerate');
+    fd.set('preset_label', 'Retake ' + start.toFixed(1) + 's-' + end.toFixed(1) + 's');
+    const r = await fetch('/queue/add', { method: 'POST', body: fd });
+    const res = await r.json().catch(() => ({}));
+    if (!r.ok || res.error) throw new Error(res.error || ('HTTP ' + r.status));
+    if (typeof phosToast === 'function') {
+      phosToast('Retake queued (' + start.toFixed(1) + 's–' + end.toFixed(1)
+        + 's) — lands next to the original, watch Now', { kind: 'success' });
+    }
+    closeRetakeModal();
+    if (typeof poll === 'function') poll();
+  } catch (e) {
+    const msg = 'Retake failed: ' + (e.message || e);
+    if (status) status.textContent = msg;
+    if (typeof phosToast === 'function') phosToast(msg, { kind: 'danger', duration: 6000 });
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 // UPSCALE & FACE FIX — the one-click clip action. The server builds the job
 // (the face-safe recipe, the clip's own prompt and seed) so the player, the
 // Outputs cards, the history rows and the Editor queue exactly the same thing.
@@ -3825,11 +5691,16 @@ async function faceFixClip(path, opts) {
     return r;
   }
   if (opts.btnId) { try { _flashActionDone(opts.btnId, 'Queued'); } catch (e) {} }
+  // VA-22: was untruncated prose that clipped at 1440px and never said the
+  // size — the real number the server just computed (no eta shown: one
+  // measurement at 1024×576 exists, not a lane table, so a guessed time
+  // would be exactly the kind of promise this review is about).
+  const sizeNote = (r.target_w && r.target_h) ? (' · ' + r.target_w + '×' + r.target_h) : '';
   phosToast(r.duplicate
-    ? (FACE_FIX_NAME + (r.running ? ' is already rendering for ' : ' is already waiting in the queue for ')
+    ? (FACE_FIX_NAME + (r.running ? ' is already rendering for ' : ' is already queued for ')
        + name + '.')
-    : (opts.doneHint || (FACE_FIX_NAME + ' queued for ' + name
-       + ' — the fixed clip (2× size, same face, same sound) lands next to it in Outputs.')),
+    : (opts.doneHint || (FACE_FIX_NAME + ' queued' + sizeNote
+       + ' — lands next to the original.')),
     { kind: 'success', duration: 6000 });
   try { poll(); } catch (e) {}
   return r;
@@ -3838,10 +5709,395 @@ function faceFixActive() {
   if (!activePath) return phosToast('Pick a clip in Outputs first.', {});
   return faceFixClip(activePath, { btnId: 'faceFixBtn' });
 }
+
+// ---- VC-18/37: the clip toolbar's "More" menu ------------------------------
+// Sharp export, Use last frame, Open in Editor, Reveal in Finder — four
+// actions that don't earn a permanent icon slot next to Params/Extend/
+// Upscale, so they live in one small popover instead (kebabToggle below).
+// Each function works from an explicit path so the SAME code drives the
+// toolbar button (activePath) and the lightbox's row (openExpandLightbox
+// wires them with the path of whatever is currently expanded).
+
+async function queueSharpExport(path) {
+  if (!path) { phosToast('Pick a clip first.', {}); return null; }
+  const fd = new URLSearchParams();
+  fd.set('path', path);
+  let r;
+  try { r = await (await fetch('/queue/sharp_export', { method: 'POST', body: fd })).json(); }
+  catch (e) { r = { ok: false, error: String(e) }; }
+  const name = String(path).split('/').pop();
+  if (!r || !r.ok) {
+    phosToast((r && r.error) || 'Sharp export could not be queued.',
+              { kind: 'danger', duration: 9000 });
+    return r;
+  }
+  phosToast(r.duplicate
+    ? ('Sharp export is already queued for ' + name + '.')
+    : ('Sharp export queued for ' + name + ' — a sharper file lands next to it in Outputs.'),
+    { kind: 'success', duration: 6000 });
+  try { poll(); } catch (e) {}
+  return r;
+}
+function sharpExportActive() {
+  if (!activePath) return phosToast('Pick a clip in Outputs first.', {});
+  return queueSharpExport(activePath);
+}
+
+async function useLastFramePath(path) {
+  if (!path) { phosToast('Pick a clip first.', {}); return; }
+  phosToast('Grabbing the last frame…', { duration: 2500 });
+  const fd = new URLSearchParams();
+  fd.set('path', path);
+  let r;
+  try { r = await (await fetch('/output/last_frame', { method: 'POST', body: fd })).json(); }
+  catch (e) { r = { ok: false, error: String(e) }; }
+  if (!r || !r.ok) {
+    phosToast((r && r.error) || 'Could not grab the last frame.', { kind: 'danger', duration: 9000 });
+    return;
+  }
+  // Same seam Animate-from-photo uses: leave Studio workflows, switch to
+  // i2v, drop the frame into the image picker so its preview updates too.
+  if (typeof workflowSwitch === 'function') workflowSwitch('manual');
+  setMode('i2v');
+  if (typeof pickerSetImage === 'function') {
+    pickerSetImage('image', r.path, { snapAspect: false });
+  } else {
+    document.getElementById('image').value = r.path;
+  }
+  const formPane = document.querySelector('aside.form-pane');
+  if (formPane) formPane.scrollTop = 0;
+  if (typeof updateDerived === 'function') updateDerived();
+  phosToast('Last frame loaded as the i2v reference — ready for a fresh take.', { kind: 'success' });
+}
+function useLastFrameActive() {
+  if (!activePath) return phosToast('Pick a clip in Outputs first.', {});
+  return useLastFramePath(activePath);
+}
+
+async function revealClipInFinder(path) {
+  if (!path) { phosToast('Pick a clip first.', {}); return; }
+  const fd = new URLSearchParams();
+  fd.set('path', path);
+  let r;
+  try { r = await (await fetch('/output/reveal', { method: 'POST', body: fd })).json(); }
+  catch (e) { r = { ok: false, error: String(e) }; }
+  if (!r || !r.ok) phosToast((r && r.error) || 'Could not open Finder.', { kind: 'danger' });
+}
+function revealActive() {
+  if (!activePath) return phosToast('Pick a clip in Outputs first.', {});
+  return revealClipInFinder(activePath);
+}
+
+async function openClipInEditor(path) {
+  if (!path) { phosToast('Pick a clip first.', {}); return; }
+  if (!(typeof SB !== 'undefined' && SB.boards && SB.boards.length)) {
+    phosToast('Create a film in Storyboard first — then a clip can join it in the Editor.', {});
+    return;
+  }
+  const id = (SB.boards[0] || {}).id;
+  const fd = new URLSearchParams();
+  fd.set('id', id); fd.set('path', path);
+  let r;
+  try { r = await (await fetch('/storyboard/add-shot', { method: 'POST', body: fd })).json(); }
+  catch (e) { r = { ok: false, error: String(e) }; }
+  if (!r || !r.ok) { phosToast((r && r.error) || 'Could not add the clip.', { kind: 'danger' }); return; }
+  phosToast('Added to "' + (r.title || 'the film') + '" — opening the Editor.', { kind: 'success' });
+  if (typeof edOpenBoard === 'function') edOpenBoard(id);
+}
+function openActiveInEditor() { return openClipInEditor(activePath); }
+
+// Generic kebab/popover controller — shared by the player's More menu and
+// the LoRA row's ⋯ menu (VC-42). id === the .kebab-pop element's id.
+// Closing on an outside click and on Escape is wired once, module-load time.
+function kebabToggle(id, forceOpen) {
+  const pop = document.getElementById(id);
+  if (!pop) return;
+  const willOpen = typeof forceOpen === 'boolean' ? forceOpen : !pop.classList.contains('open');
+  document.querySelectorAll('.kebab-pop.open').forEach(p => { if (p !== pop) p.classList.remove('open'); });
+  pop.classList.toggle('open', willOpen);
+}
+(function _wireKebabOutsideClick() {
+  document.addEventListener('click', (ev) => {
+    if (ev.target.closest && ev.target.closest('.kebab-wrap')) return;
+    document.querySelectorAll('.kebab-pop.open').forEach(p => p.classList.remove('open'));
+  });
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') document.querySelectorAll('.kebab-pop.open').forEach(p => p.classList.remove('open'));
+  });
+})();
+
+// NEW TAKE (VC-03) — "I like this, give me another": same recipe, a fresh
+// seed, queued at once. Sourced from the clip's own sidecar server-side
+// (/queue/newtake), so it works on anything still in the gallery, not only
+// a recent job. Published on globalThis so the board's own New Take
+// (FILM-22) can call this instead of re-deriving "same recipe, new seed" a
+// second time — one seed helper, shared.
+async function newTakeFromPath(path, opts) {
+  opts = opts || {};
+  if (!path) { phosToast('Pick a clip first.', {}); return null; }
+  const fd = new URLSearchParams();
+  fd.set('path', path);
+  let r;
+  try { r = await (await fetch('/queue/newtake', { method: 'POST', body: fd })).json(); }
+  catch (e) { r = { ok: false, error: String(e) }; }
+  const name = String(path).split('/').pop();
+  if (!r || !r.ok) {
+    phosToast((r && r.error) || 'New take could not be queued.',
+              { kind: 'danger', duration: 7000 });
+    return r;
+  }
+  if (opts.btnId) { try { _flashActionDone(opts.btnId, 'Queued'); } catch (e) {} }
+  const etaMin = (typeof r.eta_sec === 'number' && r.eta_sec > 0)
+    ? Math.max(1, Math.round(r.eta_sec / 60)) : null;
+  phosToast('New take queued for ' + name
+    + (etaMin ? (' · about ' + etaMin + ' min, same as last time') : ''),
+    { kind: 'success', duration: 6000 });
+  try { poll(); } catch (e) {}
+  return r;
+}
+function newTakeActive() {
+  if (!activePath) return phosToast('Pick a clip in Outputs first.', {});
+  return newTakeFromPath(activePath, { btnId: 'newTakeBtn' });
+}
+
+// ---- destructive queue controls (VC-05, VC-06, VC-35, H3-11) --------------
+//
+// Stop and Clear used to be armed at all times, right next to Generate, with
+// no cost shown and no way back — the exact shape VC-35 calls out ("Trash
+// asks, Hide/Stop/Clear don't"). This is the one place both are wired: idle
+// disables Stop, real elapsed time gates whether it asks first, and a
+// chained One Shot gets the option to keep what already finished instead of
+// an all-or-nothing kill. Runs every poll() cycle — cheap DOM writes, no
+// network of its own.
+// VC-04: the reopened way back for anything hidden from the player. Flips
+// filterMode (boot.js) between 'visible' and 'hidden' and re-polls so
+// /status fetches with include_hidden=1 — the same plumbing the old
+// Visible/Hidden segmented control drove, left in place when that control
+// was removed.
+function toggleHiddenFilter() {
+  filterMode = (filterMode === 'hidden') ? 'visible' : 'hidden';
+  try { renderCarousel(); } catch (e) {}
+  poll();
+}
+function _syncHiddenFilterToggle(s) {
+  const btn = document.getElementById('hiddenFilterToggle');
+  if (!btn) return;
+  const n = (s && s.hidden_count) || 0;
+  btn.style.display = (n > 0 || filterMode === 'hidden') ? '' : 'none';
+  btn.classList.toggle('active', filterMode === 'hidden');
+  btn.textContent = filterMode === 'hidden' ? 'Showing hidden — back to Outputs' : `Hidden (${n})`;
+  btn.title = filterMode === 'hidden'
+    ? 'Show the regular gallery again'
+    : `${n} output${n === 1 ? '' : 's'} hidden from the gallery — click to see and restore them`;
+}
+
+// VC-03: the seed-locked chip. Shows whenever #seed holds a real (locked)
+// value instead of -1/random, wherever it came from (Load Params, typing
+// one in by hand, a saved draft restored on reload — VC-38). ✕ is the one
+// click back to a fresh roll on the next Generate.
+function _syncSeedLockChip() {
+  const chip = document.getElementById('seedLockChip');
+  const valEl = document.getElementById('seedLockValue');
+  const seedEl = document.getElementById('seed');
+  if (!chip || !valEl || !seedEl) return;
+  const raw = String(seedEl.value || '').trim();
+  const locked = raw !== '' && raw !== '-1';
+  chip.hidden = !locked;
+  if (locked) valEl.textContent = 'seed ' + raw;
+}
+function clearSeedLock() {
+  const seedEl = document.getElementById('seed');
+  if (!seedEl) return;
+  seedEl.value = '-1';
+  _syncSeedLockChip();
+  if (typeof updateDerived === 'function') { try { updateDerived(); } catch (e) {} }
+}
+
+function _syncDestructiveQueueButtons(s) {
+  // Stop's enabled state + title are set once, in poll() (SYS-10d/VC-05 —
+  // the `.js-stop-btn` block), on the same buttons this used to reach via
+  // [data-role="stop-btn"]; two writers on one poll made the title flicker.
+  const queued = (s && s.queue) || [];
+  document.querySelectorAll('[data-role="clear-queue-btn"]').forEach(btn => {
+    btn.disabled = queued.length === 0;
+    const label = btn.querySelector('.clear-queue-label');
+    const text = queued.length ? `Clear queue (${queued.length})` : 'Clear queue';
+    if (label) label.textContent = text; else btn.title = text;
+    btn.title = queued.length
+      ? `Remove ${queued.length} waiting render${queued.length === 1 ? '' : 's'} — the running one continues. Undo brings them right back.`
+      : 'Nothing waiting in the queue';
+  });
+}
+
+// See _syncDestructiveQueueButtons for why Stop is disabled when idle. Once
+// something is rendering: a chained One Shot always offers the safer
+// "finish this part, then stop" choice alongside a hard stop; an ordinary
+// render under 2 minutes old stops at once (too little is at stake to make
+// the user click twice), past that it asks and says what is lost.
+function requestStop(opts) {
+  // opts.onStop: a caller-side loop to break when the user actually stops
+  // (confirmed, not cancelled) — the Lip-sync "Split into clips" chain (VA-30)
+  // queues its next part client-side and must not outlive a Stop.
+  const onStop = (opts && typeof opts.onStop === 'function') ? opts.onStop : null;
+  const cur = LAST_STATUS && LAST_STATUS.current;
+  if (!cur) { if (onStop) onStop(); return; }
+  const cp = cur.params || {};
+  const isTake = !!cp.take;
+  const progress = cur.progress || {};
+  // H3-11's other half: a plain chained H3 render (10/15 s+, no One Shot
+  // wrapper) is still ONE job with several windows — window/window_total are
+  // already live in cur.progress (the Now-card ETA reads the same fields).
+  // (4.17: offered only when the H3 runner can keep finished windows on a
+  // stop — BOOT.tier.h3_stop_after_window; today's runner writes its one
+  // output after the last window, so a mid-chain stop keeps nothing.)
+  const isH3Chain = !isTake && String(cp.engine || '').toLowerCase() === 'h3'
+    && Number(progress.window_total || 1) > 1
+    && !!(typeof BOOT !== 'undefined' && (BOOT.tier || {}).h3_stop_after_window);
+  const startedTs = Number(cur.started_ts) || 0;
+  const now = Number((LAST_STATUS && LAST_STATUS.server_now) || (Date.now() / 1000));
+  const elapsedMin = startedTs ? Math.max(0, (now - startedTs) / 60) : 0;
+  const promptSnippet = (typeof snippet === 'function') ? snippet(cp.prompt || '', 60) : (cp.prompt || '').slice(0, 60);
+  const hasDialog = typeof _phModalShow === 'function';
+
+  // 4.17 Codex SAFETY-3: both stops name the job this dialog describes. A
+  // confirmation left open while that job finished used to stop whatever
+  // started next; the server now refuses a stale id (409) and nothing stops.
+  const jobQ = cur.id ? ('?id=' + encodeURIComponent(cur.id)) : '';
+  const doHardStop = () => {
+    if (onStop) onStop();
+    api('/stop' + jobQ, 'POST').then(d => {
+      if (d && d.error) phosToast('That render already finished — nothing was stopped.', { kind: 'info' });
+      poll();
+    }).catch(e => { phosToast((e && e.message) || 'Could not stop.', { kind: 'danger' }); poll(); });
+  };
+  const doStopAfterPart = (label) => {
+    if (onStop) onStop();
+    fetch('/stop/after_part' + jobQ, { method: 'POST' }).then(r => r.json()).then(d => {
+      phosToast(d && d.ok
+        ? `Stopping after this ${label} — keeping everything already rendered.`
+        : ((d && d.error) || `Could not stop after this ${label}.`),
+        { kind: d && d.ok ? 'success' : 'danger', duration: 6000 });
+      poll();
+    }).catch(() => phosToast(`Could not stop after this ${label}.`, { kind: 'danger' }));
+  };
+
+  if ((isTake || isH3Chain) && hasDialog) {
+    const tp = isTake ? (cur.take_progress || {}) : progress;
+    const done = isTake ? (tp.part || 0) : Math.max(0, Number(progress.window || 1) - 1);
+    const total = isTake ? (tp.parts || (cp.take.parts && cp.take.parts.length) || 0)
+                          : Number(progress.window_total || 0);
+    const unit = isTake ? 'part' : 'window';
+    _phModalShow({
+      tone: 'danger', kicker: isTake ? 'Stop this One Shot?' : 'Stop this chained render?',
+      title: promptSnippet ? `Stop "${promptSnippet}"?` : 'Stop this render?',
+      body: (done > 0 ? `${unit === 'part' ? 'Part' : 'Window'} ${done} of ${total || '?'} is finishing. `
+                       : `The first ${unit} is still rendering. `)
+          + `Stop after this ${unit} keeps everything already rendered`
+          + (isTake ? ' and joins it into a shorter clip. ' : ' as a shorter clip. ')
+          + `Stop now throws away the ${unit} in progress too`
+          + (isH3Chain ? ' — and this engine may not be able to save anything at all mid-window.' : '.'),
+      primaryLabel: `Stop after this ${unit}`, onPrimary: () => doStopAfterPart(unit),
+      secondaryLabel: `Stop now (loses this ${unit})`, onSecondary: doHardStop,
+    });
+    return;
+  }
+  if (elapsedMin < 2) { doHardStop(); return; }
+  if (hasDialog) {
+    const mins = Math.max(1, Math.round(elapsedMin));
+    _phModalShow({
+      tone: 'danger', kicker: 'Stop this render?',
+      title: promptSnippet ? `Stop "${promptSnippet}"?` : 'Stop this render?',
+      body: `About ${mins} min of work will be lost, and the next render reloads the model from scratch.`,
+      primaryLabel: 'Stop', onPrimary: doHardStop,
+      secondaryLabel: 'Keep rendering',
+    });
+    return;
+  }
+  doHardStop();   // no dialog available — fail open rather than do nothing
+}
+
+// VC-06: Clear still empties the queue in one click (the label now says how
+// many, and it's disabled at zero), with Undo instead of asking first.
+// 4.17 Codex SAFETY-8/9/10: Undo restores what the SERVER removed — the
+// token /queue/clear returns — not this page's last poll. The poll could be
+// a second stale (a job the worker already started came back as a duplicate;
+// one another tab added was lost), and the old replay minted new ids, which
+// cut storyboard shots off from their restored jobs.
+function requestClearQueue() {
+  const queued = (LAST_STATUS && LAST_STATUS.queue) || [];
+  if (!queued.length) return;
+  api('/queue/clear', 'POST').then((d) => {
+    poll();
+    const n = Number((d && d.cleared) || 0);
+    const token = d && d.undo_token;
+    if (!n) return;
+    const el = phosToast(`Cleared ${n} queued render${n === 1 ? '' : 's'} (the running one continues)`,
+      { kind: 'success', duration: 8000 });
+    if (!el || !token) return;
+    const a = document.createElement('a');
+    a.href = '#'; a.className = 'phos-toast-action'; a.textContent = 'Undo';
+    a.onclick = async (ev) => {
+      ev.preventDefault(); el.remove();
+      try {
+        const r = await fetch('/queue/restore', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok || !d.ok) throw new Error((d && d.error) || ('HTTP ' + r.status));
+        const restored = (typeof d.restored === 'number') ? d.restored : n;
+        phosToast(`Restored ${restored} render${restored === 1 ? '' : 's'}`, { kind: 'success' });
+      } catch (e) {
+        phosToast('Could not restore the queue: ' + (e.message || e), { kind: 'danger', duration: 7000 });
+      }
+      poll();
+    };
+    el.appendChild(a);
+  });
+}
+
+// VA-17 / H3-11: the two ways back for a One Shot that stopped or failed
+// mid-chain, driven from the recovery bar's `data-path` (main.js's
+// delegated click handler reads it and calls these). "Resume" picks the
+// take back up from the next part; "Join what's done" publishes exactly
+// what finished as a shorter clip — never a false "the whole thing failed"
+// with no clip to show for it.
+async function takeResumeFromPath(path) {
+  if (!path) return;
+  const fd = new URLSearchParams(); fd.set('path', path);
+  let r;
+  try { r = await (await fetch('/take/resume', { method: 'POST', body: fd })).json(); }
+  catch (e) { r = { ok: false, error: String(e) }; }
+  if (!r || !r.ok) {
+    phosToast((r && r.error) || 'Could not resume this One Shot.', { kind: 'danger', duration: 7000 });
+    return;
+  }
+  phosToast(`Resuming from part ${(r.resumed_from_part || 0) + 1} of ${r.total_parts || '?'}`,
+    { kind: 'success', duration: 6000 });
+  poll();
+}
+async function takeJoinPartialFromPath(path) {
+  if (!path) return;
+  const fd = new URLSearchParams(); fd.set('path', path);
+  let r;
+  try { r = await (await fetch('/take/join_partial', { method: 'POST', body: fd })).json(); }
+  catch (e) { r = { ok: false, error: String(e) }; }
+  if (!r || !r.ok) {
+    phosToast((r && r.error) || 'Could not join what finished.', { kind: 'danger', duration: 7000 });
+    return;
+  }
+  phosToast(`Joined ${r.parts_joined} part${r.parts_joined === 1 ? '' : 's'} into one clip.`,
+    { kind: 'success', duration: 6000 });
+  currentOutputs = []; outputsCacheMutated([]); poll();
+}
+
 // The full lane (Remix → Upscale & Face Fix): presets, source picker, prompt.
 // Same hand-off shape as Extend: switch to the Remix tool, point the picker
 // at this clip, scroll the form to the top.
 function useAsUpscaleSourcePath(path) {
+  // VA-09: same fix as Extend above — switch tabs before the mode change,
+  // not after (or never).
+  if (typeof workflowSwitch === 'function') { try { workflowSwitch('manual'); } catch (e) {} }
   setMode('upscale');
   const inp = document.getElementById('upscale_source_path');
   if (inp) inp.value = path;
@@ -3903,11 +6159,29 @@ function _restoreLoraPicker(list, scaleV) {
   }
 }
 
-async function loadParams() {
-  if (!activePath) return;
-  const r = await fetch('/sidecar?path='+encodeURIComponent(activePath));
-  if (!r.ok) return;
-  const data = await r.json();
+// VC-03: what Load Params most recently restored into the Video form, for
+// the Generate-time duplicate check below. null until the first Load Params
+// of the session; stays set until the next one (a second Generate press on
+// an untouched form should still warn).
+let _loadedRecipeSnapshot = null;
+
+async function loadParams(recipe) {
+  // 4.17 Codex SAFETY-4: `recipe` ({params}) applies a QUEUED job's recipe
+  // with no sidecar fetch — editQueuedJob() restores through this one
+  // complete path (engine, H3 tier/speed/window prompts, LTX windows,
+  // steps, export method, keyframes, character, LoRAs) instead of its own
+  // short field list, which left the rest of the form as it was and let
+  // "Update job" turn an H3 job into an LTX one.
+  const _queueEdit = !!(recipe && recipe.params);
+  let data;
+  if (_queueEdit) {
+    data = recipe;
+  } else {
+    if (!activePath) return;
+    const r = await fetch('/sidecar?path='+encodeURIComponent(activePath));
+    if (!r.ok) return;
+    data = await r.json();
+  }
   const p = data.params;
   // Image-Studio sidecars (Ideogram 4 etc.) carry a TOP-LEVEL prompt that is a
   // structured caption JSON, not the video params shape below — the p.mode
@@ -3962,7 +6236,7 @@ async function loadParams() {
   // compose state instead of dumping the user into Manual. The sidecar
   // carries the source flag + the original compose chips verbatim
   // (character_id, framing, duration, prompt_body, quality_choice).
-  if (p && p.source === 'characters' && p.character_id) {
+  if (p && p.source === 'characters' && p.character_id && !_queueEdit) {
     try {
       await charactersLoadParams(p);
       return;
@@ -3992,7 +6266,17 @@ async function loadParams() {
     oneshotOpenFromParams(p);
     return;
   }
-  else if (p.mode === 'upscale') {
+  // VA-08: everything below here fills #genForm on the Video tab — upscale,
+  // extend, keyframe, i2v, character, t2v. Every branch ABOVE this point
+  // already switches to its own tab (Images, One Shot, Audio, Characters);
+  // nothing BELOW it did, so pressing Params from Audio/One Shot/Images left
+  // the form filled in behind a tab the user was still looking at, at 0
+  // height. Switch first, then scroll the pane to the top so the restored
+  // recipe is what's on screen, not whatever scroll position was left over.
+  if (typeof workflowSwitch === 'function') { try { workflowSwitch('manual'); } catch (e) {} }
+  const _lpPane = document.querySelector('aside.form-pane');
+  if (_lpPane) _lpPane.scrollTop = 0;
+  if (p.mode === 'upscale') {
     // Upscale & Face Fix reopens in its own lane on the same source clip with
     // the EXACT recipe that ran. A pill lights only when it names that recipe;
     // old sidecars (keep_shot only) match the pill with that strength.
@@ -4022,6 +6306,8 @@ async function loadParams() {
     }
     const sd = (p.seed_used != null) ? p.seed_used : p.seed;
     if (sd != null && sd !== '') document.getElementById('seed').value = sd;
+
+    if (typeof _syncSeedLockChip === 'function') { try { _syncSeedLockChip(); } catch (e) {} }
     _flashActionDone('loadParamsBtn', 'Loaded');
     return;
   }
@@ -4062,15 +6348,20 @@ async function loadParams() {
   // dropped its per-window prompts and invariants — the next Generate asked
   // for the whole length in one pass. The window text is always written, so
   // a native clip clears whatever an earlier windowed one left in the box.
-  const _winText = document.getElementById('window_prompts_text');
+  // VA-18: the per-window text now lives in dynamically rendered boxes
+  // (windowsDynamicSlots), built from an async /ltx/windows_plan fetch —
+  // there is no synchronous textarea to write into any more. Stash the
+  // restored array; _renderWindowsSlotsFromPlan consumes it (once) the
+  // next time it builds the boxes, which setTemporalMode('windows') below
+  // triggers once temporal_mode is actually 'windows' (windowPromptsInput
+  // itself is a no-op until then — see its own mode guard).
   const _winInv = document.getElementById('window_invariants');
   const _windowed = p.long_mode === 'windows';
-  if (_winText) {
-    _winText.value = (_windowed && Array.isArray(p.window_prompts))
-      ? p.window_prompts.map(x => String(x || '')).join('\n') : '';
+  if (typeof window !== 'undefined') {
+    window._pendingWindowPromptsRestore = (_windowed && Array.isArray(p.window_prompts))
+      ? p.window_prompts.map(x => String(x || '')) : null;
   }
   if (_winInv) _winInv.value = _windowed ? String(p.window_invariants || '') : '';
-  if (typeof windowPromptsInput === 'function') windowPromptsInput();
   if (_windowed) setTemporalMode('windows');
   else if (p.temporal_mode) setTemporalMode(p.temporal_mode);
   if (p.upscale) setUpscale(p.upscale);
@@ -4093,6 +6384,7 @@ async function loadParams() {
     : p.seed;
   if (seedToRestore != null) {
     document.getElementById('seed').value = seedToRestore;
+    if (typeof _syncSeedLockChip === 'function') { try { _syncSeedLockChip(); } catch (e) {} }
   }
   // Image / keyframes go through pickerSetImage so the preview tile
   // and recent-strip selection state update along with the hidden input.
@@ -4142,10 +6434,14 @@ async function loadParams() {
       }
     }
   }
-  if (p.image)       pickerSetImage('image', p.image, { snapAspect: false });
+  if (p.image) {
+    pickerSetImage('image', p.image, { snapAspect: false });
+    // The saved crop framing, not whatever the form last had (Codex H3-3).
+    _setCropFocus('image', _cropFocusFromParams(p));
+  }
   if (restoredStartImage) pickerSetImage('start_image', restoredStartImage, { snapAspect: false });
   if (restoredEndImage)   pickerSetImage('end_image', restoredEndImage, { snapAspect: false });
-  if (p.audio) document.getElementById('audio').value = p.audio;
+  if (p.audio) i2vAudioSet(p.audio);
   // Extend-specific: restore the WHOLE request, not just the source path.
   // Duration, direction, sampler depth and CFG were all saved to the sidecar
   // and never read back — a Load Params + Generate on an Extend silently
@@ -4291,10 +6587,26 @@ async function loadParams() {
   // after the tier so the tier can't clobber the seed we just loaded.
   const _seedBefore = (document.getElementById('seed') || {}).value;
   const _eng = String((p && p.engine) || (data && data.engine) || 'ltx').toLowerCase();
+  // H3-21: setEngine() refuses to hand back an engine the machine can't
+  // serve (same gate h3FinishActive() checks) and silently lands on the
+  // fallback instead — so loading an H3 clip's params on a Mac without H3
+  // used to swap to LTX with no explanation: the image mode, aspect and
+  // dims all changed under the user's H3-format prompt, and nothing said
+  // why. Read what setEngine() actually landed on and tell the user when
+  // it disagrees with what the clip was made with.
+  let _engLanded = _eng;
   if (typeof setEngine === 'function' && typeof engineById === 'function' && engineById(_eng)) {
-    try { setEngine(_eng, { persist: false }); } catch (e) {}
+    try { _engLanded = setEngine(_eng, { persist: false }) || _eng; } catch (e) {}
   }
-  if (_eng === 'h3') {
+  if (_eng === 'h3' && _engLanded !== 'h3') {
+    if (typeof phosToast === 'function') {
+      const note = (document.getElementById('engineRowNote') || {}).textContent || '';
+      phosToast('This clip was made with Hailuo H3. ' + (note
+        || 'H3 isn\'t available on this Mac, so it loaded into LTX instead — the prompt is H3-format and the shape won\'t match.'),
+        { kind: 'danger', duration: 8000 });
+    }
+  }
+  if (_engLanded === 'h3') {
     if (typeof setH3Upscale === 'function' && p.h3_upscale) {
       try { setH3Upscale(p.h3_upscale); } catch (e) {}
     }
@@ -4354,6 +6666,19 @@ async function loadParams() {
 
   updateCustomizeSummary();
   updateDerived();
+  if (_queueEdit) return;     // a queued job is not a clip: no duplicate guard, no flash
+  // VC-03's third half: if Generate is pressed with nothing changed from
+  // what Load Params just restored, it would render the identical clip a
+  // second time. Snapshot what got loaded so the submit handler can compare
+  // against it — see _duplicateOfLoadedRecipe / genForm's submit listener.
+  _loadedRecipeSnapshot = {
+    path: activePath, name: (activePath || '').split('/').pop(),
+    prompt: p.prompt || '', seed: String(seedToRestore != null ? seedToRestore : ''),
+    width: String(p.width || ''), height: String(p.height || ''),
+    quality: p.quality || '',
+    loras: (Array.isArray(p.loras) ? p.loras : [])
+      .map(l => (l && l.path) + '@' + (l && l.strength)).sort().join(','),
+  };
   // Say it out loud. This whole function ran silently before — the form
   // changed somewhere off-screen and the click read as a dead button.
   _flashActionDone('loadParamsBtn', 'Loaded');
@@ -4516,8 +6841,28 @@ function renderOutputInfoBody(path, data) {
   // Compose the dimensions + duration into a single "Format" line — fewer
   // grid rows, easier to scan. We separate technical metadata (Format,
   // Frames) from generation parameters (Mode, Quality, Seed, Steps).
+  //
+  // VC-19: this used to be p.width x p.height alone — the RENDER canvas,
+  // not the file actually delivered to disk. Balanced's default 720p-fit
+  // export (or any upscale) changes the two, so a 1024x576 render that
+  // fit-exported to 1280x720 reported "Format 1024 x 576" for a file that
+  // opens at 1280x720. /sidecar now probes the real file (routes_files.py)
+  // and attaches actual_width/actual_height; when those disagree with the
+  // render params, say both, delivered first (the number that matters to
+  // whoever's about to use the file) with the render size as context.
   const formatBits = [];
-  if (p.width && p.height) formatBits.push(`${p.width} × ${p.height}`);
+  const _upscaleNote = { fit_720p: '720p fit', x2: '×2 upscale' }[p.upscale];
+  if (data.actual_width && data.actual_height) {
+    if (p.width && p.height
+        && (data.actual_width !== p.width || data.actual_height !== p.height)) {
+      formatBits.push(`Delivered ${data.actual_width} × ${data.actual_height} `
+        + `(rendered ${p.width} × ${p.height}${_upscaleNote ? ', ' + _upscaleNote : ''})`);
+    } else {
+      formatBits.push(`${data.actual_width} × ${data.actual_height}`);
+    }
+  } else if (p.width && p.height) {
+    formatBits.push(`${p.width} × ${p.height}`);
+  }
   if (data.video_duration_sec != null) formatBits.push(`${data.video_duration_sec.toFixed(2)} s @ ${data.fps || 24} fps`);
 
   let html = '';
@@ -4598,10 +6943,15 @@ function renderOutputInfoBody(path, data) {
       const applied = tinfo && tinfo.applied && tinfo.applied.applied;
       genRows.push(`<dt>Turbo</dt><dd>on · ${escapeHtml(String(p.steps || 4))}-step `
         + `distill LoRA${applied ? ' · ' + escapeHtml(String(applied)) + ' modules applied' : ''}</dd>`);
-    } else if (Number(p.h3_steps || 0) > 0) {
-      // Steps only earns a row when the user pinned a depth — the tier default
-      // is already implied by the tier row.
-      genRows.push(`<dt>Steps</dt><dd>${escapeHtml(String(p.steps || p.h3_steps))} · tier default overridden</dd>`);
+    } else {
+      // H3-04: a Best clip fell through with NO Speed row at all — only
+      // Fast (tristep) and the retired Turbo earned one, so "what speed
+      // was this rendered at" was answerable for some clips and not
+      // others. Best earns the same row every other speed gets.
+      genRows.push(`<dt>Speed</dt><dd>Best · this shape's full sampler`
+        + (Number(p.h3_steps || 0) > 0
+          ? ` · ${escapeHtml(String(p.steps || p.h3_steps))} steps · tier default overridden`
+          : '') + '</dd>');
     }
   } else {
     genRows.push(`<dt>Quality</dt><dd>${escapeHtml((p.quality || 'standard').replace(/^./, c => c.toUpperCase()))}</dd>`);
@@ -4759,6 +7109,75 @@ function renderOutputInfoBody(path, data) {
 }
 
 async function removeJob(id) { await fetch('/queue/remove?id='+encodeURIComponent(id),{method:'POST'}); poll(); }
+
+// VC-26: reorder — plain up/down (the review's own alternative to drag).
+async function reorderQueuedJob(id, direction) {
+  const fd = new URLSearchParams();
+  fd.set('id', id); fd.set('direction', direction);
+  let r;
+  try { r = await (await fetch('/queue/reorder', { method: 'POST', body: fd })).json(); }
+  catch (e) { r = { ok: false, error: String(e) }; }
+  if (!r || !r.ok) { phosToast((r && r.error) || 'Could not reorder the queue.', { kind: 'danger' }); return; }
+  try { poll(); } catch (e) {}
+}
+
+// VC-26: "Click a row to load it into the form and Update job." Restores
+// the plain video modes (t2v/i2v/i2v_clean_audio/extend/keyframe) from the
+// job's OWN params, already in memory via LAST_STATUS — there is no
+// rendered file yet for a queued job, so they go through loadParams(recipe)
+// rather than its sidecar fetch. Anything editQueuedJob's own row-template
+// gate (`editable` in the queue render above) didn't already exclude gets
+// a graceful refusal here too, belt and braces.
+let _editingQueuedJobId = null;
+const _EDITABLE_QUEUE_MODES = ['t2v', 'i2v', 'i2v_clean_audio', 'extend', 'keyframe'];
+async function editQueuedJob(jobId) {
+  const job = ((typeof LAST_STATUS !== 'undefined' && LAST_STATUS && LAST_STATUS.queue) || [])
+    .find(j => j.id === jobId);
+  if (!job) { phosToast('That job is no longer queued.', {}); return; }
+  const p = job.params || {};
+  if (p.take || p.engine === 'music' || !_EDITABLE_QUEUE_MODES.includes(p.mode)) {
+    phosToast('This job type can’t be edited inline yet — remove it and queue a new one.', {});
+    return;
+  }
+  // SAFETY-4: the WHOLE recipe, through Load Params' own setters (engine
+  // first, then its surface) — see loadParams(recipe). "Update job" posts
+  // the full form, so anything not restored here would be replaced by
+  // whatever the form happened to hold.
+  _editingQueuedJobId = null;
+  try {
+    await loadParams({ params: Object.assign({}, p), engine: p.engine });
+  } catch (e) {
+    phosToast('Could not load that job into the form: ' + ((e && e.message) || e), { kind: 'danger' });
+    return;
+  }
+  _editingQueuedJobId = jobId;
+  const banner = document.getElementById('queueEditBanner');
+  if (banner) banner.hidden = false;
+  const formPane = document.querySelector('aside.form-pane');
+  if (formPane) formPane.scrollTop = 0;
+  phosToast('Editing queued job — change fields, then Update job.', { duration: 4000 });
+}
+function cancelEditingQueuedJob() {
+  _editingQueuedJobId = null;
+  const banner = document.getElementById('queueEditBanner');
+  if (banner) banner.hidden = true;
+}
+async function updateQueuedJob() {
+  if (!_editingQueuedJobId) return;
+  const form = document.getElementById('genForm');
+  const fd = new FormData(form);
+  fd.set('id', _editingQueuedJobId);
+  let r;
+  try { r = await (await fetch('/queue/update', { method: 'POST', body: fd })).json(); }
+  catch (e) { r = { ok: false, error: String(e) }; }
+  if (!r || !r.ok) {
+    phosToast((r && r.error) || 'Could not update the job.', { kind: 'danger', duration: 7000 });
+    return;
+  }
+  phosToast('Queued job updated.', { kind: 'success' });
+  cancelEditingQueuedJob();
+  try { poll(); } catch (e) {}
+}
 async function togglePause() {
   const s = await (await fetch('/status')).json();
   await api(s.paused ? '/queue/resume' : '/queue/pause', 'POST');
@@ -4980,6 +7399,61 @@ async function queueBatch() {
   sync();
 })();
 
+// VC-03: "if prompt + seed + size + quality + LoRAs equal an existing
+// output's sidecar, ask." Scoped to the clip Load Params most recently
+// restored (_loadedRecipeSnapshot) rather than scanning the whole gallery —
+// that covers the actual repro (Params, then Generate with nothing
+// changed) at the cost of a full-outputs comparison, which would mean a
+// server round trip on every keystroke-adjacent Generate click for a
+// gallery that can run into the thousands.
+function _duplicateOfLoadedRecipe() {
+  const snap = _loadedRecipeSnapshot;
+  if (!snap) return null;
+  const seedEl = document.getElementById('seed');
+  const seed = seedEl ? String(seedEl.value || '') : '';
+  if (!seed || seed === '-1') return null;    // a random-seed render is never "the same clip"
+  const promptEl = document.getElementById('prompt');
+  const prompt = promptEl ? (promptEl.value || '') : '';
+  const widthEl = document.getElementById('width');
+  const heightEl = document.getElementById('height');
+  const qualityEl = document.getElementById('quality');
+  const loras = (typeof _activeLoras !== 'undefined' && Array.isArray(_activeLoras) ? _activeLoras : [])
+    .map(l => (l && l.path) + '@' + (l && l.strength)).sort().join(',');
+  const same = prompt === snap.prompt && seed === snap.seed
+    && String((widthEl && widthEl.value) || '') === snap.width
+    && String((heightEl && heightEl.value) || '') === snap.height
+    && String((qualityEl && qualityEl.value) || '') === snap.quality
+    && loras === snap.loras;
+  return same ? snap : null;
+}
+
+// A submit-button click's default action IS submitting the form — cancel
+// that (not the form's 'submit' handler below, which is too late to swap in
+// an async dialog cleanly) and let the dialog's own choice decide whether to
+// call requestSubmit(), which fires 'submit' directly and does not re-run
+// this click listener.
+(function () {
+  const btn = document.getElementById('genBtn');
+  const form = document.getElementById('genForm');
+  if (!btn || !form) return;
+  btn.addEventListener('click', (ev) => {
+    const dup = _duplicateOfLoadedRecipe();
+    if (!dup || typeof _phModalShow !== 'function') return;
+    ev.preventDefault();
+    _phModalShow({
+      tone: 'danger', kicker: 'Same clip again?',
+      title: `This will render the same clip as ${dup.name}`,
+      body: 'The prompt, seed, size, quality and LoRAs all match. Render a new '
+          + 'take uses the same recipe with a fresh seed; Generate anyway repeats '
+          + 'this exact clip.',
+      primaryLabel: 'Render a new take',
+      onPrimary: () => newTakeFromPath(dup.path, { btnId: 'genBtn' }),
+      secondaryLabel: 'Generate anyway',
+      onSecondary: () => { try { form.requestSubmit(); } catch (e) { form.submit(); } },
+    });
+  });
+})();
+
 // ====== Form submit ======
 //
 // "No music" toggle: appends a clear audio constraint to the prompt
@@ -4993,6 +7467,19 @@ async function queueBatch() {
 document.getElementById('genForm').addEventListener('submit', async e => {
   e.preventDefault();
   const fd = new FormData(e.target);
+
+  // VC-15: a non-empty Avoid box on a quality that ignores it (distilled
+  // Quick/Balanced/Standard) submits fine and produces exactly the clip the
+  // "forbidden" content still appears in — the render isn't wrong, the
+  // expectation set by the box was. One toast, not a block: the user may
+  // know exactly what they're doing (leftover text from a High render, say)
+  // and Generate must not gain a second confirmation step for that.
+  if ((fd.get('negative_prompt') || '').toString().trim()
+      && typeof avoidIsIgnored === 'function' && avoidIsIgnored()
+      && typeof phosToast === 'function') {
+    phosToast('Avoid is ignored at this quality — it will not affect this render.',
+              { kind: 'warn', duration: 6000 });
+  }
 
   // ---- engine payload scrub ------------------------------------------------
   // The fold rules hide an LTX-only control on H3; they do not empty the hidden
@@ -5322,6 +7809,29 @@ document.getElementById('genForm').addEventListener('submit', async e => {
       }
     }
     await api('/queue/add','POST',fd);
+  } catch (e) {
+    // 4.17 Codex EST-10: the server REFUSED this render and said why (an
+    // Extend asking for a Face Fix follow-up this Mac can't run). That is
+    // not "offline" — show its sentence, and for a missing download offer
+    // the place to get it, before anything renders.
+    if (e && e.status) {
+      const shown = (e.code === 'pack_missing' && typeof _phModalShow === 'function'
+                     && typeof openModelsModal === 'function')
+        && _phModalShow({ kicker: 'Needs a download', title: 'Not queued',
+                          body: e.message, primaryLabel: 'Open Models',
+                          onPrimary: () => openModelsModal(), secondaryLabel: 'Not now' });
+      if (!shown) phosToast(e.message, { kind: 'danger', duration: 0 });
+      return;
+    }
+    // SYS-10a: this used to be uncaught. If the panel is offline (server
+    // unreachable, Pinokio stopped, a crash) `api()`'s underlying fetch
+    // throws "Failed to fetch" here, and with no catch it surfaced as
+    // nothing a user could see — Generate just silently did nothing, no
+    // toast, Now still said Idle. The prompt is never lost (the form isn't
+    // cleared on failure), so this is safe to just say and let them retry.
+    phosToast("Couldn't reach Phosphene — it may be offline or restarting. "
+      + 'Your prompt is still here; try again once it reconnects.',
+      { kind: 'danger', duration: 0 });
   } finally {
     // Re-enable on the next event-loop tick so the button visibly
     // bounces rather than feeling "stuck on click". poll() refreshes
@@ -5332,28 +7842,200 @@ document.getElementById('genForm').addEventListener('submit', async e => {
 });
 
 
+// ---- Video form draft autosave (VC-38) -------------------------------------
+//
+// A reload, or the restart every Pinokio Update asks for, used to wipe the
+// prompt and every setting — reload.py's own finding: `after reload prompt=
+// ''`. Autosaves the Video tab's form to this browser's localStorage (never
+// sent anywhere) so either one comes back to what was there before, not a
+// blank form. Every access is try/catch'd — a private window, blocked site
+// data, or a bad JSON blob degrades to "no draft" rather than a thrown error
+// that would take the rest of boot down with it.
+const DRAFT_LS_KEY = 'phos_video_draft_v1';
+
+function _draftSnapshot() {
+  const val = (id) => { const el = document.getElementById(id); return el ? el.value : undefined; };
+  return {
+    v: 1,
+    mode: val('mode'),
+    quality: val('quality'),
+    prompt: val('prompt'),
+    negative_prompt: val('negative_prompt'),
+    seed: val('seed'),
+    width: val('width'),
+    height: val('height'),
+    frames: val('frames'),
+    duration: val('duration'),
+    // 4.17 Codex SAFETY-13: the mode's own inputs. The draft restored an
+    // Image/Keyframe/Extend mode with its source slots empty, so Generate
+    // failed until the user rebuilt the inputs the toast said were restored.
+    i2v_mode: val('i2vMode'),
+    image: val('image'),
+    audio: val('audio'),
+    video_path: val('video_path'),
+    start_image: val('start_image'),
+    end_image: val('end_image'),
+    loras: (typeof _activeLoras !== 'undefined' && Array.isArray(_activeLoras))
+      ? _activeLoras.map(l => ({ path: l.path, strength: l.strength })) : [],
+  };
+}
+// SAFETY-13: a source path from a draft may be gone since; images validate
+// in the picker itself (pickerSetImage's /image 404 check), audio and the
+// Extend source ask /file/exists and are cleared out loud, never kept dead.
+async function _draftDropIfMissing(path, stillSet, clear, what) {
+  let d = null;
+  try { d = await (await fetch('/file/exists?path=' + encodeURIComponent(path))).json(); }
+  catch (e) { return; }
+  if (!d || d.exists !== false || !stillSet()) return;
+  clear();
+  const name = String(path).split('/').pop();
+  phosToast(`${name} from your draft is no longer on disk — pick the ${what} again.`, { kind: 'warning' });
+}
+function saveDraftNow() {
+  try {
+    const snap = _draftSnapshot();
+    // An empty prompt with nothing else interesting isn't worth a write —
+    // avoids overwriting a real saved draft with the blank state the form
+    // is in for the first second or two of every fresh boot.
+    if (!snap.prompt && !snap.negative_prompt && (!snap.loras || !snap.loras.length)) return;
+    localStorage.setItem(DRAFT_LS_KEY, JSON.stringify(snap));
+  } catch (e) { /* private window / storage blocked — draft just doesn't persist */ }
+}
+let _draftSaveTimer = null;
+function _draftSaveDebounced() {
+  if (_draftSaveTimer) clearTimeout(_draftSaveTimer);
+  _draftSaveTimer = setTimeout(saveDraftNow, 500);
+}
+function restoreDraftOnBoot() {
+  // Only on a genuinely fresh form — never stomps a clip already loaded via
+  // a deep link, an agent-driven Load Params, or anything else that ran
+  // before this (boot order keeps this call early, but "never" is cheaper
+  // to guarantee than "usually").
+  const promptEl = document.getElementById('prompt');
+  if (!promptEl || promptEl.value || (typeof activePath !== 'undefined' && activePath)) return;
+  let snap = null;
+  try {
+    const raw = localStorage.getItem(DRAFT_LS_KEY);
+    if (raw) snap = JSON.parse(raw);
+  } catch (e) { snap = null; }
+  if (!snap || (!snap.prompt && !snap.negative_prompt)) return;
+  try {
+    const videoModes = ['t2v', 'i2v', 'i2v_clean_audio', 'extend', 'keyframe', 'character'];
+    if (snap.mode && videoModes.includes(snap.mode) && typeof setMode === 'function') {
+      setMode(snap.mode === 'i2v_clean_audio' ? 'i2v' : snap.mode);
+      // The With-your-audio sub-mode rides the same field Load Params sets.
+      const sub = snap.mode === 'i2v_clean_audio' ? 'i2v_clean_audio' : snap.i2v_mode;
+      if ((snap.mode === 'i2v' || snap.mode === 'i2v_clean_audio')
+          && (sub === 'i2v' || sub === 'i2v_clean_audio')) {
+        const im = document.getElementById('i2vMode'); if (im) im.value = sub;
+        const m = document.getElementById('mode'); if (m) m.value = sub;
+      }
+    }
+    if (snap.quality && typeof setQuality === 'function') setQuality(snap.quality);
+    const setVal = (id, v) => { const el = document.getElementById(id); if (el && v !== undefined && v !== '') el.value = v; };
+    setVal('width', snap.width); setVal('height', snap.height);
+    setVal('frames', snap.frames); setVal('duration', snap.duration);
+    setVal('prompt', snap.prompt); setVal('negative_prompt', snap.negative_prompt);
+    setVal('seed', snap.seed);
+    // SAFETY-13: the source inputs, AFTER the dims (no aspect snap — the
+    // saved width/height already are what the user had).
+    if (typeof pickerSetImage === 'function') {
+      for (const key of ['image', 'start_image', 'end_image']) {
+        if (snap[key]) pickerSetImage(key, snap[key], { snapAspect: false });
+      }
+    }
+    if (snap.audio && typeof i2vAudioSet === 'function') {
+      i2vAudioSet(snap.audio);
+      _draftDropIfMissing(snap.audio,
+        () => (document.getElementById('audio') || {}).value === snap.audio,
+        () => i2vAudioSet(''), 'audio');
+    }
+    if (snap.video_path) {
+      setVal('video_path', snap.video_path);
+      setVal('extendSrcSelect', snap.video_path);
+      _draftDropIfMissing(snap.video_path,
+        () => (document.getElementById('video_path') || {}).value === snap.video_path,
+        () => { const v = document.getElementById('video_path'); if (v) v.value = '';
+                const sel = document.getElementById('extendSrcSelect'); if (sel) sel.value = '';
+                if (typeof updateDerived === 'function') { try { updateDerived(); } catch (e) {} } },
+        'clip to extend');
+    }
+    if (Array.isArray(snap.loras) && snap.loras.length && typeof _restoreLoraPicker === 'function') {
+      _restoreLoraPicker(snap.loras);
+    }
+    if (typeof syncAvoidRowFromValue === 'function') { try { syncAvoidRowFromValue(); } catch (e) {} }
+    if (typeof _syncSeedLockChip === 'function') { try { _syncSeedLockChip(); } catch (e) {} }
+    if (typeof updateCustomizeSummary === 'function') { try { updateCustomizeSummary(); } catch (e) {} }
+    if (typeof updateDerived === 'function') { try { updateDerived(); } catch (e) {} }
+    phosToast('Restored your draft prompt and settings from last time.', { kind: 'success', duration: 5000 });
+  } catch (e) { /* a half-applied restore is still better than a thrown boot */ }
+}
+function clearDraftForm() {
+  const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+  setVal('prompt', ''); setVal('negative_prompt', ''); setVal('seed', '-1');
+  if (typeof syncAvoidRowFromValue === 'function') { try { syncAvoidRowFromValue(); } catch (e) {} }
+  if (typeof _syncSeedLockChip === 'function') { try { _syncSeedLockChip(); } catch (e) {} }
+  if (typeof updateDerived === 'function') { try { updateDerived(); } catch (e) {} }
+  try { localStorage.removeItem(DRAFT_LS_KEY); } catch (e) {}
+  phosToast('Form cleared.', {});
+}
+function draftAutosaveInstall() {
+  const form = document.getElementById('genForm');
+  if (!form) return;
+  form.addEventListener('input', _draftSaveDebounced);
+  form.addEventListener('change', _draftSaveDebounced);
+  // Catches mode/quality/LoRA changes made by clicking a pill rather than
+  // typing — those don't fire on #genForm's own input/change, and hunting
+  // down every pill's click handler to hook individually is exactly the
+  // fragile coupling a plain interval avoids.
+  setInterval(saveDraftNow, 4000);
+  window.addEventListener('beforeunload', saveDraftNow);
+}
+
 // ---- published to the page --------------------------------------------------
 // Inline handlers in the markup and the other files resolve these through
 // the global scope; everything NOT listed here is private to this module.
 Object.assign(globalThis, {
   notifyJobsDone, notifyOneJob, playDoneChime,
   h3FinishSetTier, h3FinishActive, setEngine, _syncEnginePromptTools,
+  ltxFinishSetTier, ltxFinishActive, _syncFinishAffordance,
+  ltxFinishTargets, ltxFinishTierKey, ltxFinishFieldsFromSidecar, ltxTierByKeyExact,
   currentEngine, _syncEngineForMode, openH3InstallCard, closeH3InstallCard,
-  enhancePrompt, applyAspect, applyQuality, updateDerived,
+  enhancePrompt, applyAspect, applyQuality, updateDerived, updateDerivedForClampedMode, keyframePriceFor,
+  _aspectDims, refreshPickerCropOverlays, refreshExtendClampNote, _setCropFocus, _cropFocusFromParams,
   pickerSetImage, pickerUploadFile, pickerWire, refreshUploadsStrip,
   refreshIngredientRecent, ingredientPickerWire, fmtMin, snippet,
   escapeHtml, api, _setOfflineBanner, startDeepVerify,
+  applyFirstRunCard, dismissFirstRunCard, useFirstRunPrompt, scrollToShotSetup,
   friendlyJobError, poll, applyPackIncompleteGate, setRecentFilter,
+  avoidIsIgnored, updateAvoidIgnoredState,
   retryJob, renderCarousel, findOutputByPath, stageMayAutoSelectOutput,
   setStageAspect, clearStageAspect, fitStagePlayer, initStagePlayerFit,
   selectOutput, openExpandLightbox, closeExpandLightbox, phosToast,
-  animateActive, hide, openOutputsFolder, hideActive,
+  animateActive, hide, unhide, openOutputsFolder, hideActive,
   useAsExtendSource, useAsUpscaleSource, useAsUpscaleSourcePath, setUpscalePreset,
   faceFixClip, faceFixActive, isUpscaledPath, loadParams, _flashActionDone, closeOutputInfoModal,
+  queueSharpExport, sharpExportActive, useLastFramePath, useLastFrameActive,
+  revealClipInFinder, revealActive, openClipInEditor, openActiveInEditor, kebabToggle,
+  reorderQueuedJob, editQueuedJob, cancelEditingQueuedJob, updateQueuedJob, fmtEtaCompact,
+  showEnhancePanel, acceptEnhance, undoEnhance, keepMineEnhance,
+  updateLangHint, promptLooksNonLatin,
+  newTakeFromPath, newTakeActive, requestStop, requestClearQueue, toggleHiddenFilter,
+  _syncSeedLockChip, clearSeedLock,
+  clearDraftForm, draftAutosaveInstall, restoreDraftOnBoot, saveDraftNow,
+  takeResumeFromPath, takeJoinPartialFromPath,
   togglePause, openBatch, closeBatch, queueBatch,
   setBatchMode, setBatchTakes, updateBatchSummary, batchPrompts, batchMainPrompt,
   // inline-handler targets: generated markup resolves these through the
   // global scope (the v4.9.0 regression, PR #69)
   _copyToClipboard, animateFromPhoto, deleteOutput, openOutputInfoModal,
   remakeInQuality, remakeQualityEngine, removeJob, repairModel,
+  // VA-20: the mux audio slot's own "Remove" link.
+  i2vAudioSet, i2vAudioRenderSlot,
+  // "Continue the song" — the player button's inline onclick target.
+  continueSongFromClip,
+  // "Retake a moment" (VA-26) — the player button + modal's inline onclick targets.
+  openRetakeModal, closeRetakeModal, submitRetake,
+  // "Continue from here" (VA-38) — the player button's inline onclick target.
+  windowsContinueFromPartial,
 });

@@ -14,6 +14,68 @@ from panel.routes import get, get_when, post, post_when
 P = None  # the running mlx_ltx_panel module; assigned at wiring time
 
 
+# Codex UI-6: the crash-report filter (SYS-12) matched on the FILE NAME —
+# "python3*" / "python*" / "phosphene*" — so any other Python program that
+# crashed on the Mac (another app's script, a notebook kernel, a CLI tool)
+# was counted in the modal and zipped verbatim into a Phosphene bug report,
+# its own paths and content included. A name says which interpreter
+# crashed, not whose process it was. The reliable signal is inside the
+# report: an .ips body lists `procPath` and every loaded image
+# (`usedImages[].path`), and a Phosphene process always runs a binary or
+# loads extension modules (mlx, the engines' venvs) from under this
+# install. A report that shows nothing under these roots is ambiguous and
+# is left out — the opt-in checkbox never attaches it.
+_CRASH_NAME_PREFIXES = ("python3", "python", "phosphene")
+_CRASH_MAX_READ_BYTES = 32 * 1024 * 1024
+
+
+def _phosphene_crash_roots() -> tuple[str, ...]:
+    roots: set[str] = set()
+    for name in ("ROOT", "H3_ROOT", "LORA_LAB_ROOT"):
+        base = getattr(P, name, None)
+        if not base:
+            continue
+        for cand in (P.Path(base), P.Path(base) / "ltx-2-mlx"):
+            for form in (cand, cand.resolve() if cand.exists() else None):
+                if form is not None and str(form) not in ("", "/"):
+                    roots.add(str(form).rstrip("/") + "/")
+    return tuple(sorted(roots))
+
+
+def _is_phosphene_crash(path, roots: tuple[str, ...]) -> bool:
+    """True only when the .ips shows a process of THIS install."""
+    try:
+        if path.stat().st_size > _CRASH_MAX_READ_BYTES:
+            return False
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    _header, _, body = text.partition("\n")
+    try:
+        doc = P.json.loads(body)
+    except ValueError:
+        return False
+    if not isinstance(doc, dict):
+        return False
+    paths = [doc.get("procPath")]
+    images = doc.get("usedImages")
+    if isinstance(images, list):
+        paths.extend(i.get("path") for i in images if isinstance(i, dict))
+    return any(isinstance(p, str) and p.startswith(roots) for p in paths)
+
+
+def _phosphene_crash_reports(diag) -> list:
+    """This install's own crash reports in `diag`, newest first."""
+    roots = _phosphene_crash_roots()
+    if not roots:
+        return []
+    cands = [p for p in diag.iterdir()
+             if p.is_file() and p.suffix.lower() == ".ips"
+             and p.name.lower().startswith(_CRASH_NAME_PREFIXES)]
+    cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return [p for p in cands if _is_phosphene_crash(p, roots)]
+
+
 @get("/sw.js")
 def get_service_worker(h, parsed) -> None:
     """The push service worker, served from the ROOT so its scope covers the
@@ -165,16 +227,25 @@ def get_panel_bug_context(h, parsed) -> None:
         ram_gb = round(float(mem.get("total_gb") or 0.0))
         with P.LOCK:
             tail = list(P.STATE["log"])[-50:]
+        # SYS-12, privacy: this pre-fills the bug-report textarea that
+        # opens a PUBLIC GitHub issue. Log lines routinely carry
+        # /Users/<username>/... paths (panel_uploads, output paths), and
+        # the macOS username is often the person's real name. Scrub before
+        # it ever reaches the browser, not after.
+        tail = [P._bug_report_scrub_line(line) for line in tail]
         # Crash count — the modal hides the "Include crash reports"
         # checkbox when zero so the user doesn't see an empty zip.
+        # SYS-12: counted every .ips on the Mac, regardless of which process
+        # crashed — mismatched what /panel/bug-report actually zips (now
+        # filtered to python3*/Python*/phosphene*; see there). Same filter
+        # here so the modal's count matches what "Include crash reports"
+        # would actually attach.
         crash_count = 0
         try:
             diag = P.Path.home() / "Library" / "Logs" / "DiagnosticReports"
             if diag.is_dir():
-                crash_count = sum(
-                    1 for p in diag.iterdir()
-                    if p.is_file() and p.suffix.lower() == ".ips"
-                )
+                # UI-6: the SAME positive-identification filter the zip uses.
+                crash_count = len(_phosphene_crash_reports(diag))
         except OSError:
             pass
         h._json({
@@ -734,15 +805,19 @@ def post_panel_bug_report(h, path, qs, ctype) -> None:
             # method and break the bundle endpoint.
             diag = P.Path.home() / "Library" / "Logs" / "DiagnosticReports"
             if diag.is_dir():
-                # Latest 5 ips files (any process; .ips is the only
-                # universal extension across crash sources). Sorted
-                # by mtime descending.
-                ips = sorted(
-                    (p for p in diag.iterdir()
-                     if p.is_file() and p.suffix.lower() == ".ips"),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )[:5]
+                # SYS-12: this used to take the latest 5 .ips from ANY
+                # process on the Mac — Safari, Mail, a game, whatever last
+                # crashed — and zip it into a Phosphene bug report. The
+                # panel's own crashes are always "python3*" or "Python*"
+                # (see the watchdog error copy: python3.11_*.ips), so
+                # filter to those; an unrelated app's crash tells the
+                # Phosphene maintainer nothing and is a real, unnecessary
+                # privacy cost for the reporter (another app's crash log
+                # can carry its own paths/content, unrelated to this bug).
+                # UI-6: ...and a "python*" name alone is not Phosphene —
+                # _phosphene_crash_reports() reads each report and keeps
+                # only the ones whose process ran from this install.
+                ips = _phosphene_crash_reports(diag)[:5]
                 if ips:
                     # 2026-05-31 review fix: crash .ips files can carry
                     # home paths / usernames. The old predictable

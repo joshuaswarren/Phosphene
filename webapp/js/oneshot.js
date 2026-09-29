@@ -10,9 +10,29 @@
 //
 // Publish block at the bottom: what the page and the other modules call.
 
+// VA-15: 60 s (~28 min at 6 parts) used to be the default a first-time user
+// hit on typing a paragraph and pressing Generate, with no price shown
+// anywhere near the button. 30 s (3 parts, ~15 min) is the owner's own
+// sample length (ltx_oneshot_aliens...) and about half the commitment.
+const OS_SECONDS_LS_KEY = 'phos_oneshot_seconds';
+function _osStoredSeconds() {
+  try {
+    const v = parseInt(localStorage.getItem(OS_SECONDS_LS_KEY) || '', 10);
+    return OS_SECONDS.includes(v) ? v : 30;
+  } catch (e) { return 30; }
+}
+// The browser's remembered length, applied ONCE per page — on first wire, or
+// earlier when Load Params opens a saved take first (LIPSYNC-8: osWire used to
+// apply it AFTER oneshotOpenFromParams had restored the take's own length, so
+// a 90 s take reopened on first visit came back as 30 s).
+function _osApplyStoredPrefs() {
+  if (OS.prefsApplied) return;
+  OS.prefsApplied = true;
+  OS.seconds = _osStoredSeconds();
+}
 const OS = {
   engine: 'ltx',
-  seconds: 60,
+  seconds: 30,
   quality: { ltx: 'balanced', h3: 'standard', character: 'pro' },
   character: '',
   image: '',
@@ -26,7 +46,9 @@ const OS = {
   statusTimer: null,
   estimateSeq: 0,
   wired: false,
+  prefsApplied: false,  // _osApplyStoredPrefs ran (stored length never overrides a restored take)
   lastSubmitted: null,
+  lastEta: '',          // VA-15: bare "N min" from the last /oneshot/estimate, for the footer
 };
 
 const OS_SECONDS = [30, 45, 60, 90, 120];
@@ -274,8 +296,13 @@ function osRenderSummary() {
   const who = (OS.engine === 'ltx' && OS.character)
     ? (((OS.options || {}).characters || []).find(c => c.id === OS.character) || {}).name || OS.character
     : '';
+  // VA-15: the price used to live only in the composer card above (#osEstimate),
+  // out of sight once the user scrolls to Generate. The footer next to the
+  // button now carries it too, so nobody commits to a render without seeing
+  // the time right beside the button that starts it.
+  const priceBit = OS.lastEta ? ` · about ${OS.lastEta}` : '';
   el.innerHTML = `<strong>${osLengthLabel(OS.seconds)}</strong> · ${osPartsText(OS.seconds)}`
-    + ` · ${OS.engine === 'h3' ? 'Hailuo H3' : 'LTX 2.5'}${who ? ` · ${osEsc(who)}` : ''}`;
+    + ` · ${OS.engine === 'h3' ? 'Hailuo H3' : 'LTX 2.5'}${who ? ` · ${osEsc(who)}` : ''}${priceBit}`;
 }
 function osRenderAll() {
   osRenderEngine(); osRenderLengths(); osRenderQualities(); osRenderCharacters();
@@ -300,6 +327,7 @@ function osSetSeconds(s) {
   s = parseInt(s, 10);
   if (!OS_SECONDS.includes(s)) return;
   OS.seconds = s;
+  try { localStorage.setItem(OS_SECONDS_LS_KEY, String(s)); } catch (e) {}
   osRenderLengths(); osRenderBeats(); osBeatsInput(); osRenderSummary(); osEstimate();
 }
 function osSetQuality(q) {
@@ -320,6 +348,9 @@ function osToggle(name, value) {
   else if (name === 'retake') OS.retake = value === 'off' ? 'off' : 'on';
   else if (name === 'handoff') { OS.handoff = value === 'speech' ? 'speech' : 'last'; OS.handoffTouched = true; }
   osRenderToggles();
+  // Retake changes whether the "up to ~X if parts are redone" ceiling shows
+  // at all — the price shown must follow the switch, not the last fetch.
+  if (name === 'retake') { osEstimate(); }
 }
 function osSplitPrompt() {
   const prompt = String((osEl('osPrompt') || {}).value || '');
@@ -359,9 +390,20 @@ async function osEstimate() {
     const d = await r.json();
     if (seq !== OS.estimateSeq) return;
     if (!d.ok) { el.textContent = d.error || ''; return; }
+    const bareEta = d.eta ? String(d.eta).replace(/^~\s*/, '').split(' · ')[0] : '';
+    OS.lastEta = bareEta;
+    // VA-16: the base price only ever showed the best case. Each part can
+    // ALSO get one light-drift retake and, if it's spoken, up to
+    // TAKE_LIPSYNC_RETAKES lip-sync retakes — up to ~4x the base render in
+    // the worst case. eta_worst is a mechanism-derived CEILING (not a
+    // measured rate), labeled "up to" so it reads as a bound, not a promise.
+    const worstBit = (OS.retake === 'on' && d.eta_worst)
+      ? ` · up to ${String(d.eta_worst).replace(/^~\s*/, '')} if parts are redone`
+      : '';
     el.textContent = `${osLengthLabel(d.seconds)} · ${osPartsText(d.seconds)}`
-      + (d.eta ? ` · about ${String(d.eta).replace(/^~\s*/, '').split(' · ')[0]} on this Mac` : '')
-      + (OS.retake === 'on' ? ' · a part that drifts is rendered once more' : '');
+      + (bareEta ? ` · about ${bareEta} on this Mac` : '') + worstBit
+      + (OS.retake === 'on' ? ' · a part that drifts or doesn’t sync is rendered again' : '');
+    osRenderSummary();
   } catch (e) {
     if (seq === OS.estimateSeq) el.textContent = '';
   }
@@ -511,10 +553,11 @@ function oneshotTabLeave() {
 // document is rebuilt from the take block, and the tab opens on it.
 function oneshotOpenFromParams(p) {
   p = p || {};
+  _osApplyStoredPrefs();
   const take = p.take || {};
   OS.engine = (take.engine || p.engine) === 'h3' ? 'h3' : 'ltx';
-  const s = parseInt(take.seconds || p.take_seconds || 60, 10);
-  OS.seconds = OS_SECONDS.includes(s) ? s : 60;
+  const s = parseInt(take.seconds || p.take_seconds || 30, 10);
+  OS.seconds = OS_SECONDS.includes(s) ? s : 30;
   OS.character = String(p.character_id || '');
   OS.image = String(p.image || '');
   OS.light = take.light_lock === '' ? 'off' : 'on';
@@ -528,7 +571,17 @@ function oneshotOpenFromParams(p) {
   const beats = (take.beats || take.beat_prompts || []);
   OS.beats = Array.isArray(beats) ? beats.map(b => String(b || '').replace(/\s+Continuity:.*$/, '')) : [];
   const cam = osEl('osCamera'); if (cam) cam.value = String(take.camera || '');
-  const seed = osEl('osSeed'); if (seed) seed.value = (p.seed && String(p.seed) !== '-1') ? String(p.seed) : '';
+  // VA-28: a random parent seed (-1) drew a fresh random seed per part, and
+  // none of them were recorded anywhere — reopening a random-seed take left
+  // Seed blank (still random) even though the take's own sidecar now names
+  // exactly which seed rendered part 1 (take.parts_meta, run_take_job_inner).
+  const seed = osEl('osSeed');
+  if (seed) {
+    const partsMeta = Array.isArray(take.parts_meta) ? take.parts_meta : [];
+    const firstPartSeed = partsMeta[0] && partsMeta[0].seed_used;
+    seed.value = (p.seed && String(p.seed) !== '-1') ? String(p.seed)
+      : (firstPartSeed != null ? String(firstPartSeed) : '');
+  }
   const label = osEl('osLabel'); if (label) label.value = String(p.preset_label || '');
   const nm = osEl('osNoMusic'); if (nm) nm.checked = String(p.no_music || '') === 'on';
   if (typeof workflowSwitch === 'function') workflowSwitch('oneshot');
@@ -539,6 +592,10 @@ function oneshotOpenFromParams(p) {
 function osWire() {
   if (OS.wired) return;
   OS.wired = true;
+  // VA-15: remember the last length this browser used, once, on first wire —
+  // a manual osSetSeconds() later in the same session is never overridden,
+  // and neither is a take Load Params restored before the first wire.
+  _osApplyStoredPrefs();
   document.querySelectorAll('#osEngineGroup [data-os-engine]').forEach(b => b.onclick = () => osSetEngine(b.dataset.osEngine));
   document.querySelectorAll('[data-os-toggle]').forEach(group => {
     group.querySelectorAll('[data-os-value]').forEach(b => b.onclick = () => osToggle(group.dataset.osToggle, b.dataset.osValue));

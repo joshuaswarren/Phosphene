@@ -73,7 +73,10 @@ __all__ = [
     "peaks_path", "compute_peaks", "save_peaks", "load_peaks",
     "clip_peaks_path", "clip_peaks", "prune_clip_peaks",
     "edit_path", "load_edit", "save_edit", "validate_edit", "normalise_edit",
-    "migrate_edit", "clip_kind", "clip_brightness", "clip_carries_media",
+    "migrate_edit", "clip_kind", "clip_brightness", "clip_grade",
+    "clip_grade_is_neutral", "EXPOSURE_LIMIT", "GRADE_CONTRAST_RANGE",
+    "GRADE_SATURATION_RANGE", "GRADE_TEMP_TINT_LIMIT", "FILM_LOOK_PRESETS",
+    "film_look_stack", "SEQ_ASPECTS", "markers_of", "clip_carries_media",
     "clip_audio", "clip_audio_drift", "clip_audio_resync", "clip_muted",
     "clip_effects", "clip_length",
     "SOUND_LANES", "clip_sound_lane", "sound_lane_label", "alternate_sound_lanes",
@@ -101,11 +104,13 @@ __all__ = [
     "history_dir", "archive_edit", "prune_history", "list_history",
     "restore_edit",
     "drafts_dir", "load_draft_index", "list_drafts", "create_draft",
+    "set_aside_for_replan",
     "duplicate_draft", "rename_draft", "delete_draft", "activate_draft",
     "write_backup", "pending_backup", "recover_backup", "discard_backup",
     "DRAFT_NAME_MAX",
     "export_nle", "NLE_FPS",
     "film_fps", "frame_seconds", "quantise_gap", "heal_subframe_gaps",
+    "heal_subframe_lengths",
 ]
 
 
@@ -133,6 +138,55 @@ CLIP_KINDS = ("video", "still", "slug")
 # directions, and a clamp the validator enforces is what stops a typo in a
 # saved document from rendering an hour of white.
 BRIGHTNESS_LIMIT = 0.5
+
+# FILM-14: the 5-slider grade — exposure, contrast, saturation, temp, tint —
+# a sibling of `brightness` under the same `adjust` dict, not a new EDIT_VERSION
+# (absent is still neutral, the migration-free rule every field here follows).
+# `exposure` shares ffmpeg's `eq=brightness` LEVER with the legacy single
+# slider but is a SEPARATE stored number and a separate chained filter node
+# (`_sb_grade_term` in mlx_ltx_panel.py) — the two never read each other.
+EXPOSURE_LIMIT = 0.5
+GRADE_CONTRAST_RANGE = (0.5, 1.8)
+GRADE_SATURATION_RANGE = (0.0, 2.5)
+GRADE_TEMP_TINT_LIMIT = 1.0
+
+# FILM-14, Render ▾'s "Film look": a whole-film grade next to Grain, applied
+# ON TOP of each clip's own per-clip grade — not a hand-authored .cube LUT
+# (a real `lut3d` needs a file to ship and calibrate; a preset needs neither
+# and reaches the same "one consistent light for the whole film" goal for
+# the sizes this app ships at). Fixed points, not deltas from each clip's
+# current grade — `film_look_stack` below is what combines the two.
+FILM_LOOK_PRESETS: dict[str, dict] = {
+    "warm_tungsten": {"temp": 0.30, "tint": -0.05, "saturation": 1.10},
+    "neutral": {"tint": -0.04},
+}
+
+# FILM-58: the sequence aspect — a whole-film choice, `settings.aspect`,
+# next to `settings.film_look`. width/height as a ratio; the render
+# center-crops to it (never stretches, never pads) and '16:9' is a no-op —
+# every film already renders at its own native shape.
+SEQ_ASPECTS: dict[str, tuple[int, int]] = {"16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1)}
+
+
+def film_look_stack(adjust: dict | None, preset_key: str | None) -> dict:
+    """A clip's own `adjust` with a Film-look preset folded in — additive
+    fields (exposure, temp, tint) sum, the two 1.0-centred fields (contrast,
+    saturation) sum their DISTANCE from neutral. The same result a second,
+    chained ffmpeg `eq=`/`colorbalance=` node would produce (`_sb_grade_term`
+    called twice), done here in the dict because the preset is resolved once
+    per film rather than once per low-level filter string.
+    """
+    out = dict(adjust) if isinstance(adjust, dict) else {}
+    preset = FILM_LOOK_PRESETS.get(str(preset_key or "").strip().lower())
+    if not preset:
+        return out
+    for key in ("exposure", "temp", "tint"):
+        if key in preset:
+            out[key] = round(_f(out.get(key), 0.0) + _f(preset.get(key), 0.0), 6)
+    for key in ("contrast", "saturation"):
+        if key in preset:
+            out[key] = round(_f(out.get(key), 1.0) + (_f(preset.get(key), 1.0) - 1.0), 6)
+    return out
 
 # Bumped whenever the proxy RECIPE changes. It is part of the content hash, so
 # a bump rebuilds every proxy on the next prepare instead of leaving a mixed
@@ -171,7 +225,18 @@ TOUCH_TOLERANCE = 1.0 / 48.0
 # note on a document that is going to disk either way — the rule is that
 # persisting the user's work always wins, because the alternative was a red
 # banner over an afternoon of cutting that could not be stored anywhere.
-WARNING_CODES = frozenset({"clips_audio_overlap"})
+#
+# FILM-31: `still_missing` joined this set once it stopped being catastrophic
+# to leave in a document. It was blocking because a still with no image "can
+# never play" — true when it was written, and no longer true: the assembler
+# now renders a missing still's slot as black at its exact length instead of
+# dropping it (`_sb_timeline_segments`, FILM-15), and the same check that
+# flags the clip is what the Editor now badges "offline" and reads the render
+# will be safe with (`_sbe_payload`'s `offline` list). One trashed still used
+# to make the WHOLE FILM impossible to save or back up — `write_backup` and
+# `save_edit` both refuse on a blocking error — which is a strictly worse
+# outcome than the thing it was trying to prevent.
+WARNING_CODES = frozenset({"clips_audio_overlap", "still_missing"})
 
 
 class EditError(Exception):
@@ -301,6 +366,36 @@ def clip_brightness(clip) -> float:
         return 0.0
     b = _f(adj.get("brightness"), 0.0)
     return max(-BRIGHTNESS_LIMIT, min(BRIGHTNESS_LIMIT, b))
+
+
+def clip_grade(clip) -> dict:
+    """`{exposure, contrast, saturation, temp, tint}`, clamped — FILM-14's
+    5-slider grade. `{0.0, 1.0, 1.0, 0.0, 0.0}` (neutral) for a clip that has
+    none, the same "absent is neutral" rule `clip_brightness` follows.
+    """
+    if not isinstance(clip, dict):
+        adj = {}
+    else:
+        adj = clip.get("adjust")
+        adj = adj if isinstance(adj, dict) else {}
+    lo_c, hi_c = GRADE_CONTRAST_RANGE
+    lo_s, hi_s = GRADE_SATURATION_RANGE
+    t = GRADE_TEMP_TINT_LIMIT
+    return {
+        "exposure": round(max(-EXPOSURE_LIMIT, min(EXPOSURE_LIMIT,
+                              _f(adj.get("exposure"), 0.0))), 6),
+        "contrast": round(max(lo_c, min(hi_c, _f(adj.get("contrast"), 1.0))), 6),
+        "saturation": round(max(lo_s, min(hi_s, _f(adj.get("saturation"), 1.0))), 6),
+        "temp": round(max(-t, min(t, _f(adj.get("temp"), 0.0))), 6),
+        "tint": round(max(-t, min(t, _f(adj.get("tint"), 0.0))), 6),
+    }
+
+
+def clip_grade_is_neutral(clip) -> bool:
+    g = clip_grade(clip)
+    return (abs(g["exposure"]) < 1e-9 and abs(g["contrast"] - 1.0) < 1e-9
+            and abs(g["saturation"] - 1.0) < 1e-9
+            and abs(g["temp"]) < 1e-9 and abs(g["tint"]) < 1e-9)
 
 
 def clip_audio(clip) -> dict:
@@ -549,8 +644,14 @@ def clip_effects(clip) -> dict:
             # ramp", and silently zeroing the out-fade is not that.
             total = fin + fout
             fin, fout = fin - over * (fin / total), fout - over * (fout / total)
-    return {"fade_in": round(fin, 6), "fade_out": round(fout, 6),
-            "brightness": clip_brightness(c)}
+    # FILM-14: the 5-slider grade rides the same accessor brightness does —
+    # "every output reads this and nothing else" is the whole point, and a
+    # second accessor for a second adjustment would just be the brightness
+    # mistake (three code paths that can disagree) made again on purpose.
+    out = {"fade_in": round(fin, 6), "fade_out": round(fout, 6),
+           "brightness": clip_brightness(c)}
+    out.update(clip_grade(c))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -787,6 +888,26 @@ def overlay_items(edit) -> list[dict]:
         return []
     out = [o for o in rows if isinstance(o, dict)]
     out.sort(key=lambda o: (_f(o.get("film_start")), str(o.get("id") or "")))
+    return out
+
+
+def markers_of(edit) -> list[dict]:
+    """FILM-58: every marker, on the film's clock, in time order. Absent is
+    no markers — the same "empty lane" rule `overlay_items` follows."""
+    rows = (edit or {}).get("markers")
+    if not isinstance(rows, list):
+        return []
+    out = []
+    for m in rows:
+        if not isinstance(m, dict):
+            continue
+        at = _f(m.get("at"))
+        if at < 0:
+            continue
+        kind = m.get("kind") if m.get("kind") in ("beat", "lyric", "note") else "note"
+        out.append({"id": m.get("id") or "", "at": round(at, 6), "kind": kind,
+                    "label": str(m.get("label") or "")})
+    out.sort(key=lambda m: (m["at"], m["id"]))
     return out
 
 
@@ -2575,17 +2696,38 @@ def validate_edit(edit) -> list[dict]:
             if not isinstance(adj, dict):
                 bad("clip_adjust", f"clip {i + 1}: adjust must be an object "
                                    f"or absent", i)
-            elif adj.get("brightness") is not None:
-                b = adj.get("brightness")
-                if not isinstance(b, (int, float)) or isinstance(b, bool) \
-                        or b != b or b in (float("inf"), float("-inf")):
-                    bad("clip_brightness",
-                        f"clip {i + 1}: adjust.brightness must be a number", i)
-                elif abs(float(b)) > BRIGHTNESS_LIMIT + 1e-9:
-                    bad("clip_brightness_range",
-                        f"clip {i + 1}: adjust.brightness is {float(b):+.3f} — "
-                        f"it must be between {-BRIGHTNESS_LIMIT:+.1f} and "
-                        f"{BRIGHTNESS_LIMIT:+.1f}", i)
+            else:
+                if adj.get("brightness") is not None:
+                    b = adj.get("brightness")
+                    if not isinstance(b, (int, float)) or isinstance(b, bool) \
+                            or b != b or b in (float("inf"), float("-inf")):
+                        bad("clip_brightness",
+                            f"clip {i + 1}: adjust.brightness must be a number", i)
+                    elif abs(float(b)) > BRIGHTNESS_LIMIT + 1e-9:
+                        bad("clip_brightness_range",
+                            f"clip {i + 1}: adjust.brightness is {float(b):+.3f} — "
+                            f"it must be between {-BRIGHTNESS_LIMIT:+.1f} and "
+                            f"{BRIGHTNESS_LIMIT:+.1f}", i)
+                # FILM-14: the 5-slider grade. Same shape as brightness —
+                # absent is neutral, present must be a finite number inside
+                # its own range.
+                for key, lo, hi in (
+                        ("exposure", -EXPOSURE_LIMIT, EXPOSURE_LIMIT),
+                        ("contrast", *GRADE_CONTRAST_RANGE),
+                        ("saturation", *GRADE_SATURATION_RANGE),
+                        ("temp", -GRADE_TEMP_TINT_LIMIT, GRADE_TEMP_TINT_LIMIT),
+                        ("tint", -GRADE_TEMP_TINT_LIMIT, GRADE_TEMP_TINT_LIMIT)):
+                    v = adj.get(key)
+                    if v is None:
+                        continue
+                    if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                            or v != v or v in (float("inf"), float("-inf")):
+                        bad("clip_grade",
+                            f"clip {i + 1}: adjust.{key} must be a number", i)
+                    elif not (lo - 1e-9 <= float(v) <= hi + 1e-9):
+                        bad("clip_grade_range",
+                            f"clip {i + 1}: adjust.{key} is {float(v):+.3f} — "
+                            f"it must be between {lo:+.2f} and {hi:+.2f}", i)
         fr = c.get("frame")
         if fr is not None:
             if not isinstance(fr, dict):
@@ -2837,6 +2979,32 @@ def validate_edit(edit) -> list[dict]:
             if t.get("problem"):
                 bad(t["problem"]["code"], t["problem"]["message"],
                     t.get("out_index"))
+    # FILM-58: MARKERS. A marker names a SECOND on the film, not a clip, so
+    # it has nothing to overlap and nothing to be too short — the only
+    # things worth refusing are the shape and an `at` that is not a real
+    # number.
+    mkr = edit.get("markers") if isinstance(edit, dict) else None
+    if mkr is not None and not isinstance(mkr, list):
+        bad("markers_shape", "markers must be a list or absent")
+    elif isinstance(mkr, list):
+        for n, m in enumerate(mkr):
+            if not isinstance(m, dict):
+                bad("marker_shape", f"marker {n + 1}: must be an object")
+                continue
+            at = m.get("at")
+            if not isinstance(at, (int, float)) or isinstance(at, bool) \
+                    or at != at or at in (float("inf"), float("-inf")):
+                bad("marker_at", f"marker {n + 1}: at must be a number")
+            elif float(at) < 0:
+                bad("marker_at_range", f"marker {n + 1}: at must be >= 0")
+            if m.get("kind") is not None and m.get("kind") not in ("beat", "lyric", "note"):
+                bad("marker_kind",
+                    f"marker {n + 1}: kind must be beat, lyric or note")
+    # FILM-58: SEQUENCE ASPECT — a whole-film choice, not a per-clip one.
+    aspect = (edit.get("settings") or {}).get("aspect") if isinstance(edit.get("settings"), dict) else None
+    if aspect is not None and aspect not in SEQ_ASPECTS:
+        bad("settings_aspect", "settings.aspect must be one of "
+                               + ", ".join(sorted(SEQ_ASPECTS)))
     spans.sort()
     for (a_s, a_e, a_i), (b_s, b_e, b_i) in zip(spans, spans[1:]):
         if b_s < a_e - TOUCH_TOLERANCE:
@@ -2897,6 +3065,87 @@ def _digest_clip(c) -> dict:
         if k in out:
             out[k] = round(_f(out.get(k)), 6)
     return out
+
+
+# FILM-54: what to CALL a field, in the recovery bar's own words — never the
+# document's key. "adjust" is handled separately (it is one number a person
+# actually watches move).
+_DIFF_FIELD_LABELS = {
+    "mute": "mute", "locked": "lock", "speed": "speed",
+    "frame": "reframe", "fx": "fade", "audio": "sound",
+    "path": "file", "kind": "kind", "adjust": "brightness",
+}
+
+
+def _clip_diff_fields(old: dict, new: dict) -> list[str]:
+    """Field-level differences between two digest-normalised clips, named
+    the way a person would say them rather than the way the document does.
+    """
+    out: list[str] = []
+    for k in sorted(set(old) | set(new)):
+        if old.get(k) == new.get(k):
+            continue
+        if k == "adjust":
+            ob = _f((old.get("adjust") or {}).get("brightness"))
+            nb = _f((new.get("adjust") or {}).get("brightness"))
+            if abs(ob - nb) < 1e-6:
+                continue                      # something else under "adjust" moved
+            delta = nb - ob
+            out.append("brightness " + (f"+{delta:.2f}" if delta >= 0 else f"{delta:.2f}"))
+        elif k in ("film_start", "film_end"):
+            if "moved" not in out:
+                out.append("moved")
+        elif k in ("start", "end"):
+            if "trimmed" not in out:
+                out.append("trimmed")
+        else:
+            out.append(_DIFF_FIELD_LABELS.get(k, k))
+    return out
+
+
+def edit_diff_summary(old: dict, new: dict) -> str:
+    """One line: what changed between two documents, in the vocabulary a
+    person used to make the change — "1 clip changed: 02 brightness +0.30" —
+    built from the exact normalised shape `edit_digest` already hashes, so
+    the two can never disagree about whether there IS a difference.
+
+    THE BUG THIS EXISTS FOR: the recovery bar could say a backup and the
+    saved draft held the same clip count and the same duration and STILL be
+    the reason a chip was up — because what actually differed was one
+    brightness value, and the bar had no vocabulary for that: "a backup from
+    3 min ago holds 10 clip(s), 2:51 — the saved draft has 10, 2:51." A
+    question about a difference it could not name.
+    """
+    o = old if isinstance(old, dict) else {}
+    n = new if isinstance(new, dict) else {}
+    o_clips = [_digest_clip(c) for c in (o.get("clips") or []) if isinstance(c, dict)]
+    n_clips = [_digest_clip(c) for c in (n.get("clips") or []) if isinstance(c, dict)]
+    o_by_id = {c.get("id"): (i, c) for i, c in enumerate(o_clips) if c.get("id")}
+    n_by_id = {c.get("id"): (i, c) for i, c in enumerate(n_clips) if c.get("id")}
+    changed: list[tuple[int, list[str]]] = []
+    for cid, (idx, nc) in n_by_id.items():
+        if cid in o_by_id:
+            oc = o_by_id[cid][1]
+            if oc != nc:
+                changed.append((idx, _clip_diff_fields(oc, nc)))
+    added = [cid for cid in n_by_id if cid not in o_by_id]
+    removed = [cid for cid in o_by_id if cid not in n_by_id]
+    other_labels = {"audio": "soundtrack", "overlays": "titles/cards",
+                    "transitions": "transitions", "audio_tracks": "sound tracks",
+                    "beats": "beat grid"}
+    other = [label for key, label in other_labels.items() if o.get(key) != n.get(key)]
+    if len(changed) == 1 and not added and not removed and not other:
+        idx, fields = changed[0]
+        return f"1 clip changed: {idx + 1:02d} {fields[0] if fields else 'changed'}"
+    bits = []
+    if changed:
+        bits.append(f"{len(changed)} clip{'s' if len(changed) != 1 else ''} changed")
+    if added:
+        bits.append(f"{len(added)} added")
+    if removed:
+        bits.append(f"{len(removed)} removed")
+    bits.extend(other)
+    return ", ".join(bits) if bits else "changed"
 
 
 def edit_digest(edit) -> str:
@@ -3197,7 +3446,23 @@ def normalise_edit(edit: dict) -> dict:
         adj = c.get("adjust")
         if isinstance(adj, dict):
             b = clip_brightness(c)
-            rest = {k: v for k, v in adj.items() if k != "brightness"}
+            g = clip_grade(c)
+            rest = {k: v for k, v in adj.items()
+                    if k not in ("brightness", "exposure", "contrast",
+                                "saturation", "temp", "tint")}
+            # FILM-14: the grade, written back CLAMPED and neutral-is-absent
+            # per field — the same rule brightness follows, applied five
+            # more times rather than reinvented for them.
+            if abs(g["exposure"]) >= 1e-9:
+                rest["exposure"] = g["exposure"]
+            if abs(g["contrast"] - 1.0) >= 1e-9:
+                rest["contrast"] = g["contrast"]
+            if abs(g["saturation"] - 1.0) >= 1e-9:
+                rest["saturation"] = g["saturation"]
+            if abs(g["temp"]) >= 1e-9:
+                rest["temp"] = g["temp"]
+            if abs(g["tint"]) >= 1e-9:
+                rest["tint"] = g["tint"]
             # NEUTRAL IS ABSENT. Dragging the slider back to zero must leave a
             # document identical to one that never had a slider, or every clip
             # anyone ever touched carries a dead field forever.
@@ -3452,6 +3717,24 @@ def save_edit(board_dir, edit: dict, *, bump: bool = True,
         raise EditError("; ".join(e["message"] for e in errs[:6])
                         + (f" (+{len(errs) - 6} more)" if len(errs) > 6 else ""))
     doc = normalise_edit(edit)
+    # FILM-51: heal AFTER validate_edit has passed, never before — healing
+    # can rewrite a clip's own `end`, and running it on a document nothing
+    # has checked yet can recompute a plausible `end` for one that should
+    # have been refused (see heal_subframe_lengths' own docstring). Every
+    # manual save is a frame-exact document from here on, so an edit that
+    # never triggers this function's OTHER call site (the render path, for
+    # a film saved before this existed) still converges the next time a
+    # human saves it.
+    # EDITOR-3 (Codex 4.17.0): ...AND CHECK WHAT THE HEAL PRODUCED before it
+    # is written. Validation used to run only on the document as sent, so a
+    # heal that moved a clip into a locked one was saved as `clips_overlap`
+    # and every render afterwards refused the film. The heal is bounded now;
+    # this is the backstop — a healed document that no longer validates is
+    # never written, and the user's own (valid) arrangement is saved as sent.
+    healed = json.loads(json.dumps(doc))
+    heal_subframe_lengths(healed)
+    if not blocking_errors(validate_edit(healed)):
+        doc = healed
     with board_write_lock(board_dir):
         return _save_edit_locked(board_dir, doc, bump=bump, origin=origin,
                                  expect=expect, expect_draft=expect_draft)
@@ -3546,6 +3829,19 @@ _AUTO_PREFIX = "edit-r"
 # appeared. A lane that stops is not a safety net. See
 # docs/EDITOR_SAVE_MODEL.md §2.
 _SNAP_PREFIX = "snap-"
+# FILM-57: RETENTION BY TIME, NOT COUNT. A flat count of 20 read as "about
+# 30 s of active editing" once the digest dedup above stopped burning slots
+# on no-op re-backups — the SAME 20-file cap that used to protect against a
+# runaway loop was, once that loop was fixed at the source, just a small
+# window on real work. A day of cutting a film now keeps its own history;
+# `SNAPSHOT_HARD_CAP` stays as the one thing that still counts files, and
+# only so a genuinely pathological burst (a bug elsewhere hammering the
+# backup route) cannot fill a disk — it is far above anything a real
+# editing session reaches.
+SNAPSHOT_KEEP_HOURS = 24
+SNAPSHOT_HARD_CAP = 500
+# Retained for anything that still imports the old name (docs, older
+# comments); prune_snapshots no longer keys off it by default.
 SNAPSHOT_KEEP = 20
 _KEPT_PREFIX = "keep-r"
 _MANUAL_PREFIX = "save-r"
@@ -3914,6 +4210,142 @@ def heal_subframe_gaps(edit: dict) -> list[dict]:
     return closed
 
 
+def heal_subframe_lengths(edit: dict) -> list[dict]:
+    """FILM-51: round every clip's FILM length to the frame grid. Mutates
+    `edit`. Returns one row per clip corrected, so a caller can say what it
+    did — the same shape `heal_subframe_gaps` answers with.
+
+    MEASURED (`test_editor_film_frame_lock.py`): the render trims each
+    segment on its OWN local clock (`setpts=PTS-STARTPTS` then `fps=`), so
+    ffmpeg's `fps=` filter rounds a sub-frame-length segment to the nearest
+    frame INDEPENDENTLY of every other segment, while the song is laid out
+    on the exact (unrounded) timeline. On a synthetic 52-cut film built from
+    realistic non-frame-aligned windows the two clocks drifted apart by
+    more than a frame well before the last cut. Once every clip's length
+    already IS a whole number of frames, `fps=` has nothing left to round
+    and the picture cannot come apart from the song no matter how many cuts
+    follow — fixed here, at the model, rather than in the render graph,
+    so nothing about how a segment is trimmed, faded or transitioned has
+    to change to get it.
+
+    A clip's length grows or shrinks at its TAIL — `end` moves, `start`
+    never does — the same convention every other tail-trim in this file
+    already uses; a still or a slug has no source window of its own,
+    `normalise_edit` derives theirs from the slot. Gaps are UNTOUCHED
+    (this is a length fix, not `heal_subframe_gaps`'s job); a locked clip
+    is an anchor exactly as it is there, and the shift a length correction
+    hands to everything after it is reset at one.
+
+    STILL NOT CALLED FROM `load_edit`. Unlike the gap heal, this can
+    rewrite a clip's own `end` — and doing that unconditionally on every
+    read can recompute a PLAUSIBLE `end` for a clip whose document has not
+    been validated yet, which is worse than the drift it fixes: a
+    genuinely corrupt saved/history document could stop looking corrupt
+    before `validate_edit` ever saw it (see
+    test_a_genuinely_broken_version_is_STILL_refused,
+    test_storyboard_editor_api.py — the regression that proved this).
+    CALL THIS ONLY AFTER `validate_edit` HAS PASSED THE DOCUMENT. Its two
+    callers: `save_edit` (right after `validate_edit`/`normalise_edit`, so
+    every document a human saves converges) and
+    `mlx_ltx_panel._sbe_render_edit` (its own `validate_edit` check, then
+    this, before `edit_to_cuts` — so an OLDER film saved before this fix
+    existed still renders frame-exact without needing a resave first).
+    """
+    if not isinstance(edit, dict):
+        return []
+    clips = [c for c in (edit.get("clips") or []) if isinstance(c, dict)]
+    clips.sort(key=lambda c: _f(c.get("film_start")))
+    frame = frame_seconds(edit)
+    # Below this, a length is ALREADY frame-exact — everything here is
+    # stored `round(x, 6)`, and 1/24 has no exact 6-decimal form, so a
+    # value built from a whole number of frames can read back a few
+    # microseconds off its own target. Comparing at raw float precision
+    # (1e-9) would "fix" that noise forever, reporting a repair that did
+    # nothing and never reaching a stable, idempotent document. Real drift
+    # — the thing this function exists to remove — is one to two orders of
+    # magnitude larger (up to half a frame, ~20 ms at 24 fps).
+    NOISE = 1e-4
+
+    def _plan(run: list[dict], floor: bool) -> list[tuple]:
+        """What healing `run` would do, WITHOUT touching it: one row per
+        clip — (clip, new source end or None, film start, film length,
+        length change, frames, old length, old start)."""
+        rows: list[tuple] = []
+        shift = 0.0
+        for c in run:
+            fs0, fe0 = _f(c.get("film_start")), _f(c.get("film_end"))
+            length = fe0 - fs0
+            if length <= 0:
+                continue
+            if floor:
+                frames = max(1, math.floor(length / frame + NOISE / frame))
+            else:
+                frames = max(1, round(length / frame))
+            length_q = frames * frame
+            d = length_q - length
+            new_end = None
+            # NEVER PAST THE TAKE'S OWN END. A correction that would ask for
+            # source the file does not have is skipped rather than clamped — a
+            # clamp would silently leave the stored film length and the source
+            # window disagreeing by the very sub-frame amount this pass exists
+            # to remove. Skipping costs nothing downstream: `shift` (below)
+            # still carries whatever earlier clips already corrected, so this
+            # clip's POSITION stays right even when its own length does not.
+            if abs(d) > NOISE and clip_kind(c) == "video":
+                sp = clip_speed(c)
+                ne = _f(c.get("start")) + length_q * sp
+                dur = c.get("duration")
+                if isinstance(dur, (int, float)) and dur > 0 and ne > float(dur) + 1e-6:
+                    d, length_q = 0.0, length
+                else:
+                    new_end = ne
+            rows.append((c, new_end, fs0 + shift, length_q, d, frames, length, fs0))
+            shift += d
+        return rows
+
+    # A LOCKED CLIP IS AN ANCHOR, and the clips between two anchors are one
+    # run: their corrections accumulate as a `shift` that moves everything
+    # after them in the run, and the next anchor does not move. EDITOR-3
+    # (Codex 4.17.0): that shift used to be reset at the anchor WITHOUT ever
+    # being checked against it, so two 0.98 s clips before a clip locked at
+    # 1.96 s (24 fps) each grew to 1.0 s and the second one ran 40 ms INTO
+    # the locked clip — a `clips_overlap` document, written by Save after
+    # validation had passed, that the render then refused. A run whose
+    # rounded-to-nearest lengths would cross the next anchor is healed by
+    # rounding DOWN instead: every length change is then ≤ 0, so nothing in
+    # the run moves later and nothing can reach the anchor.
+    fixed: list[dict] = []
+    runs: list[tuple[list[dict], float | None]] = []
+    cur: list[dict] = []
+    for c in clips:
+        if c.get("locked"):
+            runs.append((cur, _f(c.get("film_start"))))
+            cur = []
+        else:
+            cur.append(c)
+    runs.append((cur, None))
+    for run, anchor in runs:
+        if not run:
+            continue
+        rows = _plan(run, floor=False)
+        if anchor is not None and rows and \
+                max(r[2] + r[3] for r in rows) > max(anchor, max(r[7] + r[6] for r in rows)) + NOISE:
+            rows = _plan(run, floor=True)
+        for c, new_end, fs, length_q, d, frames, length, fs0 in rows:
+            if new_end is not None:
+                c["end"] = round(new_end, 6)
+            if abs(d) > NOISE:
+                fixed.append({"id": c.get("id"), "was": round(length, 6),
+                             "now": round(length_q, 6), "frames": frames})
+            if abs(fs - fs0) > NOISE or abs(d) > NOISE:
+                c["film_start"] = round(fs, 6)
+                c["film_end"] = round(fs + length_q, 6)
+                aud = c.get("audio")
+                if isinstance(aud, dict) and aud.get("film_start") is not None:
+                    aud["film_start"] = round(_f(aud.get("film_start")) + (fs - fs0), 6)
+    return fixed
+
+
 def heal_mix(edit: dict) -> bool:
     """Write the render's old hidden levels onto a document that predates the
     controls. Mutates `edit`; True when it wrote something.
@@ -4033,6 +4465,18 @@ def migrate_edit(edit: dict) -> dict:
         edit["healed_subframe_gaps"] = healed
     else:
         edit.pop("healed_subframe_gaps", None)
+    # FILM-51's `heal_subframe_lengths` is deliberately NOT run here yet.
+    # Unlike the gap heal above (which only ever moves `film_start`), it can
+    # rewrite a clip's own `end` — and wiring it into every load surfaced a
+    # real hazard in this suite: a save-history entry deliberately corrupted
+    # for `test_a_genuinely_broken_version_is_STILL_refused` stopped being
+    # refused, because the heal recomputed a plausible `end` for the clip
+    # BEFORE validation ever saw the corrupt one. It is correct and tested on
+    # its own (`test_editor_film_frame_lock.py`) and ready to call explicitly
+    # once it runs strictly after `validate_edit` has passed a document, not
+    # before. Do not wire this into `load_edit` without that ordering fixed
+    # and a full-suite pass proving no other read path can hand it a
+    # not-yet-validated document.
     return edit
 
 
@@ -4090,8 +4534,37 @@ def edit_to_cuts(edit: dict) -> list[dict]:
         if kind != "video":
             entry["kind"] = kind
         b = clip_brightness(c)
+        adj_out: dict = {}
         if abs(b) >= 1e-9:
-            entry["adjust"] = {"brightness": round(b, 6)}
+            adj_out["brightness"] = round(b, 6)
+        # FILM-14: the grade reaches the render the same way brightness
+        # does — through this same plan entry, which `_sb_grade_term`
+        # (mlx_ltx_panel.py) reads — so "match colour", the per-clip
+        # sliders AND the whole-film Film-look preset all land in the film
+        # render, not only the preview. A slug has no colour to grade, and
+        # the preset applies even to a clip with no grade of its own — it is
+        # a whole-film choice, not conditional on the clip already having one.
+        if kind != "slug":
+            settings = (edit or {}).get("settings")
+            settings = settings if isinstance(settings, dict) else {}
+            look = settings.get("film_look")
+            stacked = film_look_stack(c.get("adjust"), look) if look else clip_grade(c)
+            if not look:
+                pass  # `stacked` is already clip_grade(c)'s clamped shape
+            else:
+                # `film_look_stack` returns the RAW combination; run it back
+                # through `clip_grade` so it is clamped the same way a
+                # hand-set value would be.
+                stacked = clip_grade({"adjust": stacked})
+            neutral = (abs(stacked["exposure"]) < 1e-9
+                       and abs(stacked["contrast"] - 1.0) < 1e-9
+                       and abs(stacked["saturation"] - 1.0) < 1e-9
+                       and abs(stacked["temp"]) < 1e-9 and abs(stacked["tint"]) < 1e-9)
+            if not neutral:
+                for key in ("exposure", "contrast", "saturation", "temp", "tint"):
+                    adj_out[key] = stacked[key]
+        if adj_out:
+            entry["adjust"] = adj_out
         if kind != "slug" and not clip_frame_is_neutral(c):
             entry["frame"] = clip_frame(c)
         if kind == "video":
@@ -4132,6 +4605,26 @@ def edit_to_cuts(edit: dict) -> list[dict]:
         if c.get("id"):
             by_id[str(c["id"])] = entry
     out.sort(key=lambda e: e["film_start"])
+    # FILM-27: A HOLE IS NOT NOTHING. The assembler below CONCATENATES — it
+    # lays these entries end to end with no notion of the film-second each
+    # was cut to — so a gap between two clips used to vanish rather than
+    # play: everything after it slid earlier, off the beat it was cut to,
+    # behind a native confirm() that only ever fired once, at Render, and
+    # said nothing about WHERE. `edit_gaps` is the exact list the timeline
+    # already computes for its own "N holes" disclosure (`edit_to_cuts` and
+    # the header's hole count now agree by construction, not by two people
+    # reimplementing the same cursor walk). Filling each one with a slug —
+    # the same synthetic entry "Add black" already produces by hand — is the
+    # one change that makes the export match what every later clip's
+    # `film_start` already claimed, instead of quietly breaking that promise.
+    for g in edit_gaps(edit):
+        dur = round(g["duration"], 6)
+        if dur <= 0:
+            continue
+        out.append({"path": None, "start": 0.0, "end": dur,
+                    "film_start": round(g["film_start"], 6), "kind": "slug"})
+    if out:
+        out.sort(key=lambda e: e["film_start"])
     # THE TRANSITIONS RIDE ON THE ENTRIES THEY JOIN: `transition` on the
     # outgoing entry, `tx_in` (the extra head, in seconds) on the incoming.
     # Only a transition that resolved without a problem is stamped — one the
@@ -4406,12 +4899,18 @@ def _link_or_copy(src: Path, dest: Path, *, link=None) -> str:
         return "copy"
 
 
-def _nle_segments(clips, *, probe=None) -> list[dict]:
+def _nle_segments(clips, *, probe=None, film_look: str | None = None) -> list[dict]:
     """The export's own view of the timeline: one row per clip, in film order.
 
     `probe` answers {"w","h","duration"} for a file and is injected rather than
     imported, for the same reason `compute_peaks` takes a decoder: this module
     runs no subprocess of its own, and the panel already owns ffprobe.
+
+    `film_look` is `settings.film_look`. EDITOR-14 (Codex 4.17.0): the render
+    folds the whole-film look into every picture's grade (`film_look_stack`,
+    in the render plan) and the export never saw it — a Warm-tungsten film
+    reached After Effects neutral. Folded here the same way, clamped the
+    same way, so each row's `fx` grade is the one the render draws.
     """
     rows: list[dict] = []
     for c in clips or []:
@@ -4434,7 +4933,11 @@ def _nle_segments(clips, *, probe=None) -> list[dict]:
                 info = probe(path) or {}
             except Exception:                                      # noqa: BLE001
                 info = {}
+        fx = clip_effects(c)
+        if film_look and kind != "slug":
+            fx.update(clip_grade({"adjust": film_look_stack(c.get("adjust"), film_look)}))
         rows.append({
+            "id": str(c.get("id") or ""),
             "kind": kind,
             "path": path,
             "title": str(c.get("title") or (Path(path).stem if path else "black")),
@@ -4442,7 +4945,7 @@ def _nle_segments(clips, *, probe=None) -> list[dict]:
             "film_start": fs, "film_end": fe,
             "brightness": clip_brightness(c),
             "frame": clip_frame(c),
-            "fx": clip_effects(c),
+            "fx": fx,
             "w": int(info.get("w") or 0), "h": int(info.get("h") or 0),
             "has_audio": bool(info.get("has_audio")),
             "gain": audio_gain_points(c, clip_audio(c)["len"])
@@ -4555,6 +5058,43 @@ def _fcp7_motion(seg: dict) -> str:
             "</effect></filter>")
 
 
+def _fcp7_transitionitem(entry: dict, fps: int = NLE_FPS) -> str:
+    """The `<transitionitem>` bridging two clipitems the caller has already
+    extended to overlap by `entry['half_frames']` on each side.
+
+    `Cross Dissolve` and `Dip to Color Dissolve` are FCP7's own standard
+    transition names/effect ids — the two Premiere and Resolve both ship —
+    so this needs no custom effect definition to be understood on either
+    side. `Dip to Color Dissolve` carries an explicit `Color` parameter
+    (defaulted black by the effect itself, stated here anyway rather than
+    relied upon) since "dip to WHAT colour" is the one thing the name alone
+    does not say.
+    """
+    at = entry["at_frames"]
+    half = entry["half_frames"]
+    start, end = at - half, at + half
+    is_black = entry["kind"] == "fade_black"
+    name = "Dip to Color Dissolve" if is_black else "Cross Dissolve"
+    color_param = (
+        "<parameter><parameterid>Color</parameterid><name>Color</name>"
+        "<value><alpha>255</alpha><red>0</red><green>0</green><blue>0</blue>"
+        "</value></parameter>") if is_black else ""
+    return (
+        "<transitionitem>"
+        f"<start>{start}</start><end>{end}</end>"
+        "<alignment>center</alignment>"
+        f"{_fcp7_rate(fps)}"
+        "<effect>"
+        f"<name>{_xml_text(name)}</name>"
+        f"<effectid>{_xml_text(name)}</effectid>"
+        "<effectcategory>Dissolve</effectcategory>"
+        "<effecttype>transition</effecttype>"
+        "<mediatype>video</mediatype>"
+        f"{color_param}"
+        "</effect>"
+        "</transitionitem>")
+
+
 def _fcp7_rate(fps: int = NLE_FPS) -> str:
     # ntsc FALSE is load-bearing: at ntsc TRUE an NLE reads timebase 24 as
     # 23.976 and every cut past the first drifts one frame per 1000.
@@ -4593,10 +5133,65 @@ def _fcp7_file(fid: str, seg: dict, media_abs: Path, *, fps: int,
     return "".join(body)
 
 
+def _fcp7_markers(markers: list[dict] | None, fps: int) -> str:
+    """FILM-58: every `markers_of(edit)` row as a SEQUENCE-level `<marker>` —
+    xmeml's own kind, the one both Premiere and Resolve show on the ruler
+    rather than on a track. `<out>-1</out>` is xmeml's own spelling of "this
+    is a point, not a range" — the only kind FILM-58's markers are.
+
+    The label is the marker's NAME (blank reads as "Marker N" in the NLE,
+    which is not nothing but is not what the editor typed either); the kind
+    always goes in the COMMENT, so "beat"/"lyric"/"note" survives even when
+    the editor never gave the marker its own words.
+    """
+    if not markers:
+        return ""
+    out = []
+    for m in markers:
+        label = str(m.get("label") or "").strip() or m["kind"].capitalize()
+        out.append(
+            "<marker>"
+            f"<name>{_xml_text(label)}</name>"
+            f"<comment>{_xml_text(m['kind'])}</comment>"
+            f"<in>{_frames(m['at'], fps)}</in>"
+            "<out>-1</out>"
+            "</marker>")
+    return "".join(out)
+
+
+def _nle_transitions(clips, transitions, fps: int = NLE_FPS) -> dict:
+    """The document's transitions, resolved and keyed for the export.
+
+    Reuses `resolve_transitions` — the SAME resolver the render and the
+    validator use — rather than re-deriving handle math here, so a boundary
+    the render can draw is a boundary the export can draw and a boundary the
+    render refuses (no spare source, an unknown clip, a duplicate) is simply
+    absent from the XML/JSX rather than exported as a transition that would
+    then need its own re-validation. Returns `{"out": {clip_id: entry},
+    "in": {clip_id: entry}}`, each entry `{kind, half_frames, at_frames,
+    half_sec, at_sec}` — both units, since FCP7 XML counts frames and the AE
+    script (seconds throughout, like the rest of `ae_jsx`) does not.
+    """
+    edit = {"clips": clips, "transitions": transitions}
+    out_map: dict = {}
+    in_map: dict = {}
+    for t in resolve_transitions(edit):
+        if t.get("problem"):
+            continue
+        entry = {"kind": t["kind"], "half_frames": _frames(t["half"], fps),
+                 "at_frames": _frames(t["at"], fps),
+                 "half_sec": t["half"], "at_sec": t["at"]}
+        out_map[t["after_clip"]] = entry
+        in_map[t["before_clip"]] = entry
+    return {"out": out_map, "in": in_map}
+
+
 def fcp7_xml(segments, *, name: str, media: dict, width: int, height: int,
              base, fps: int = NLE_FPS, audio: dict | None = None,
              overlays: list | None = None,
-             audio_tracks: list | None = None) -> str:
+             audio_tracks: list | None = None,
+             transitions: dict | None = None,
+             markers: list[dict] | None = None) -> str:
     """The sequence, as the one XML both Premiere and Resolve import.
 
     SLUGS ARE GAPS. A slug could be written as a `<generatoritem>` with the
@@ -4626,6 +5221,8 @@ def fcp7_xml(segments, *, name: str, media: dict, width: int, height: int,
     mdir = Path(str(base)) / "media"
     file_ids: dict = {}
     total = max([_frames(s["film_end"], fps) for s in segments] or [0])
+    tx = transitions or {"out": {}, "in": {}}
+    v_entries: list = []   # (clip_id, xml) — post-processed into v_items below
     v_items, a_items, b_items = [], [], []
     for i, seg in enumerate(segments):
         if seg["kind"] == "slug":
@@ -4642,7 +5239,25 @@ def fcp7_xml(segments, *, name: str, media: dict, width: int, height: int,
         # the film plays, in the wrong order, at the wrong lengths.
         f_in, f_out = _frames(seg["start"], fps), _frames(seg["end"], fps)
         f_s, f_e = _frames(seg["film_start"], fps), _frames(seg["film_end"], fps)
-        v_items.append(
+        # THE AUDIO CLIPITEM KEEPS ITS OWN, UNEXTENDED NUMBERS — "the audio
+        # plan never sees the extension" (TRANSITION_KINDS' own docstring):
+        # only the PICTURE crossfades; the clip's sound stays a hard cut at
+        # the original boundary, exactly as the render already does it.
+        av_in, av_out, av_s, av_e = f_in, f_out, f_s, f_e
+        # FILM-50: A TRANSITION EXTENDS THE CLIPITEM, NEVER THE SEGMENT. The
+        # extra picture comes from spare SOURCE material beyond the trim
+        # (the render's own model — see TRANSITION_KINDS' docstring) so only
+        # the local frame numbers written into THIS tag grow; `seg` itself
+        # stays untouched, which matters because `_fcp7_opacity` below reads
+        # `seg`'s own film_start/film_end for an unrelated fade and must not
+        # see a boundary that moved for a different reason.
+        out_tx = tx["out"].get(seg.get("id"))
+        in_tx = tx["in"].get(seg.get("id"))
+        if out_tx:
+            f_e += out_tx["half_frames"]; f_out += out_tx["half_frames"]
+        if in_tx:
+            f_s -= in_tx["half_frames"]; f_in -= in_tx["half_frames"]
+        v_entries.append((seg.get("id"),
             f'<clipitem id="clipitem-{i + 1}">'
             f"<name>{_xml_text(seg['title'])}</name>"
             f"<enabled>TRUE</enabled>"
@@ -4654,7 +5269,7 @@ def fcp7_xml(segments, *, name: str, media: dict, width: int, height: int,
             f"<compositemode>normal</compositemode>"
             f"{_fcp7_motion(seg)}"
             f"{_fcp7_opacity(seg, fps)}"
-            f"</clipitem>")
+            f"</clipitem>"))
         if seg["has_audio"]:
             # DISABLED, NOT DELETED. A muted clip whose audio clipitem was
             # simply omitted would arrive in Premiere as a shot that never had
@@ -4666,15 +5281,32 @@ def fcp7_xml(segments, *, name: str, media: dict, width: int, height: int,
                 f'<clipitem id="clipitem-a{i + 1}">'
                 f"<name>{_xml_text(seg['title'])}</name>"
                 f"<enabled>{'FALSE' if seg.get('muted') else 'TRUE'}</enabled>"
-                f"<duration>{max(1, f_out - f_in)}</duration>"
+                f"<duration>{max(1, av_out - av_in)}</duration>"
                 f"{_fcp7_rate(fps)}"
-                f"<start>{f_s}</start><end>{f_e}</end>"
-                f"<in>{f_in}</in><out>{f_out}</out>"
+                f"<start>{av_s}</start><end>{av_e}</end>"
+                f"<in>{av_in}</in><out>{av_out}</out>"
                 f'<file id="{_xml_text(fid)}"/>'
                 f"<sourcetrack><mediatype>audio</mediatype>"
                 f"<trackindex>1</trackindex></sourcetrack>"
                 f"{_fcp7_levels(seg.get('gain'), fps)}"
                 f"</clipitem>")
+    # A TRANSITIONITEM ONLY WHEN BOTH SIDES ACTUALLY PRODUCED A CLIPITEM. A
+    # transition resolved against a slug (TRANSITION_KINDS allows one — a
+    # slug has no source clock, so `_spare_source` never refuses it) has
+    # nothing on the OTHER side to bridge: a slug is a GAP in this track, not
+    # a clipitem, so it is left as the plain cut it already was rather than
+    # exported as a half-transition with nothing to dissolve into.
+    for k in range(len(v_entries) - 1):
+        cur_id, cur_xml = v_entries[k]
+        nxt_id, _ = v_entries[k + 1]
+        entry = tx["out"].get(cur_id)
+        if entry is not None and entry is tx["in"].get(nxt_id):
+            v_items.append(cur_xml)
+            v_items.append(_fcp7_transitionitem(entry, fps))
+        else:
+            v_items.append(cur_xml)
+    if v_entries:
+        v_items.append(v_entries[-1][1])
     # ---- V2: the overlay lane ------------------------------------------
     ov_items = []
     for j, o in enumerate(overlays or []):
@@ -4822,6 +5454,9 @@ def fcp7_xml(segments, *, name: str, media: dict, width: int, height: int,
         f"{extra_tracks}"
         "</audio>"
         "</media>"
+        # SEQUENCE-level, after </media> and before </sequence> — the slot
+        # xmeml defines for them, and the one both importers read from.
+        f"{_fcp7_markers(markers, fps)}"
         "</sequence>\n"
         "</xmeml>\n")
 
@@ -4829,7 +5464,9 @@ def fcp7_xml(segments, *, name: str, media: dict, width: int, height: int,
 def ae_jsx(segments, *, name: str, media: dict, width: int, height: int,
            fps: int = NLE_FPS, audio: dict | None = None,
            overlays: list | None = None,
-           audio_tracks: list | None = None) -> str:
+           audio_tracks: list | None = None,
+           transitions: dict | None = None,
+           markers: list[dict] | None = None) -> str:
     """An ExtendScript that BUILDS the comp, because AE cannot import a timeline.
 
     It locates its own folder (`File($.fileName).parent`) and imports from the
@@ -4855,19 +5492,34 @@ def ae_jsx(segments, *, name: str, media: dict, width: int, height: int,
         "    if (!f.exists) { throw new Error('missing media: ' + f.fsName); }",
         "    return proj.importFile(new ImportOptions(f));",
         "  }",
-        "  function bright(layer, v) {",
-        "    // Brightness & Contrast. AE's Brightness is roughly [-150, 150]",
-        "    // against a 0-255 pixel; ffmpeg's eq=brightness is an additive",
-        "    // offset in [-1, 1] against a 0-1 pixel. 0.5 -> 75 is the same",
-        "    // half-of-half. APPROXIMATE, not a match: AE and ffmpeg do not",
-        "    // agree on gamma, and the render is the one that is exact.",
+        "  function bright(layer, v, con) {",
+        "    // Brightness & Contrast. AE's Brightness/Contrast are each",
+        "    // roughly [-150, 150] against a 0-255 pixel; ffmpeg's",
+        "    // eq=brightness is additive in [-1, 1] and eq=contrast a",
+        "    // 1.0-centred multiplier in [0.5, 1.8] against a 0-1 pixel.",
+        "    // 0.5 -> 75 and (contrast-1) -> (contrast-1)*150 are the same",
+        "    // half-of-half scaling. APPROXIMATE, not a match: AE and ffmpeg",
+        "    // do not agree on gamma, and the render is the one that is exact.",
         "    var fx = layer.property('ADBE Effect Parade')",
         "               .addProperty('ADBE Brightness & Contrast 2');",
         "    fx.property(1).setValue(v);",
+        "    if (con) { fx.property(2).setValue(con); }",
+        "  }",
+        "  function satur(layer, v) {",
+        "    // FILM-14's saturation slider. ffmpeg's eq=saturation is a",
+        "    // 1.0-centred multiplier in [0, 2.5]; AE's Master Saturation is",
+        "    // roughly [-100, 100] around 0. APPROXIMATE, like brightness.",
+        "    var fx = layer.property('ADBE Effect Parade')",
+        "               .addProperty('ADBE HUE SATURATION');",
+        "    fx.property('Master Saturation').setValue(v);",
         "  }",
     ]
+    tx = transitions or {"out": {}, "in": {}}
     for i, seg in enumerate(segments):
-        ae_b = round(seg["brightness"] * 150.0, 3)
+        fxseg = seg.get("fx") or {}
+        ae_b = round((seg["brightness"] + _f(fxseg.get("exposure"), 0.0)) * 150.0, 3)
+        ae_con = round((_f(fxseg.get("contrast"), 1.0) - 1.0) * 150.0, 3)
+        ae_sat = round((_f(fxseg.get("saturation"), 1.0) - 1.0) * 100.0, 3)
         if seg["kind"] == "slug":
             lines += [
                 f"  // {i + 1}: black slug",
@@ -4888,12 +5540,28 @@ def ae_jsx(segments, *, name: str, media: dict, width: int, height: int,
             # clamp any hold longer than that.
             lines.append("  lay.startTime = %.6f;"
                          % (seg["film_start"] - seg["start"]))
+        # FILM-50: A TRANSITION EXTENDS THE LAYER'S PRESENCE WINDOW, never
+        # `seg` itself — the same rule fcp7_xml follows, for the same reason
+        # (the fx fade block just below reads seg's own film_start/film_end
+        # for an UNRELATED fade and must not see a boundary that moved for a
+        # different reason). AE has no separate source-in/out clock the way
+        # FCP7's XML does: `startTime` already anchors where the untrimmed
+        # footage's own frame 0 sits, so extending inPoint/outPoint alone
+        # reveals more of the SAME footage already loaded — nothing else to
+        # recompute.
+        out_tx = tx["out"].get(seg.get("id"))
+        in_tx = tx["in"].get(seg.get("id"))
+        ae_out = seg["film_end"] + (out_tx["half_sec"] if out_tx else 0.0)
+        ae_in = seg["film_start"] - (in_tx["half_sec"] if in_tx else 0.0)
         lines += [
-            "  lay.inPoint = %.6f;" % seg["film_start"],
-            "  lay.outPoint = %.6f;" % seg["film_end"],
+            "  lay.inPoint = %.6f;" % ae_in,
+            "  lay.outPoint = %.6f;" % ae_out,
         ]
-        if abs(seg["brightness"]) >= 1e-9:
-            lines.append("  bright(lay, %s);" % ae_b)
+        if abs(ae_b) >= 1e-9 or abs(ae_con) >= 1e-9:
+            lines.append("  bright(lay, %s%s);"
+                         % (ae_b, (", %s" % ae_con) if abs(ae_con) >= 1e-9 else ""))
+        if abs(ae_sat) >= 1e-9:
+            lines.append("  satur(lay, %s);" % ae_sat)
         fr = seg.get("frame") or {}
         z = _f(fr.get("zoom"), 1.0)
         if abs(z - 1.0) >= 1e-9:
@@ -4927,6 +5595,38 @@ def ae_jsx(segments, *, name: str, media: dict, width: int, height: int,
             lines.append("  op = lay.property('ADBE Transform Group')"
                          ".property('ADBE Opacity');")
             for when, val in pts:
+                lines.append("  op.setValueAtTime(%.6f, %d);" % (when, val))
+        # FILM-50: THE TRANSITION, AS OPACITY — AE has no importable
+        # transition object, so this is the same "the decision travels"
+        # promise the fade block just above keeps, for a boundary instead of
+        # an edge. `comp.layers.add()` always inserts at the TOP of the
+        # stack, so a clip added LATER in film order (the INCOMING side of
+        # any boundary) ends up ABOVE the one before it — every transition
+        # here is built around that, not against it:
+        #   dissolve: only the INCOMING layer animates, 0->100 across the
+        #     WHOLE overlap. It is on top, so fading it up from transparent
+        #     progressively reveals the outgoing layer sitting static
+        #     underneath — a standard crossfade, without needing the two
+        #     layers' opacities to sum to anything in particular.
+        #   fade_black: OUTGOING fades 100->0 over the FIRST half only,
+        #     INCOMING fades 0->100 over the SECOND half only — the two
+        #     windows never overlap, so which layer is on top does not
+        #     matter; at the midpoint both read 0, which is what makes it a
+        #     dip through black rather than a dissolve.
+        tx_pts = []
+        if out_tx and out_tx["kind"] == "fade_black":
+            a, h = out_tx["at_sec"], out_tx["half_sec"]
+            tx_pts += [(max(0.0, a - h), 100), (a, 0)]
+        if in_tx:
+            a, h = in_tx["at_sec"], in_tx["half_sec"]
+            if in_tx["kind"] == "fade_black":
+                tx_pts += [(a, 0), (a + h, 100)]
+            else:
+                tx_pts += [(max(0.0, a - h), 0), (a + h, 100)]
+        if tx_pts:
+            lines.append("  op = lay.property('ADBE Transform Group')"
+                         ".property('ADBE Opacity');")
+            for when, val in tx_pts:
                 lines.append("  op.setValueAtTime(%.6f, %d);" % (when, val))
         gain = seg.get("gain") or []
         if len(gain) >= 2:
@@ -5040,6 +5740,16 @@ def ae_jsx(segments, *, name: str, media: dict, width: int, height: int,
                                  % (w["film_start"] + t, db, db))
             if strip_muted(s) or track_muted(trk):
                 lines.append("  lay.audioEnabled = false;")
+    # ---- FILM-58: MARKERS, on the comp's own ruler ------------------------
+    # `comp.markerProperty` is the one AE property every composition already
+    # has — no layer to attach them to, no extra import — and MarkerValue's
+    # comment is what the Timeline panel shows under the flag.
+    for m in (markers or []):
+        label = str(m.get("label") or "").strip() or m["kind"].capitalize()
+        lines.append(
+            "  comp.markerProperty.setValueAtTime(%.6f, new MarkerValue(%s));"
+            % (_f(m["at"]), _jsx_string(label + " (" + m["kind"] + ")"
+                                         if m.get("label") else label)))
     lines += [
         "  comp.openInViewer();",
         "  app.endUndoGroup();",
@@ -5053,7 +5763,10 @@ def export_nle(clips, dest_dir, *, name: str, fps: int = NLE_FPS,
                audio: dict | None = None, probe=None, link=None,
                width: int = 0, height: int = 0,
                overlays: list | None = None,
-               audio_tracks: list | None = None) -> dict:
+               audio_tracks: list | None = None,
+               transitions: list | None = None,
+               markers: list[dict] | None = None,
+               film_look: str | None = None) -> dict:
     """Write `<name>_project/` — one XML, one AE script, and the media beside them.
 
     Returns {"ok", "dir", "xml", "jsx", "clips", "linked", "copied",
@@ -5061,11 +5774,23 @@ def export_nle(clips, dest_dir, *, name: str, fps: int = NLE_FPS,
 
     `audio_tracks` is `edit["audio_tracks"]`: each track becomes its own audio
     track in the XML and its strips their own layers in the AE script.
+
+    `transitions` is `edit["transitions"]` — the raw rows, resolved here
+    (once, via `_nle_transitions`) into the same `{"out", "in"}` map both
+    `fcp7_xml` and `ae_jsx` read, so the XML's transitionitem and the
+    script's opacity ramp always describe the SAME boundary the render will
+    actually draw, never two independent readings of the document.
+
+    `markers` is `markers_of(edit)` — FILM-58's beat/lyric/note flags, each
+    written as a sequence-level FCP7 marker and a composition marker on the
+    AE comp. They cost the caller nothing to omit: no markers is no markers,
+    the same rule `overlays` and `audio_tracks` already follow.
     """
     import shutil                                                 # noqa: PLC0415, F401
-    segs = _nle_segments(clips, probe=probe)
+    segs = _nle_segments(clips, probe=probe, film_look=film_look)
     if not segs:
         raise EditError("there is nothing on the timeline to export")
+    tx_map = _nle_transitions(clips, transitions, fps)
     root = Path(str(dest_dir)) / f"{_slug(name, 60)}_project"
     media_dir = root / "media"
     media_dir.mkdir(parents=True, exist_ok=True)
@@ -5111,15 +5836,18 @@ def export_nle(clips, dest_dir, *, name: str, fps: int = NLE_FPS,
 
     xml_path = root / f"{_slug(name, 60)}.xml"
     jsx_path = root / f"{_slug(name, 60)}_ae.jsx"
+    mks = [m for m in (markers or []) if isinstance(m, dict)]
     xml_path.write_text(
         fcp7_xml(segs, name=name, media=media, width=width, height=height,
                  overlays=ovs,
                  base=root, fps=fps, audio=a_arg,
-                 audio_tracks=trks or None), encoding="utf-8")
+                 audio_tracks=trks or None, transitions=tx_map,
+                 markers=mks or None), encoding="utf-8")
     jsx_path.write_text(
         ae_jsx(segs, name=name, media=media, width=width, height=height,
                overlays=ovs,
-               fps=fps, audio=a_arg, audio_tracks=trks or None), encoding="utf-8")
+               fps=fps, audio=a_arg, audio_tracks=trks or None,
+               transitions=tx_map, markers=mks or None), encoding="utf-8")
     return {
         "ok": True, "dir": str(root), "xml": str(xml_path),
         "jsx": str(jsx_path), "clips": len(segs),
@@ -5127,6 +5855,7 @@ def export_nle(clips, dest_dir, *, name: str, fps: int = NLE_FPS,
         "media": sorted(media.values()),
         "sound_strips": sum(1 for t in trks for s in track_strips(t)
                             if str(s.get("path") or "") in media),
+        "markers": len(mks),
         "width": width, "height": height,
         "duration": round(max([s["film_end"] for s in segs] or [0.0]), 3),
     }
@@ -5322,6 +6051,46 @@ def create_draft(board_dir, name: str, *, from_current: bool = False) -> dict:
 
 
 @_under_board_lock
+def set_aside_for_replan(board_dir, when: str = "") -> dict | None:
+    """Keep the current timeline as a draft of its own and start the next one
+    fresh. Returns `{"kept": <name>, "active": <name>}`, or None when there
+    was no timeline with clips to keep.
+
+    BOARD-7: a music video re-planned through the Audio tab replaced the
+    board's shots but left `edit.json` — the cut of the OLD plan — as the
+    active timeline, and Export prefers a saved timeline over the shot list,
+    so it silently assembled the previous version. The old cut is not thrown
+    away (it is somebody's arrangement): `edit.json` is MOVED to the draft
+    file an inactive draft lives in, renamed so the list says what it is,
+    and a new active draft with no file takes its place — so the next Editor
+    open builds the new plan's timeline the ordinary way, and Export uses the
+    new shots until then.
+    """
+    cur = edit_path(board_dir)
+    doc = _read_json(cur)
+    if not isinstance(doc, dict) or not (doc.get("clips") or []):
+        return None
+    idx = load_draft_index(board_dir)
+    old = idx["active"]
+    drafts_dir(board_dir).mkdir(parents=True, exist_ok=True)
+    os.replace(cur, _draft_file(board_dir, old))
+    stamp = f" ({when})" if when else ""
+    kept_name = ""
+    for d in idx["drafts"]:
+        if d["slug"] == old:
+            base = str(d.get("name") or old)
+            d["name"] = (base + " — before re-plan" + stamp)[:DRAFT_NAME_MAX]
+            kept_name = d["name"]
+    text = ("New plan" + stamp)[:DRAFT_NAME_MAX]
+    slug = _draft_slug(text, {d["slug"] for d in idx["drafts"]})
+    idx["drafts"].append({"slug": slug, "name": text,
+                          "created_at": int(time.time())})
+    idx["active"] = slug
+    _save_draft_index(board_dir, idx)
+    return {"kept": kept_name, "active": text}
+
+
+@_under_board_lock
 def duplicate_draft(board_dir, slug: str, name: str = "") -> dict:
     """Copy a draft under a new name. The copy becomes active."""
     idx = load_draft_index(board_dir)
@@ -5502,13 +6271,54 @@ def latest_snapshot(board_dir, slug: str = "") -> tuple[Path, dict] | None:
     return None
 
 
-def prune_snapshots(board_dir, *, keep: int = SNAPSHOT_KEEP) -> int:
-    """Drop the oldest snapshots past the cap. Losing one is not an event."""
+def _snapshot_stamp_ms(path) -> int | None:
+    """The clock the snapshot was written at, straight off its own name —
+    `snap-<13-digit-ms>-<bump>.json` — rather than the filesystem's mtime,
+    which a copy, a backup tool or a slow disk can all disturb. None for
+    anything that does not match (a legacy or foreign file `_snapshot_paths`
+    should not have handed back, but pruning must not crash on one either)."""
+    m = re.match(r"^" + re.escape(_SNAP_PREFIX) + r"(\d{13})-\d{3}\.json$",
+                 Path(path).name)
+    return int(m.group(1)) if m else None
+
+
+def prune_snapshots(board_dir, *, keep_hours: float = SNAPSHOT_KEEP_HOURS,
+                    hard_cap: int = SNAPSHOT_HARD_CAP) -> int:
+    """Drop snapshots older than `keep_hours`, and — ONLY past `hard_cap`
+    files — the oldest ones regardless of age. Losing one is not an event.
+
+    FILM-57: the lane used to be a flat count (`keep`, formerly 20), which
+    read as "about 30 s of active editing" on a document that re-backs up
+    itself every debounce tick even with nothing new to save (fixed at the
+    source: sbeTick's watchdog no longer re-arms sbeQueueSave once the
+    current state is already covered). Time is the axis a person actually
+    reasons about ("what did this look like an hour ago"), not "the 14th
+    most recent write" — so age is now the primary rule. `hard_cap` is a
+    backstop, not a design target: it exists only so a bug elsewhere that
+    hammers the backup route cannot fill a disk, and at 500 files it is far
+    above anything a real editing session reaches inside a day.
+    """
     paths = _snapshot_paths(board_dir)
+    now_ms = int(time.time() * 1000)
+    cutoff_ms = now_ms - int(keep_hours * 3600 * 1000)
     gone = 0
-    for stale in paths[:max(0, len(paths) - int(keep))]:
+    # Oldest-past-the-hard-cap first (paths is already oldest-first — see
+    # _snapshot_paths' sort), so a burst that is ALSO too big loses its
+    # oldest files whether or not they have aged past the time window yet.
+    over = max(0, len(paths) - int(hard_cap))
+    stale = set(paths[:over])
+    for p in paths:
+        if p in stale:
+            continue
+        stamp = _snapshot_stamp_ms(p)
+        # An unparsable name is never aged out by the clock — only the hard
+        # cap above can remove it — so a foreign or legacy file is never
+        # silently deleted by a rule it was not named for.
+        if stamp is not None and stamp < cutoff_ms:
+            stale.add(p)
+    for p in stale:
         try:
-            stale.unlink()
+            p.unlink()
             gone += 1
         except OSError:
             continue
@@ -5639,7 +6449,10 @@ def pending_backup(board_dir) -> dict | None:
         return None
     return {"file": p.name, "at": int(doc.get("backed_up_at") or 0),
             "draft": idx["active"], "clips": stats["clips"],
-            "duration": stats["duration"]}
+            "duration": stats["duration"],
+            # FILM-54: what actually changed, so the chip can say it instead
+            # of asking a question it cannot name.
+            "diff": edit_diff_summary(saved, doc)}
 
 
 def recover_backup(board_dir) -> dict:

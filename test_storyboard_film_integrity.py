@@ -245,5 +245,100 @@ class StillFadesReachTheEncoder(unittest.TestCase):
         self.assertIn("fade=t=out", still_chain)
 
 
+class RepeatRendersDoNotOverwriteEachOther(unittest.TestCase):
+    """FILM-28, through the real `/storyboard/edit/render` route: three
+    renders of the same board at the same delivery used to write the same
+    file three times, with only the mtime to tell them apart. Now the
+    second and third get `_r2`, `_r3` — versioned, never clobbered."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.state, self.out = root / "state", root / "outputs"
+        self.state.mkdir()
+        self.out.mkdir()
+        for p in (mock.patch.object(panel, "STATE_DIR", self.state),
+                  mock.patch.object(panel, "OUTPUT", self.out),
+                  mock.patch.object(panel, "push", lambda *a, **k: None)):
+            p.start()
+            self.addCleanup(p.stop)
+        self.clip = root / "a.mp4"
+        self.clip.write_bytes(b"clip")
+        board = _board("sb_t", "Night Drive")
+        storyboard.save_storyboard(self.state, board)
+        self.bdir = storyboard.board_dir(self.state, "sb_t")
+        edit = {"version": sedit.EDIT_VERSION, "board_id": "sb_t", "revision": 0,
+                "source": "human", "audio": None, "beats": None, "settings": {},
+                "clips": [sedit.new_clip(str(self.clip), 0.0, 2.0, 0.0,
+                                         source="human", duration=2.0)]}
+        sedit.save_edit(self.bdir, edit)
+
+        def fake_ffmpeg(cmd, label):
+            Path(cmd[-1]).write_bytes(b"film")
+        self._probe = mock.patch.object(
+            panel, "_sb_probe_clip",
+            return_value={"has_audio": False, "duration": 2.0, "w": 640,
+                         "h": 360, "sample_rate": 0})
+        self._ffmpeg = mock.patch.object(panel, "run_ffmpeg_tracked",
+                                         side_effect=fake_ffmpeg)
+        self._probe.start(); self._ffmpeg.start()
+        self.addCleanup(self._probe.stop)
+        self.addCleanup(self._ffmpeg.stop)
+
+    def _render(self, **form):
+        from test_storyboard_editor_api import FakeHandler
+        h = FakeHandler()
+        h.post("edit/render", {"id": "sb_t", **form})
+        self.assertTrue(h.payload.get("ok"), h.payload)
+        return Path(h.payload["path"])
+
+    def test_three_renders_at_the_same_delivery_are_three_files(self):
+        p1 = self._render()
+        p2 = self._render()
+        p3 = self._render()
+        self.assertEqual(p1.name, "night-drive_film.mp4")
+        self.assertEqual(p2.name, "night-drive_film_r2.mp4")
+        self.assertEqual(p3.name, "night-drive_film_r3.mp4")
+        # All three are real, distinct files — nothing got overwritten.
+        for p in (p1, p2, p3):
+            self.assertTrue(p.is_file(), p)
+        names = {f["name"] for f in panel._sb_films(_board("sb_t", "Night Drive"),
+                                                     probe=False)}
+        self.assertEqual(names, {p1.name, p2.name, p3.name})
+
+    def test_an_explicit_out_still_renders_in_place(self):
+        # `out=` is the deliberate escape hatch (re-render a NAMED delivery
+        # over itself); versioning must not fight it.
+        p1 = self._render(out="custom.mp4")
+        p2 = self._render(out="custom.mp4")
+        self.assertEqual(p1, p2)
+
+    def test_loudnorm_reaches_the_encoder_through_the_route(self):
+        with mock.patch.object(panel, "run_ffmpeg_tracked",
+                               side_effect=lambda cmd, label:
+                               (self._seen.__setitem__("cmd", cmd),
+                                Path(cmd[-1]).write_bytes(b"film"))):
+            self._seen = {}
+            self._render(loudnorm="on")
+        # EDITOR-2 (Codex 4.17.0): one link inside -filter_complex, mapped by
+        # its label — `-af` on a stream fed from the complex graph is refused
+        # by ffmpeg outright.
+        cmd = self._seen["cmd"]
+        self.assertNotIn("-af", cmd)
+        graph = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("[aout]loudnorm=I=-14:TP=-1.5:LRA=11[aoutln]", graph)
+        self.assertIn("[aoutln]", cmd)
+
+    def test_loudnorm_off_by_default_through_the_route(self):
+        with mock.patch.object(panel, "run_ffmpeg_tracked",
+                               side_effect=lambda cmd, label:
+                               (self._seen.__setitem__("cmd", cmd),
+                                Path(cmd[-1]).write_bytes(b"film"))):
+            self._seen = {}
+            self._render()
+        self.assertNotIn("-af", self._seen["cmd"])
+
+
 if __name__ == "__main__":
     unittest.main()

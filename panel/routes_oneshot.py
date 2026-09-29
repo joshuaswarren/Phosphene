@@ -102,11 +102,17 @@ def get_oneshot_estimate(h, parsed) -> None:
         h._json({"ok": False, "error": f"seconds must be one of {list(P.TAKE_SECONDS)}",
                  "choices": list(P.TAKE_SECONDS)}, 400); return
     minutes = P.take_estimate_minutes(engine, quality, seconds)
+    # VA-16: the ceiling if every part hits its worst case (a light-drift
+    # retake plus every lip-sync retake) — a mechanism-derived bound, shown
+    # as "up to", not a second point estimate.
+    minutes_worst = P.take_estimate_minutes_worst(engine, quality, seconds)
     h._json({"ok": True, "seconds": plan["seconds"], "beats": plan["beats"],
              "parts": len(plan["parts"]), "beats_per_part": plan["beats_per_part"],
              "part_seconds": (15 if plan["engine"] == "h3" else P.TAKE_LTX_PART_FRAMES // 24),
              "engine": plan["engine"], "minutes": minutes,
-             "eta": (P._fmt_eta(minutes) if minutes else None)})
+             "eta": (P._fmt_eta(minutes) if minutes else None),
+             "minutes_worst": minutes_worst,
+             "eta_worst": (P._fmt_eta(minutes_worst) if minutes_worst else None)})
 
 
 @post("/oneshot/plan")

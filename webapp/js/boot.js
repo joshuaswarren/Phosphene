@@ -15,11 +15,7 @@ globalThis.PIPERSR_UPSCALE_ENABLED = !!BOOT.pipersr_upscale_enabled;
 // (useful for low-RAM-user testing on Mr Bizarro's M4 Max).
 window.PHOSPHENE_CAP_TIER = (BOOT.cap_tier || 'q8');
 
-// Apply tier-aware time estimates to the Quality pill subtitles. The HTML
-// ships with the Comfortable-tier (M4 Studio 64 GB) numbers as defaults;
-// users on Compact / Roomy / Studio tiers see realistic estimates instead
-// of the optimistic baseline. Runs once on boot, plus when the tier modal
-// reports new info (rare — tier is fixed for a given Mac).
+// Apply tier-aware time estimates to the Quality pill subtitles.
 function applyTierTimes() {
   // NO-OP for the LTX strip since v4.0, deliberately, and kept as a named
   // function because the tier modal still calls it.
@@ -29,11 +25,11 @@ function applyTierTimes() {
   // canvas and the frame count. Two writers for one span is how a chip ends up
   // claiming "1024×576 · about 8 min" for a render the table prices at ~2 min.
   //
-  // The tier-aware estimate is not lost: BOOT.quality_times is a RAM-tier
-  // figure, and the tier table's own model is anchored on renders measured on
-  // this class of machine. When a per-tier coefficient is wanted it belongs in
-  // ltx_estimate_minutes(), server-side, where one number serves the chip, the
-  // Length meta and the queue card at once.
+  // The tier-aware estimate is not lost: every LTX chip reads BOOT.ltx.tiers
+  // (ltx_tiers_payload(), server-side), which is chip-AND-RAM-aware per
+  // VC-01 — a strictly better number than a RAM-tier-only figure ever was.
+  // BOOT.quality_times (a RAM-tier-only table, now retired — VC-12/SYS-20)
+  // is gone; the Tier modal reads the same honest source via honest_tier_times().
   return;
 }
 
@@ -79,8 +75,8 @@ function setKeyframeMode(n) {
   const hint = document.getElementById('keyframeHint');
   if (hint) {
     hint.textContent = n >= 3
-      ? `${n} Keyframes needs Q8 (auto-selects High quality). Intermediate beats are locked at their At(s) times below.`
-      : 'FFLF needs Q8 (auto-selects High quality). The model interpolates between the first and last frames.';
+      ? `${n} Keyframes needs Q8 — it always renders the Q8 two-stage pass, whatever the Quality pill says. Intermediate beats are locked at their At(s) times below.`
+      : 'FFLF needs Q8 — it always renders the Q8 two-stage pass, whatever the Quality pill says. The model interpolates between the first and last frames.';
   }
   if (currentMode === 'keyframe') {
     document.querySelectorAll('#modeGroup .pill-btn').forEach(b => {
@@ -320,6 +316,11 @@ function filteredMainOutputs() {
   if (mainOutputsFilter === 'photos') all = all.filter(o => outputKind(o) === 'image');
   else if (mainOutputsFilter === 'audio') all = all.filter(o => outputKind(o) === 'audio');
   else if (mainOutputsFilter !== 'all') all = all.filter(o => outputKind(o) === 'video');
+  // VC-04: when the Hidden view is on, /status was asked with
+  // include_hidden=1 (queue.js poll()), which returns hidden AND visible
+  // outputs mixed — this is the other half of that filter, narrowing to
+  // just the hidden ones instead of showing everything twice-over.
+  all = (filterMode === 'hidden') ? all.filter(o => o.hidden) : all.filter(o => !o.hidden);
   return applyOutputsQuery(all);
 }
 
@@ -539,9 +540,19 @@ function _autoMainOutputsFilterForMode(mode) {
 //
 // A clip that predates the field has no `model` and falls back to BOOT.model
 // silently — the old behaviour, for the only case where it was ever right.
+// H3-34: an H3 clip's raw model path (.../mlx_models/hailuo-h3/deepbeep-
+// pruned-bf16/models/h3-dit-q8/...) fell through the same slice-off-the-
+// last-two-segments logic LTX paths use, which reads a quantization-pack
+// folder name, not an engine — so the credit read a bare "models/h3-dit-
+// q8" with no indication it names H3 at all. Recognize the H3 tree
+// explicitly and say the engine.
 function _modelCreditLabel(raw) {
   const m = String(raw || '');
   if (!m) return '';
+  if (/\/hailuo-h3\//.test(m) || /\bh3-dit-(q8|bf16)\b/.test(m)) {
+    return /\bh3-dit-q8\b|\/models\/h3-dit-q8\//.test(m) || /deepbeep-pruned-q8/.test(m)
+      ? 'Hailuo H3 · compact (Q8)' : 'Hailuo H3 · full (bf16)';
+  }
   let label = m;
   const idx = m.indexOf('mlx_models/');
   if (idx >= 0) label = m.slice(idx + 'mlx_models/'.length);
@@ -552,10 +563,19 @@ function updateModelCredit(path) {
   const el = document.getElementById('modelTag');
   if (!el) return;
   let raw = '';
+  let entry = null;
   try {
     const p = path || (typeof activePath !== 'undefined' ? activePath : '');
-    const entry = (typeof currentOutputs !== 'undefined' && currentOutputs || []).find(o => o && o.path === p);
-    if (entry && entry.kind === 'audio' && entry.engine === 'music') {
+    entry = (typeof currentOutputs !== 'undefined' && currentOutputs || []).find(o => o && o.path === p);
+    // VC-20: a song is only "what's active" while the Audio tab itself is
+    // showing it. Browsing to Outputs -> Audio from the Video tab is a
+    // FILTER on the gallery, not a switch of what Generate will render —
+    // the credit chip stayed pinned to the last song's "YuE2 · MLX by
+    // vanch007" even though the LTX form on the left was still the one
+    // about to run. Off that tab, ignore the clip's own engine entirely
+    // and fall through to the form's own model (BOOT.model below).
+    const onAudioTab = document.body.dataset.workflow === 'audio';
+    if (entry && entry.kind === 'audio' && entry.engine === 'music' && onAudioTab) {
       // The slot is a short chip beside the Now/Queue tabs: the full credit
       // lives in the tooltip and on the Compose form.
       el.textContent = 'YuE2 · MLX by vanch007';
@@ -563,11 +583,43 @@ function updateModelCredit(path) {
       el.href = 'https://github.com/vanch007/mlx-Yue';
       return;
     }
-    if (entry && entry.model) raw = entry.model;
+    // A song browsed from another tab credits the form's engine, not the
+    // song (VC-20) — so it must not count as "a selected clip" for the
+    // H3-34 active-engine fallback below either.
+    if (entry && entry.kind === 'audio' && entry.engine === 'music') entry = null;
+    if (entry && entry.model) {
+      raw = entry.model;
+    }
   } catch (e) {}
-  el.textContent = _modelCreditLabel(raw || BOOT.model);
-  el.title = 'MLX port by @dgrauet';
-  el.href = 'https://github.com/dgrauet/ltx-2-mlx';
+  // H3-34: with no clip selected (or one that predates the `model` field),
+  // this fell back to BOOT.model unconditionally — a server-rendered
+  // snapshot from page load that is ALWAYS the LTX pack, regardless of
+  // engine. On H3 that showed "ltx-2.5-mlx-q4" while the form was set up to
+  // render on H3 entirely. Fall back to whichever engine is actually active.
+  if (!raw && !entry && document.body.dataset.engine === 'h3') {
+    const kind = (typeof H3 !== 'undefined' && H3.dit_choice && H3.dit_choice.kind) || 'bf16';
+    el.textContent = kind === 'q8' ? 'Hailuo H3 · compact (Q8)' : 'Hailuo H3 · full (bf16)';
+    el.title = `Current engine: ${el.textContent} — MiniMax H3 (FL2VA)`;
+    el.href = 'https://github.com/mrbizarro/minimax-h3-mlx';
+    return;
+  }
+  const label = _modelCreditLabel(raw || BOOT.model);
+  el.textContent = label;
+  const isH3Label = label.indexOf('Hailuo H3') === 0;
+  const credit = isH3Label ? 'MiniMax H3 (FL2VA)' : 'MLX port by @dgrauet';
+  // SYS-39: this label follows the SELECTED clip (deliberately — see the
+  // comment above; it used to credit the currently-loaded engine and
+  // mis-attributed every older-generation clip). Without any hint of
+  // that, selecting an old output and watching the tag change reads as
+  // "the engine changed", which it hasn't. The tooltip says what it
+  // actually is; `raw` set means "this clip", the fallback means "no clip
+  // selected yet".
+  el.title = raw
+    ? `This clip was rendered with ${label} — ${credit}`
+    : `Current engine: ${label} — ${credit}`;
+  el.href = isH3Label
+    ? 'https://github.com/mrbizarro/minimax-h3-mlx'
+    : 'https://github.com/dgrauet/ltx-2-mlx';
 }
 updateModelCredit();
 // `audio` is still a free-text input (advanced section); `image` is now a
@@ -596,6 +648,11 @@ function toggleAvoidRow(forceOpen) {
   if (wantOpen && ta) {
     try { ta.focus(); } catch (e) {}
   }
+  // VC-15: the collapsed label also needs "(off at Balanced)" appended
+  // when guidance is ignored at the current mode/quality — recomputed
+  // here (not just from updateDerived's poll) so opening/closing the row
+  // updates it immediately rather than waiting a beat.
+  if (typeof updateAvoidIgnoredState === 'function') { try { updateAvoidIgnoredState(); } catch (e) {} }
 }
 // Auto-open the Avoid row if it has content (e.g. loaded from a sidecar
 // via loadParams). Run once at boot AND after loadParams sets values.
@@ -684,6 +741,19 @@ function setMode(mode) {
     mode = 't2v';
   }
   currentMode = mode;
+  // VA-23: Train / Character / Image (Studio) all return early below, before
+  // the fall-through video-mode branch's own remixSubGroup show/hide logic
+  // (the `_inRemix` block further down) ever runs. Remix → Upscale & Face
+  // Fix → Character used to leave the Remix tool panel on screen with
+  // "Upscale & Face Fix" still lit, as if Character renders would be
+  // upscaled or face-fixed too. Hide it unconditionally here; the
+  // fall-through branch re-shows it when the new mode actually is a Remix
+  // tool (REMIX_MODES.indexOf(mode) !== -1).
+  const _remixBarEarly = document.getElementById('remixSubGroup');
+  if (_remixBarEarly && mode !== 'remix'
+      && (typeof REMIX_MODES === 'undefined' || REMIX_MODES.indexOf(mode) === -1)) {
+    _remixBarEarly.style.display = 'none';
+  }
   // HDR vs Character mutual exclusion — reflect mode change in pill state.
   // Runs in a microtask so the rest of setMode finishes setting UI bits
   // first (character chip strip visibility, etc.).
@@ -860,6 +930,10 @@ function setMode(mode) {
   updateAccelAvailability();
   updateTemporalAvailability();
   updateDerived();
+  if (mode === 'extend' && typeof applyExtendPillPrices === 'function') {
+    applyExtendPillPrices();
+  }
+  if (typeof updateShotSetupSummary === 'function') { try { updateShotSetupSummary(); } catch (e) {} }
   // Ingredients (multi-reference) — lazily wire the multi-image picker + load
   // the recent-uploads strip on first entry. Idempotent (guarded by __wired).
   if (mode === 'ingredients') {

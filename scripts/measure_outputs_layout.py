@@ -182,6 +182,13 @@ JS_MEASURE = r"""
     return { x: num(r.left), y: num(r.top), w: num(r.width), h: num(r.height),
              b: num(r.bottom), r: num(r.right) }; };
   const out = { missing: [] };
+  // This gate measures the VIDEO tab's gallery. The previous viewport's song
+  // step (JS_SONG, VC-20) left the page on the Audio tab, whose gallery is
+  // songs only — go back, and back to All, before measuring.
+  if (typeof workflowSwitch === 'function' && document.body.dataset.workflow !== 'manual')
+    workflowSwitch('manual');
+  if (typeof setMainOutputsFilter === 'function' && mainOutputsFilter !== 'all')
+    setMainOutputsFilter('all');
   const surface = document.querySelector('.stage-pane > .player-surface');
   if (!surface) { out.missing.push('.player-surface'); return out; }
   const shaped = () => {
@@ -245,6 +252,14 @@ JS_SONG = r"""
     return { x: num(r.left), y: num(r.top), w: num(r.width), h: num(r.height),
              b: num(r.bottom), r: num(r.right) }; };
   const surface = document.querySelector('.stage-pane > .player-surface');
+  // VC-20: the song hero (this whole scenario) is the Audio/Music tab's
+  // own surface now — selectOutput() only builds it when
+  // document.body.dataset.workflow === 'audio' (reached by filtering the
+  // VIDEO tab's own gallery to Audio and clicking a song used to
+  // transplant this same hero into the Video tab's pane, which was the
+  // bug). Switch tabs first, the same way a real user (or the new "Open
+  // in Audio tab" link) would, before selecting the song.
+  if (typeof workflowSwitch === 'function') workflowSwitch('audio');
   const t0 = performance.now();
   let tries = 0;
   while (performance.now() - t0 < 10000) {

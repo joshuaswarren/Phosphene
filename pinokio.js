@@ -51,6 +51,15 @@ function musicCapable() {
   try { return os.totalmem() >= 24 * 1000 * 1000 * 1000 } catch (e) { return false }
 }
 
+// SYS-18: the Q8 download entry below was offered on EVERY Mac regardless
+// of RAM — 30 GB of disk and bandwidth for a feature the panel's own tier
+// table (SYSTEM_CAPS["allows_q8"], mlx_ltx_panel.py) refuses under 48 GB
+// (the base/"Compact" tier). Same threshold, same fail-closed shape as
+// h3Capable()/musicCapable() above.
+function q8Capable() {
+  try { return os.totalmem() >= 48 * 1000 * 1000 * 1000 } catch (e) { return false }
+}
+
 function getInstallRoot(info) {
   // Pinokio's `info.path` API has shifted across versions:
   //   - older Pinokio: info.path is a STRING property (the install dir itself)
@@ -594,7 +603,7 @@ module.exports = {
       // Escape hatch. This branch used to offer no Reset at all, so a user
       // whose install died before the venv existed had nothing to click except
       // the thing that kept failing.
-      if (install_attempted) m.push({ icon: "fa-regular fa-circle-xmark", text: "Reset", href: "reset.js" })
+      if (install_attempted) m.push({ icon: "fa-regular fa-circle-xmark", text: "Reset engine (keeps models & outputs)", href: "reset.js" })
       return m
     }
 
@@ -615,7 +624,7 @@ module.exports = {
       if (has_uploads) m.push({ icon: "fa-solid fa-image", text: "Uploads", href: "panel_uploads?fs=true" })
       pushLtxRepair(m)
       pushH3Recovery(m)
-      m.push({ icon: "fa-regular fa-circle-xmark", text: "Reset", href: "reset.js" })
+      m.push({ icon: "fa-regular fa-circle-xmark", text: "Reset engine (keeps models & outputs)", href: "reset.js" })
       return m
     }
 
@@ -657,7 +666,7 @@ module.exports = {
       { icon: "fa-solid fa-cube",  text: "Models",  href: "mlx_models?fs=true" },
       { icon: "fa-solid fa-image", text: "Uploads", href: "panel_uploads?fs=true" },
     )
-    if (!q8_ready) {
+    if (!q8_ready && q8Capable()) {
       // ~30 GB and what it actually buys on 2.5: trained characters and voices.
       // High additionally needs the separate 29.5 GB add-on, which is offered
       // in Settings -> Models rather than here — one menu entry, one download.
@@ -675,7 +684,12 @@ module.exports = {
       // failed pip step, or a pre-3.2.1 install that hasn't updated). Renamed
       // off "Qwen-Image-Edit" — it enables Ideogram 4 too (cocktailpeanut's
       // confusion: installing "Qwen" to use Ideogram).
-      baseMenu.push({ icon: "fa-solid fa-images", text: "Reinstall image engines (Ideogram 4 + Qwen-Edit)", href: "install_qwen.js" })
+      // SYS-30: "Reinstall" implies it was here before and broke — on a
+      // fresh install that never fetched this pack, that's simply untrue.
+      // qwen_ready collapses both cases (never installed vs. broken) to
+      // the same boolean, so the honest word covers both without
+      // guessing which one this install is.
+      baseMenu.push({ icon: "fa-solid fa-images", text: "Install/repair image engines (Ideogram 4 + Qwen-Edit)", href: "install_qwen.js" })
     }
     baseMenu.push(...musicMenu())
     // Second VIDEO engine — joint picture + dialogue + sound. Opt-in only:
@@ -697,7 +711,7 @@ module.exports = {
     }
     baseMenu.push(
       { icon: "fa-solid fa-rotate", text: "Update", href: "update.js" },
-      { icon: "fa-regular fa-circle-xmark", text: "Reset", href: "reset.js" },
+      { icon: "fa-regular fa-circle-xmark", text: "Reset engine (keeps models & outputs)", href: "reset.js" },
     )
     return baseMenu
   }

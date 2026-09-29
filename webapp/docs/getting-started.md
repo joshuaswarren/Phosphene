@@ -18,7 +18,7 @@ The row of tabs at the top of the left column is where you choose what to make. 
 
 ## The engine {#engine}
 
-The switch at the top right of the header chooses which model renders: **LTX** or **Hailuo H3**. They are two different engines with different strengths, not a good one and a spare:
+The engine switch in the header chooses which model renders: **LTX** or **Hailuo H3**. They are two different engines with different strengths, not a good one and a spare:
 
 - **LTX** — every Video mode, LoRAs and trained characters.
 - **Hailuo H3** — joint video, dialogue and sound. Text and Image modes.
@@ -31,7 +31,7 @@ Everything you generate goes into one queue and renders one job at a time. The p
 
 - **Now** — the render in progress, with a live preview of the shot as it forms. **Stop early** (on the preview) asks first, then stops it: *"nothing is saved"*, and the queue carries on with the next job.
 - **Queue** — the jobs waiting. The × on a card removes it.
-- **Recent** — what finished, filtered by All / Videos / Photos.
+- **Recent** — what finished, filtered by All / Videos / Photos / Audio.
 - **Logs** — the render log. See [Reading the log](#docs/troubleshooting/logs).
 
 Under the Generate button: **⊞ Batch** pastes many prompts at once and queues them all; **Pause queue** holds the queue (the button then reads **Resume queue**); **Clear** removes every waiting job — the one running carries on.
@@ -40,11 +40,11 @@ Under the Generate button: **⊞ Batch** pastes many prompts at once and queues 
 
 The gallery on the right shows what you have made. Click a card to put it on the player.
 
-- **All / Videos / Photos** filter it, and the search box finds outputs by prompt words, model, LoRA, size or seed ([[sc:search.focus]] jumps to it).
+- **All / Videos / Photos / Audio** filter it, and the search box finds outputs by prompt words, model, LoRA, size or seed ([[sc:search.focus]] jumps to it).
 - **Show all** loads older renders than the newest 60.
 - [[sc:outputs.step]] steps through the gallery, [[sc:player.toggle]] plays and pauses, [[sc:outputs.expand]] expands the player to full screen.
-- Under the player, the action row offers what you can do next with that clip: **Extend** it, run **Upscale & Face Fix** on it, send it **To film**, **Animate** a still, see its **Params**.
-- The trash button on a card moves the file to the macOS Trash after asking — restore it from Finder if you change your mind. [[sc:outputs.trash]] does the same for the selected output.
+- Over the player, the action row offers what you can do next with that clip: **Extend** it, run **Upscale & Face Fix** on it, send it **To film**, **Animate** a still, see its **Params**.
+- The eye icon hides a clip from the gallery (there is currently no way to bring it back from the UI — see [Video](#docs/video/more) for the manual restore). The trash button on a card moves the file to the macOS Trash after asking — restore it from Finder if you change your mind. [[sc:outputs.trash]] does the same for the selected output.
 
 ## Where files go {#files}
 

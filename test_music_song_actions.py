@@ -226,6 +226,12 @@ class AnActionUsesItsOwnSong(unittest.TestCase):
 const EL = {};
 function _el(id) { return EL[id] || (EL[id] = { value: '', textContent: '', innerHTML: '',
   hidden: false, querySelectorAll: () => [] }); }
+// VC-20: songCardRender() now gates on document.body.dataset.workflow —
+// these are Music Studio's own actions (restyle/cover/etc), which only
+// ever run from the Audio tab, so 'audio' is the correct fixed value here
+// (this shim otherwise has no document at all; _el() above is the real
+// _el's replacement, not a wrapper around it).
+const document = { body: { dataset: { workflow: 'audio' } } };
 EL.musicStyle = { value: 'punk' }; EL.musicLyrics = { value: '' };
 EL.musicMaxSeconds = { value: '60' };
 const said = [];

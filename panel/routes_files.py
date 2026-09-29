@@ -62,6 +62,23 @@ def post_upload_delete(h, path, qs, ctype) -> None:
              "uploads": P.list_uploads(limit=24)})
 
 
+# 4.17 Codex SAFETY-13: the draft restore brings back an Image/Keyframe/
+# Extend/audio source path saved in localStorage — possibly one deleted since.
+# Images validate themselves in the picker (/image 404s); an audio upload or
+# an Extend source has no preview to fail, so the restore asks here. Bound to
+# outputs/ and uploads/ like every file route; answers only a boolean.
+@get("/file/exists")
+def get_file_exists(h, parsed) -> None:
+    raw = (P.parse_qs(parsed.query).get("path", [""])[0] or "").strip()
+    try:
+        path = P.Path(raw).resolve() if raw else None
+        roots = [P.OUTPUT.resolve(), P.UPLOADS.resolve()]
+    except Exception:
+        path, roots = None, []
+    ok = bool(path) and any(path.is_relative_to(r) for r in roots) and path.is_file()
+    h._json({"exists": ok})
+
+
 @get("/file")
 def get_file(h, parsed) -> None:
     qs = P.parse_qs(parsed.query)
@@ -178,6 +195,55 @@ def get_image(h, parsed) -> None:
         h.wfile.write(fh.read())
 
 
+#: VC-31/36: video containers the poster route will generate a frame for.
+#: Everything else under OUTPUT/UPLOADS (images, audio) has no poster to
+#: make and is refused rather than silently 404ing from inside
+#: _ensure_video_poster.
+POSTER_ROUTE_EXTS = frozenset({".mp4", ".mov", ".m4v", ".webm"})
+
+
+@get("/poster")
+def get_poster(h, parsed) -> None:
+    """One cached JPEG frame of a rendered clip — what lets a gallery card
+    be a plain `<img>` instead of a live `<video preload="metadata">`
+    (VC-31/36). Same containment rule as /image; generation itself is
+    _ensure_video_poster's job (idempotent, cached in the same
+    _THUMBCACHE _ensure_thumbnail already uses)."""
+    qs = P.parse_qs(parsed.query)
+    try:
+        path = P.Path(qs.get("path", [""])[0]).resolve()
+    except Exception:
+        h.send_error(400); return
+    try:
+        roots = [P.OUTPUT.resolve(), P.UPLOADS.resolve()]
+    except Exception:
+        roots = []
+    if not any(path.is_relative_to(r) for r in roots):
+        h.send_error(403); return
+    if path.suffix.lower() not in POSTER_ROUTE_EXTS:
+        h.send_error(403); return
+    if not path.exists() or not path.is_file():
+        h.send_error(404); return
+    try:
+        poster = P._ensure_video_poster(path)
+    except Exception as exc:                                     # noqa: BLE001
+        P.push(f"poster generation failed for {path.name}: {exc}")
+        poster = None
+    if poster is None:
+        h.send_error(404); return
+    h.send_response(200)
+    h.send_header("Content-Type", "image/jpeg")
+    h.send_header("Content-Length", str(poster.stat().st_size))
+    # Cacheable — the file only changes if the SOURCE clip's mtime/size
+    # changes, and the cache key already encodes that (a rewritten source
+    # gets a new key, this response for the old one is simply never
+    # requested again).
+    h.send_header("Cache-Control", "public, max-age=604800, immutable")
+    h.end_headers()
+    with poster.open("rb") as fh:
+        h.wfile.write(fh.read())
+
+
 @get("/sidecar")
 def get_sidecar(h, parsed) -> None:
     qs = P.parse_qs(parsed.query)
@@ -242,7 +308,30 @@ def get_sidecar(h, parsed) -> None:
         if companion is None:
             h.send_error(404); return
         sidecar = companion
-    h._ok(sidecar.read_bytes(), "application/json")
+    # VC-19: the modal's "Format" line used to read straight from
+    # params.width/height — the RENDER canvas, not the DELIVERED file.
+    # Balanced's default 720p-fit export (or any upscale) changes the two,
+    # and the modal reported the render size as if it were the file on
+    # disk: "Format 1024x576" for a 1280x720 video. `sidecar` is always
+    # `<media>.json`, so its own stem names the real media file — probe
+    # THAT and attach the answer as a sibling field the params never had a
+    # reason to carry (an ffprobe on render's own output would just repeat
+    # the request; this asks the file, not the memory of the request).
+    # One ffprobe, only when a human opens the info modal — never on the
+    # gallery's poll path.
+    try:
+        payload = P.json.loads(sidecar.read_bytes())
+    except (ValueError, OSError):
+        h._ok(sidecar.read_bytes(), "application/json")
+        return
+    if isinstance(payload, dict) and "actual_width" not in payload:
+        media_path = sidecar.parent / sidecar.stem  # "<media>.json" -> "<media>"
+        if media_path.suffix.lower() == ".mp4" and media_path.is_file():
+            aw, ah = P._probe_video_dims(str(media_path))
+            if aw and ah:
+                payload["actual_width"] = aw
+                payload["actual_height"] = ah
+    h._json(payload)
 
 
 @get("/library/images")
@@ -617,6 +706,87 @@ def post_output_open_folder(h, path, qs, ctype) -> None:
         h._json({"error": f"open failed: {e}"}, 500)
 
 
+# VC-18/37: per-clip "Reveal in Finder" — the toolbar/lightbox "More" menu
+# action. `/output/open_folder` above only ever reveals the newest file
+# across the whole gallery; this reveals the SPECIFIC clip the user has
+# selected, wherever it lives (a plain render, a Sharp export, a face-fix
+# pass, an uploaded reference — same containment rule as /image).
+@post("/output/reveal")
+def post_output_reveal(h, path, qs, ctype) -> None:
+    _rb = h._read_form_body()
+    if _rb is None:
+        return
+    body, form = _rb
+    raw = (form.get("path", [""])[0] or qs.get("path", [""])[0] or "").strip()
+    if not raw:
+        h._json({"ok": False, "error": "no path given"}, 400); return
+    try:
+        target = P.Path(raw).resolve()
+    except Exception:
+        h._json({"ok": False, "error": "bad path"}, 400); return
+    try:
+        roots = [P.OUTPUT.resolve(), P.UPLOADS.resolve()]
+    except Exception:
+        roots = []
+    if not any(target.is_relative_to(r) for r in roots):
+        h._json({"ok": False, "error": "that path is outside the outputs/uploads folders"}, 403)
+        return
+    if not target.is_file():
+        h._json({"ok": False, "error": "that file is not on disk any more"}, 404)
+        return
+    P.subprocess.run(["open", "-R", str(target)], check=False)
+    h._json({"ok": True, "opened": str(target)})
+
+
+# VC-18/37: "Use last frame" — extract the clip's final frame as a new
+# reference image so the player can offer it straight into i2v ("continue
+# from here on a fresh roll of the dice", the non-Extend way of picking up
+# where a take left off). Same ffmpeg recipe One Shot's own take-to-take
+# handoff already uses (`-sseof -0.05 -frames:v 1`), just pointed at
+# UPLOADS instead of a private take-dir so the picker can show it.
+@post("/output/last_frame")
+def post_output_last_frame(h, path, qs, ctype) -> None:
+    _rb = h._read_form_body()
+    if _rb is None:
+        return
+    body, form = _rb
+    raw = (form.get("path", [""])[0] or qs.get("path", [""])[0] or "").strip()
+    if not raw:
+        h._json({"ok": False, "error": "no path given"}, 400); return
+    try:
+        src = P.Path(raw).resolve()
+    except Exception:
+        h._json({"ok": False, "error": "bad path"}, 400); return
+    try:
+        roots = [P.OUTPUT.resolve(), P.UPLOADS.resolve()]
+    except Exception:
+        roots = []
+    if not any(src.is_relative_to(r) for r in roots):
+        h._json({"ok": False, "error": "that path is outside the outputs/uploads folders"}, 403)
+        return
+    if not src.is_file() or src.suffix.lower() != ".mp4":
+        h._json({"ok": False, "error": "Use last frame works on rendered video clips."}, 400)
+        return
+    ff = P.shutil.which("ffmpeg")
+    if not ff:
+        h._json({"ok": False, "error": "ffmpeg is not available"}, 500); return
+    out_dir = P.UPLOADS / "library" / "manual" / P.time.strftime("%Y-%m-%d")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{src.stem}_lastframe_{int(P.time.time())}.png"
+    try:
+        P.subprocess.run(
+            [ff, "-loglevel", "error", "-y", "-sseof", "-0.05", "-i", str(src),
+             "-frames:v", "1", "-update", "1", str(out_path)],
+            check=True, capture_output=True, timeout=30,
+        )
+    except Exception as e:
+        h._json({"ok": False, "error": f"could not extract the last frame: {e}"}, 500)
+        return
+    if not out_path.is_file() or out_path.stat().st_size == 0:
+        h._json({"ok": False, "error": "ffmpeg produced no image"}, 500); return
+    h._json({"ok": True, "path": str(out_path), "url": f"/image?path={P.quote(str(out_path))}"})
+
+
 @post("/external/open")
 def post_external_open(h, path, qs, ctype) -> None:
     _rb = h._read_form_body()
@@ -740,10 +910,56 @@ def post_upload(h, path, qs, ctype) -> None:
         if not getattr(fld, "filename", None):
             h._json({"error": "no filename"}, 400); return
         P.UPLOADS.mkdir(parents=True, exist_ok=True)
-        safe_name = P.re.sub(r"[^A-Za-z0-9._-]+", "_", fld.filename)
+        raw = fld.file.read()
+        _orig = P.Path(fld.filename)
+        out_ext = _orig.suffix
+        # SYS-01/SYS-02: normalize every picked IMAGE (not the audio field —
+        # i2v_clean_audio's external track shares this endpoint) once, here,
+        # before it ever reaches a picker preview, a render, or a thumbnail.
+        # EXIF orientation is applied and stripped; HEIC/HEIF/AVIF (what
+        # AirDrop/Photos hand a Mac by default, and what Pillow cannot open
+        # at all) is converted to JPEG. A failure here — a genuinely corrupt
+        # file, or HEIC on a Mac without sips — refuses the upload with a
+        # clear reason instead of writing bytes the render will die on 30 s
+        # into a helper's model load.
+        if field_name == "image":
+            raw, out_ext, err = P.normalize_ingested_image_bytes(raw, fld.filename)
+            if err:
+                h._json({"error": err}, 400); return
+        # SYS-26: this used to be `[^A-Za-z0-9._-]+ -> "_"`, ASCII-only, so
+        # テスト画像_猫.jpg landed as ____.jpg and "Recent uploads" listed
+        # it the same way — unsearchable, indistinguishable from every
+        # other erased name. _unicode_slug keeps any script's letters and
+        # digits; the extension is kept separately (conventionally ASCII,
+        # and matters for the server's own extension checks elsewhere).
+        # The extension is the NORMALIZED one (a HEIC converted above is
+        # written as .jpg), not the name the file arrived with.
+        _stem = P._unicode_slug(_orig.stem, max_chars=120, fallback="upload")
+        _ext = P.re.sub(r"[^A-Za-z0-9.]", "", out_ext or "")[:10]
+        safe_name = f"{_stem}{_ext}"
+        # Cap the FULL name (this slug + the millisecond timestamp prefix
+        # below) at 200 bytes, well under the 255-byte filesystem limit on
+        # APFS — a multi-byte-per-character script (CJK, emoji) can blow
+        # past a character-count cap in byte terms even at a modest
+        # character count.
+        while len(safe_name.encode("utf-8")) > 200 and _stem:
+            _stem = _stem[:-1]
+            safe_name = f"{_stem}{_ext}"
         dest = P.UPLOADS / f"{int(P.time.time()*1000)}_{safe_name}"
-        dest.write_bytes(fld.file.read())
-        h._json({"ok": True, "path": str(dest)})
+        dest.write_bytes(raw)
+        resp = {"ok": True, "path": str(dest)}
+        # Audio duration (VA-03): the A2V form's Duration slider and Audio
+        # start have always been blind to the length of what was just
+        # dropped — an uploaded 4s vocal silently defaulted to a 7s render,
+        # 43% of it silence rendered against nothing (exactly where a
+        # lip-sync mouth freezes). The client already reads duration_sec
+        # when present (AUDIO_STUDIO.audioDuration in characters.js); this
+        # is the half of that contract the server never filled in.
+        if field_name == "audio":
+            dur = P.probe_media_duration(dest)
+            if dur is not None:
+                resp["duration_sec"] = dur
+        h._json(resp)
     except Exception as exc:
         h._json({"error": f"upload failed: {exc}"}, 500)
 

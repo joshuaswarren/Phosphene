@@ -118,3 +118,78 @@ class KeptTakeSurvivesReconcile(unittest.TestCase):
         finally:
             for k, v in saved.items():
                 setattr(p, k, v)
+
+
+class EditsMadeWhileTheGateRunsSurvive(unittest.TestCase):
+    """FILM-20: the gate used to hold ONE board snapshot across its whole
+    run (a retake render can take minutes) and save that stale snapshot
+    back at each step — silently reverting any edit made on the Storyboard
+    tab in the meantime. Every save now re-reads the current board and
+    patches in only the fields the gate itself owns."""
+
+    def test_a_board_edit_made_mid_gate_is_not_reverted(self):
+        import mlx_ltx_panel as p
+        import storyboard
+        tmp = Path(tempfile.mkdtemp(prefix="phos_gate_edit_"))
+        files = {}
+        for name in ("a", "b"):
+            f = tmp / f"take_{name}.mp4"; f.write_bytes(b"x"); files[name] = str(f)
+        board = {"id": "sb_test_gate_edit", "title": "Original title", "shots": [
+            {"n": 1, "mode": "text", "engine": "h3", "duration_s": 5, "seed": 1,
+             "status": "pending", "prompt": "an untouched B-roll shot", "uid": "shot_00000001"},
+            {"n": 9, "mode": "text", "engine": "h3", "duration_s": 5, "seed": 100,
+             "status": "done", "uid": "shot_00000009",
+             "prompt": "He whispers: <d>[English] This is not ashwagandha.</d>",
+             "final_job_id": "j1", "final_output": files["a"]}]}
+        storyboard.save_storyboard(p.STATE_DIR, board)
+        scores = {files["a"]: -0.35, files["b"]: 0.20}
+        queued, jobs = [], {"j1": {"status": "done", "output_path": files["a"]}}
+
+        def fake_enqueue(form):
+            jid = f"j{len(queued) + 2}"; queued.append((jid, int(form["seed"])))
+            jobs[jid] = {"status": "done", "output_path": files["b"]}
+            return jid
+
+        def wait_and_edit(job_ids):
+            # Simulate the user editing the board on the Storyboard tab
+            # WHILE this render is in flight: rewrite shot 1's prompt, the
+            # board's title, and add a brand-new shot 2.
+            live = storyboard.load_storyboard(p.STATE_DIR, "sb_test_gate_edit")
+            live["title"] = "Retitled while the gate ran"
+            for s in live["shots"]:
+                if s["n"] == 1:
+                    s["prompt"] = "edited while the gate ran"
+            live["shots"].append({"n": 2, "mode": "text", "engine": "h3",
+                                  "duration_s": 3, "seed": 2, "status": "pending",
+                                  "prompt": "a shot added mid-gate", "uid": "shot_00000002"})
+            storyboard.save_storyboard(p.STATE_DIR, live)
+            return True
+
+        saved = {k: getattr(p, k) for k in ("take_lipsync_score", "_sb_enqueue", "_sb_job_index", "set_hidden", "push")}
+        try:
+            p.take_lipsync_score = lambda path: scores.get(str(path))
+            p._sb_enqueue = fake_enqueue
+            p._sb_job_index = lambda: dict(jobs)
+            p.set_hidden = lambda path, hidden: None
+            p.push = lambda line: None
+            p._sb_lipsync_gate("sb_test_gate_edit", [board["shots"][1]],
+                               "final_job_id", "final_output",
+                               {"quality": "standard", "width": 1024, "height": 576},
+                               False, False, wait_and_edit)
+        finally:
+            for k, v in saved.items():
+                setattr(p, k, v)
+
+        after = storyboard.load_storyboard(p.STATE_DIR, "sb_test_gate_edit")
+        self.assertEqual(after["title"], "Retitled while the gate ran")
+        by_n = {s["n"]: s for s in after["shots"]}
+        self.assertEqual(by_n[1]["prompt"], "edited while the gate ran")
+        self.assertIn(2, by_n, "the shot added mid-gate must not be lost")
+        self.assertEqual(by_n[2]["prompt"], "a shot added mid-gate")
+        # and the gate's own shot still got its result
+        self.assertEqual(by_n[9]["final_output"], files["b"])
+        self.assertEqual(by_n[9]["lipsync"]["kept"], files["b"])
+
+
+if __name__ == "__main__":
+    unittest.main()

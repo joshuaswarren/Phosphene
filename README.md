@@ -19,7 +19,7 @@
 
 </p>
 
-> **Current release: v4.16.3.** **Three fixes from the field.** The Hailuo H3 progress card now reads "12m in · ~18m left" instead of "12m / ~18m", which looked like a total, and its estimate counts the model load of every window still to come. A LoRA whose download was cut short is named and refused before the render ("style.safetensors is incomplete ... download it again") instead of failing with "cannot reshape array". And if the first ffmpeg Phosphene finds cannot encode H.264 (no libx264), it uses the next one that can, instead of failing every export with "Unknown encoder 'libx264'". Full notes on the [releases page](https://github.com/mrbizarro/Phosphene/releases).
+> **Current release: v4.17.0.** **Honest times, faces that survive, and films you can fix.** We used every flow on small and big Macs and fixed the 222 places it lied, lost work or made you hunt. Time estimates are for your Mac, not ours. Portrait and phone photos keep the face (right way up, right shape, with a crop you can drag). Stop, Clear queue and Hide have Undo or a confirm, and One Shot keeps its finished parts. Lip-sync is a Video mode with a 3 s draft, a sync verdict and Continue the song. The Editor gains Sync to song, Match colour, slip and roll edits, Replace and take history, and renders are versions you can cancel. Press Update in Pinokio, then restart. Full notes on the [releases page](https://github.com/mrbizarro/Phosphene/releases).
 
 ## Overview
 
@@ -112,7 +112,7 @@ The Train tab also exposes **Style** training (experimental in v3.0) — same en
 ### Audio-to-Video
 <img width="876" height="557" alt="image" src="https://github.com/user-attachments/assets/e64b2a23-e3e2-4132-8ceb-838b0c089136" />
 
-New workflow tab in 3.0. WAV or MP3 in, MP4 out — the audio drives motion in the generated video, and an optional reference image anchors frame zero. The pipeline runs in two stages: low-resolution with classifier-free guidance, then full-resolution with the distilled LoRA fused on top. The original input audio is muxed onto the final clip so the result is a single self-contained MP4. Requires Q8 + ≥64 GB unified memory.
+New workflow tab in 3.0 — Phosphene's lip-sync: a picture (optional) and a stretch of audio become one clip whose mouth follows the track. WAV or MP3 in, MP4 out — the audio drives motion in the generated video, and an optional reference image anchors frame zero. On Q8 (≥64 GB unified memory) it runs the two-stage pipeline: low-resolution with classifier-free guidance, then full-resolution with the distilled LoRA fused on top. Below that it falls back to a faster Q4 distilled lane — smaller Macs still get Audio-to-Video, just not the Q8 pipeline. The original input audio is muxed onto the final clip so the result is a single self-contained MP4.
 
 ### LoRAs
 

@@ -76,6 +76,14 @@ On the fast qualities, a **Speed** row offers **Tuned** or **Fast draft** — a 
 
 With a trained character selected the chips become **Q8 Draft** (704×384), **Q8 Pro** (1024×576, *best identity*) and, on LTX-2.5, High and High · 720p. Trained faces hold best on Q8 Pro.
 
+### Sliding windows on LTX {#ltx-windows}
+
+For a clip longer than one pass, **Advanced → Long clips → Windows** renders it as a sequence: one first pass, then one Extend per later window, each continuing the kept tail of the one before. This needs the High add-on (the Q8 model) and a Mac that supports Extend.
+
+**Per-window prompts.** Window 1 is always the main prompt above — there is no separate box for it. Every later window gets its own labelled, timed box ("Window 2 · 0:05–0:09"), built from the real render schedule; a box left blank holds the previous moment. Write the next beat of the action in each one, led by the movement (LTX renders whatever a prompt names first). **Invariants** — what must not change between windows (who is in frame, the light, the lens, the place) — go in the field below the boxes and are re-injected into every later window automatically.
+
+This is the LTX equivalent of H3's [per-window prompts](#windows) — same idea (one prompt per pass so the action doesn't repeat), different engine and a different box layout, since the number of windows and their real timing come from LTX's own window planner rather than a fixed 5-second grid.
+
 ## Quality and Length on Hailuo H3 {#h3-quality}
 
 | Quality | Size | Notes |
@@ -99,7 +107,7 @@ A 10 s or 15 s H3 clip asks every 5-second window for the same prompt, which can
 
 ### H3 first frame and orientation {#h3-image}
 
-Image mode works on H3 — the picture is the first frame. Under **Customize**, **Orientation** turns the tier's canvas **Portrait** at the same cost.
+Image mode works on H3 — the picture is the first frame. The **Orientation** row (top-level, next to the size chips) turns the tier's canvas **Portrait** at the same cost.
 
 ## Engines side by side {#engines}
 
@@ -118,20 +126,22 @@ Image mode works on H3 — the picture is the first frame. Under **Customize**, 
 
 After the render, the clip can be resized without cropping.
 
-**On Hailuo H3** (under Customize → **Upscale**):
+**On Hailuo H3** (under **After the render** → **Upscale**):
 
 - **Native** — as rendered.
 - **720p fit** / **1080p fit** — scaled to fill the frame. A canvas close to 16:9 (H3 Draft and Standard, LTX Standard) loses a few pixels at the edges instead of getting black bars; one far from it (square, portrait into landscape) is still padded. 720p fit is the default.
 Below the sizes, **Also run Upscale & Face Fix after the draft** is optional and off by default. When it is ticked, the draft ships as rendered and a second job re-renders it at twice the size with LTX-2.5, keeping the face and the sound; the fixed clip lands next to the draft. It needs the 0.3 GB Upscale adapter, downloaded from the Models window, and takes about the draft's time again.
 
-**On LTX** (under Customize → **Export**): **Native** (default), **720p fit**, or **2×**. When it is not Native, **Method** chooses **Fast** (instant) or **Sharp** (a sharper upscaler, +30–90 s).
+**On LTX** (under **After the render** → **Export**): **720p fit** (default), **Native**, or **2×**. When it is not Native, **Method** chooses **Fast** (instant) or **Sharp** (a sharper upscaler, +30–90 s).
 
-Any finished clip can also go through [Upscale & Face Fix](#docs/remix/upscale-face-fix) later — one click under the player.
+Any finished clip can also go through [Upscale & Face Fix](#docs/remix/upscale-face-fix) later — one click over the player, in its action overlay.
 
 ## More controls {#more}
 
 - **Seed** — `-1` is random; reuse a seed to get the same take with a changed prompt.
 - **LoRAs** — the add-ons picker. See [LoRAs](#docs/loras).
-- **Orientation** (LTX) — 16:9 or 9:16.
-- **Customize** — width × height, duration and frames, and **Open file when done**.
+- **Orientation** (LTX) — 16:9, 9:16, 1:1 or 4:5.
+- **Advanced** — width × height, duration and frames.
+- **After the render** — Export/Upscale, and **Open file when done**.
 - **⊞ Batch** — paste many prompts and queue them all.
+- **Hide** (the eye icon on the player toolbar) — removes a clip from the gallery, with an **Undo** in the toast. The **Hidden (N)** chip in the Outputs filter row shows everything hidden, so a clip hidden by mistake is one click away.

@@ -3741,7 +3741,18 @@ def _coerce_for_mode(obj, fb_mode, fb_shot, previous, *, concept, n_shots, style
             # A re-roll should look different: nudge the seed rather than re-render the
             # same latent with new words.
             replacement["seed"] = _seed_for(seed_base + int(time.time()) % 9973, fb_shot)
-            for carry in ("status",):
+            # FILM-21: the model that writes a single-shot re-roll knows
+            # nothing about music-video structure — it returns an ordinary
+            # planner shot. Carrying only `status` across meant a Rewrite on
+            # a singing shot silently dropped its music_video block, its
+            # audio/audio_start_time/audio_stem (the second of the SONG it
+            # was rendered against), its still (the cast picture), and its
+            # `a2v` mode itself — the fresh shot came back as silent i2v/t2v
+            # text with no idea it was ever supposed to sing. These fields
+            # are the shot's structural identity, not its creative content,
+            # so they ride across a rewrite exactly like `status` always did.
+            for carry in ("status", "uid", "mode", "music_video", "audio",
+                         "audio_start_time", "audio_stem", "still", "still_source"):
                 if carry in s:
                     replacement[carry] = s[carry]
             spec["shots"][i] = replacement

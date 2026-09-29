@@ -1740,6 +1740,10 @@ document.addEventListener('DOMContentLoaded', () => {
 //   ⊘ missing (red)             — nothing on disk
 //   ↻ downloading (blue, anim)  — hf is currently fetching this repo
 function openModelsModal() {
+  // SYS-19: the health popover's Models row opens this modal too (the
+  // real #modelsPill element is relocated into the popover by
+  // _hcRelocate) -- same under-the-popover overlap as the Tier modal.
+  if (typeof closeHealthPop === 'function') closeHealthPop();
   document.getElementById('modelsModal').style.display = 'flex';
   refreshModelsModal();
 }
@@ -1756,7 +1760,23 @@ async function refreshModelsModal({ silent = false } = {}) {
     if (!silent) hint.textContent = 'Failed to load models. Panel might be restarting — try again.';
     return;
   }
-  const repos = data.repos || [];
+  // SYS-17: the modal listed repos in registry order, which put the
+  // PREVIOUS-generation LTX-2.3 Q4 first (red border, unmet) and the
+  // engine this build actually renders with (LTX-2.5 base) 8th. Sorted
+  // client-side into the groups the fix asked for: installed/required
+  // for the active generation, then this generation's add-ons, then
+  // previous-generation rows last (still shown -- training needs them --
+  // just not leading with the one thing that reads as broken on a
+  // perfectly healthy install).
+  const repos = (data.repos || []).slice().sort((a, b) => {
+    const rank = (r) => {
+      if (!r.active) return 3;                          // previous generation
+      if (r.kind !== 'optional' && r.complete) return 0;  // required, installed
+      if (r.complete) return 1;                          // optional, installed
+      return 2;                                          // this generation, not yet fetched
+    };
+    return rank(a) - rank(b);
+  });
   const active = data.active_download;
   hint.innerHTML = data.hf_available
     ? `Each row shows what's on disk. Click <b>Download</b> to fetch the missing files; progress streams to the log at the bottom of the page. Everything is resumable and checksum-verified.`
@@ -1817,13 +1837,24 @@ async function refreshModelsModal({ silent = false } = {}) {
       : r.kind === 'optional'
       ? `<span style="color:var(--muted)">optional</span>`
       : `<span style="color:var(--success,#3fb950)">required</span>`;
+    // SYS-42: this row used to lead with "dgrauet/ltx-2.3-mlx-q4 ->
+    // mlx_models/ltx-2.3-mlx-q4" — a repo id and a filesystem path, always
+    // visible, ahead of the one thing a non-engineer can act on (what this
+    // pack unlocks, how big it is, whether it's here). The report's own fix:
+    // "one line per pack ... Put the path and repo behind 'Details'." The
+    // outcome line now leads; repo_id/local_dir move into a closed
+    // <details> that opens the same info for anyone who does want it
+    // (debugging a mis-pointed LTX_Q8_LOCAL, filing an issue, etc).
     return `
       <li class="${cls}">
         <span class="icon">${icon}</span>
         <div class="meta">
           <span class="ttl">${escapeHtml(r.name)} · ${kindBadge}</span>
-          <span class="sub">${escapeHtml(r.repo_id)} → ${escapeHtml(r.local_dir)}</span>
           <span class="sub">${statusText}${r.blurb ? ' · ' + escapeHtml(r.blurb) : ''}</span>
+          <details class="model-row-details">
+            <summary>Details</summary>
+            <span class="sub">${escapeHtml(r.repo_id)} → ${escapeHtml(r.local_dir)}</span>
+          </details>
         </div>
         ${btnHtml}
       </li>`;

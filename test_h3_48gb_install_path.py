@@ -113,9 +113,14 @@ class TestPanelTellsA48GBMacTheTruth(unittest.TestCase):
         self.assertIn(P.H3_INSTALL_MENU_TEXT, PANEL_JS)
 
     def test_settings_card_splits_the_band(self):
-        branch = PANEL_JS.split("if (h3s.needs_q8_dit) {")[1][:1600]
+        # H3-20: the two sub-cases (built vs never-installed) used to carry
+        # different button text ("How to enable H3" / "How to install H3");
+        # they now share one "Set up H3 ->" label, since both open the same
+        # install card, which differentiates internally (H3-05). The band
+        # split itself (missing_q8_dit vs not) is unchanged and still real.
+        branch = PANEL_JS.split("if (h3s.needs_q8_dit) {")[1][:2400]
         self.assertIn("h3s.reason === 'missing_q8_dit'", branch)
-        self.assertIn("How to install H3", branch)
+        self.assertIn("Set up H3", branch)
 
     def test_install_card_says_this_mac_runs_it_and_where_the_button_is(self):
         self.assertIn("H3.ram_lane === 'q8'", PANEL_JS)
@@ -315,6 +320,14 @@ class TestPreflightLetsA48GBMacThrough(unittest.TestCase):
         d = Path(tempfile.mkdtemp(prefix="phos-sysctl-"))
         (d / "sysctl").write_text(f"#!/bin/sh\necho {GIB48}\n")
         (d / "sysctl").chmod(0o755)
+        # H3-18: the preflight now also gates on free disk space (~97 GB for
+        # a fresh install). That's this test's own machine's real free space
+        # here, not the 48 GB RAM figure under test — fake `df` with plenty
+        # of room so this test still isolates the RAM check, its own concern.
+        (d / "df").write_text(
+            "#!/bin/sh\necho 'Filesystem 1024-blocks Used Available Capacity Mounted'\n"
+            "echo '/dev/disk1 1000000000 1 209715200 1% /'\n")
+        (d / "df").chmod(0o755)
         out = subprocess.run(["bash", str(ROOT / "scripts/pinokio/h3_preflight.sh")],
                              capture_output=True, text=True, errors="replace", timeout=30,
                              env={**os.environ, "PATH": f"{d}:{os.environ['PATH']}"})

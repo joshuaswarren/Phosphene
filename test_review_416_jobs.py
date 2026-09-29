@@ -137,11 +137,17 @@ class CompactMacsRefuseOversizedA2V(unittest.TestCase):
         src = panel_source()
         js = """
 var A2V_AREA_KNEE = 0.45e6, A2V_KNEE_FRAMES = 450, BOOT;
+// VA-03: the window-vs-file check reads AUDIO_STUDIO.audioDuration and the
+// Start at field — null/absent here means "duration unknown", the same as
+// a file that hasn't been uploaded yet, so the pre-existing cap/knee checks
+// below are exercised unchanged.
+var AUDIO_STUDIO = {audioDuration: null};
 const els = {};
 function el(id, v) { return els[id] = {id, value: v, style: {}, innerHTML: '', textContent: ''}; }
 const document = { getElementById: id => els[id] || null };
 el('audioStudioDuration', '30'); el('audioStudioDurationVal');
 el('audioStudioDurationWarn'); el('audioStudioWidth', '768'); el('audioStudioHeight', '416');
+el('audioStudioStart', '0');
 """ + "\n".join(extract_function(n, src) for n in (
             "_a2vFramesForSeconds", "audioStudioDurationChanged")) + """
 const out = {};

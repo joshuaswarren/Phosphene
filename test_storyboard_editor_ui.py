@@ -173,6 +173,8 @@ FUNCTIONS = (
     "sbeGroupLimits", "sbeMoveGroup",
     # The save that cannot be dropped, and the failure that cannot be missed.
     "sbeSaveInner", "sbeSaveAlarm", "sbeSaveAlarmClear", "sbeQueueSave",
+    # EDITOR-11: a save adopts the healed timings the server wrote.
+    "sbeAdoptSavedTimings",
     # The crash lane itself, so save → backup → recovery can be DRIVEN rather
     # than grepped for the presence of its guards.
     "sbeBackup", "sbeDraftOp", "sbeNameMode",
@@ -184,6 +186,22 @@ FUNCTIONS = (
     # these, so every harness that extracts those needs them too.
     "sbeSoundLane", "sbeLaneName", "sbeSetSoundLane", "sbeAlternateLanes",
     "sbeLaneAfter", "sbeLaneFit",
+    # FILM package (2026-09-29 mega review) — slip and roll edits, the
+    # frame timecode, and the take/replace maths. Pure by the same rule as
+    # everything above: arithmetic nobody should have to check by dragging.
+    "sbeFmtTC", "sbeSlip", "sbeRollEdit", "sbeReplaceClip",
+    # FILM-04 — the song as the film's master clock in Replace mode.
+    "sbeMusicAt", "sbeMusicMaster", "sbeSongPlayhead",
+    # FILM-05 — the per-clip song-sync readout and Snap to song.
+    "sbeShotForClip", "sbeSongSyncOffset", "sbeSnapToSong",
+    # FILM-05 item 4 — auto-lock a2v clips against moves that break sync.
+    "sbeSongLocked",
+    # FILM-14 — the 5-slider grade.
+    "sbeGrade", "sbeGradeIsNeutral", "sbeSetGrade", "sbeCopyGrade", "sbeGradeCss",
+    # FILM-58 — markers, copy/paste, sequence aspect.
+    "sbeMarkerAdd", "sbeMarkerRemove", "sbeMarkerSetLabel", "sbeMarkerSetKind",
+    "sbeClipboardCopy", "sbeClipboardPasteAttrs", "sbeClipboardPasteClips",
+    "sbeSeqAspect", "sbeSetSeqAspect",
 )
 
 SHIM = r"""
@@ -222,6 +240,21 @@ const SBE_SNAP_PX = 9;
 const SBE_GUESS_CONFIDENCE = 0.4;
 const SBE_BRIGHT_MAX = 0.5;
 const SBE_STILL_SECONDS = 3.0;
+// FILM-14. Keep equal to the panel's — test_editor_film_grade reads both.
+const SBE_GRADE_EXPOSURE_MAX = 0.5;
+const SBE_GRADE_CONTRAST_MIN = 0.5, SBE_GRADE_CONTRAST_MAX = 1.8;
+const SBE_GRADE_SATURATION_MIN = 0.0, SBE_GRADE_SATURATION_MAX = 2.5;
+const SBE_GRADE_TEMP_TINT_MAX = 1.0;
+// FILM-58.
+const SBE_SEQ_ASPECTS = { '16:9': 16 / 9, '9:16': 9 / 16, '1:1': 1 };
+const SBE_PASTE_ATTR_FIELDS = ['adjust', 'frame', 'fx', 'speed'];
+const SBE_GRADE_FIELDS = {
+  exposure: [-SBE_GRADE_EXPOSURE_MAX, SBE_GRADE_EXPOSURE_MAX, 0],
+  contrast: [SBE_GRADE_CONTRAST_MIN, SBE_GRADE_CONTRAST_MAX, 1],
+  saturation: [SBE_GRADE_SATURATION_MIN, SBE_GRADE_SATURATION_MAX, 1],
+  temp: [-SBE_GRADE_TEMP_TINT_MAX, SBE_GRADE_TEMP_TINT_MAX, 0],
+  tint: [-SBE_GRADE_TEMP_TINT_MAX, SBE_GRADE_TEMP_TINT_MAX, 0],
+};
 // Editor v2. Keep equal to the panel's — test_editor_v2 reads both.
 const SBE_SPEED_MIN = 0.25;
 const SBE_SPEED_MAX = 4.0;
@@ -1042,6 +1075,15 @@ out.backupLivesAfterASave = [!!(await sbeBackup(true)), FETCHES.length,
 out.backupNamesItsDraft = JSON.parse(FETCHES[0].body || '{}').draft;
 // A backup that does not land is the safety net gone, and only the alarm says so.
 SBE.dirty = true;
+// FILM-57: sbeBackup now skips the network call for CONTENT it already
+// backed up successfully — the watchdog's own re-arm-every-tick loop used to
+// re-POST the same unchanged document every 1.4s forever. This scenario is a
+// genuinely new attempt (whatever failed here is not what the previous line
+// already has safely on the server), so it clears the memory that dedup
+// reads rather than changing the content — the alarm this asserts is about
+// a NEW write failing, not about the dedup skip, which is covered on its
+// own in test_editor_save_integrity.TheWatchdogStopsCallingWhenNothingChanged.
+SBE.lastBackupSig = '';
 NEXT = { status: 500, body: { ok: false, error: 'disk is full' } };
 out.backupFailureIsLoud = [await sbeBackup(true), !!SBE.saveFailed];
 SBE.saveFailed = ''; els.sbeAlarm.hidden = true;
@@ -1321,14 +1363,23 @@ out.holeCounterOnHisFilm = (() => {
 // ---- THE NET'S OWN STATE ------------------------------------------------
 out.protectedChip = (() => {
   const read = () => ({ text: sbeEl('sbeProtected').textContent,
+                        hidden: !!sbeEl('sbeProtected').hidden,
+                        tooltip: sbeEl('sbeState').title,
                         cold: sbeEl('sbeProtected').classList.contains('is-cold') });
   const was = { open: SBE.open, id: SBE.id, dirty: SBE.dirty,
                 dirtyAt: SBE.dirtyAt, backedUpAt: SBE.backedUpAt };
   SBE.open = true; SBE.id = 'sb_t'; SBE.otherEditor = '';
+  // FILM-38: cold is stated in the WATCHDOG's own terms now — the oldest
+  // unwritten change (dirtyAt) is older than the grace AND no backup has
+  // landed since it. Ageing only `backedUpAt` while `dirtyAt` stayed fresh
+  // used to read as cold anyway (the bug this fixture now exercises the fix
+  // for) — a brand new edit with no backup yet is "backing up…", not alarmed.
   SBE.dirty = true; SBE.dirtyAt = Date.now();
   SBE.backedUpAt = Date.now() - 3000;   sbePaintProtected(); const fresh = read();
-  SBE.backedUpAt = Date.now() - 40000;  sbePaintProtected(); const cold = read();
-  SBE.backedUpAt = 0;                   sbePaintProtected(); const never = read();
+  SBE.dirtyAt = Date.now() - 40000; SBE.backedUpAt = 0;
+  sbePaintProtected(); const cold = read();
+  SBE.dirtyAt = Date.now(); SBE.backedUpAt = 0;
+  sbePaintProtected(); const never = read();
   Object.assign(SBE, was);
   return [fresh, cold, never];
 })();
@@ -1958,7 +2009,13 @@ out.musicDragNowhereChangesNothing = (() => {
 out.draftSwitchRefusesWhenTheBackupCannotWrite = await (async () => {
   // A REAL write failure, not an unanswered offer: the snapshot POST fails,
   // so the work on screen has nowhere to go and the switch must not proceed.
-  SBE.backup = null;
+  // FILM-06 made the FIRST edit off a clean timeline fire its own
+  // fire-and-forget sbeBackup() (previously that write waited out a 1.4s
+  // debounce that never elapsed inside this script, so nothing upstream
+  // could still be "in flight" here) — an earlier scenario's own first edit
+  // may still be an unsettled promise holding SBE.backingUp, which this
+  // scenario does not own and must not inherit.
+  SBE.backup = null; SBE.backingUp = false;
   SBE.dirty = true; SBE.conflict = 0;
   FETCHES = [];
   NEXT = { status: 500, body: { ok: false, error: 'disk is full' } };
@@ -4251,24 +4308,84 @@ class TheNetSaysWhenItLastCaughtYou(unittest.TestCase):
 
     def test_fresh_reads_as_protected_and_stale_reads_as_NOT(self):
         fresh, cold, never = self.r["protectedChip"]
-        self.assertIn("protected", fresh["text"])
+        # FILM-37: the routine case used to sit in the header as its own
+        # always-visible text, permanently spending width the title/state/
+        # draft-chip needed — at 1366-1440px that was what truncated
+        # "saved · rev7" down to "saved · r", well above the breakpoint that
+        # was supposed to fold the state text first. It still says the same
+        # thing, just in the status pill's tooltip rather than on screen.
+        self.assertTrue(fresh["hidden"])
+        self.assertEqual(fresh["text"], "")
+        self.assertIn("protected", fresh["tooltip"])
         self.assertFalse(fresh["cold"])
         # Past the watchdog's own grace, the chip goes cold on the SAME
         # threshold the banner alarms on — two indicators that can disagree
-        # are one indicator and one bug.
+        # are one indicator and one bug. An ALARM earns the width back: it
+        # is the one case in this chip that is actionable.
+        self.assertFalse(cold["hidden"])
         self.assertIn("NOT PROTECTED", cold["text"])
+        self.assertEqual(cold["tooltip"], cold["text"])
         self.assertTrue(cold["cold"])
-        self.assertIn("not backed up yet", never["text"])
+        # FILM-38: a BRAND NEW edit, no backup landed yet, is not alarming —
+        # it is the normal half-second between an edit and the (now
+        # near-immediate, FILM-06) snapshot reaching the server. Red is
+        # reserved for a write that is actually late, so this one is quiet
+        # on screen too — "backing up…" lives in the tooltip.
+        self.assertTrue(never["hidden"])
+        self.assertIn("backing up", never["tooltip"])
+        self.assertFalse(never["cold"])
 
-    def test_cold_is_stated_against_the_last_SUCCESSFUL_write(self):
-        # Not against `dirtyAt`: the outage froze that pair in a way that read
-        # "protected" for seven hours. How long ago the net actually caught
-        # this tab cannot be faked by a stuck flag.
+    def test_cold_now_AGREES_with_the_watchdog_instead_of_only_claiming_to(self):
+        # FILM-38: the comment used to say "the SAME threshold the watchdog
+        # alarms on" while comparing only against `backedUpAt` — which is
+        # cold the instant `dirty` becomes true, before the snapshot has had
+        # one network round trip. `dirtyAt` was avoided because the old
+        # stale-session outage froze it in a way that read "protected" for
+        # seven hours — that outage is closed (docs/EDITOR_SAVE_MODEL.md §5),
+        # and the watchdog (sbeTick) has safely compared `dirtyAt` this whole
+        # time. The chip now uses the identical expression.
         fn = extract_function("sbePaintProtected", self.src)
-        self.assertIn("SBE.backedUpAt", fn)
         cold = fn[fn.index("const cold"):]
-        cold = cold[:cold.index(";")]
-        self.assertNotIn("dirtyAt", cold)
+        cold = cold[:cold.index(";", cold.index("SBE.dirtyAt"))]
+        self.assertIn("SBE.dirtyAt", cold)
+        self.assertIn("SBE_SAVE_GRACE_MS", cold)
+        self.assertIn("SBE.backedUpAt", cold)
+        tick = extract_function("sbeTick", self.src)
+        self.assertIn("SBE.backedUpAt < SBE.dirtyAt", tick)
+
+
+class ThePoolFiltersAreOneRow(unittest.TestCase):
+    """FILM-37: five sources (This __SEQCAP__ / Other __SEQS__ / Generations /
+    Images / Sound) at a 40% flex-basis wrapped into up to three rows —
+    measured 1.5 rows at 1366x768 — eating vertical space the pool's own
+    list needed. They are a single non-wrapping row now."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.src = panel_source()
+
+    def test_the_row_does_not_wrap(self):
+        css = self.src[self.src.index(".ed-pool-tabs {"):]
+        rule = css[:css.index("}") + 1]
+        self.assertIn("flex-wrap: nowrap", rule)
+
+    def test_the_five_sources_are_one_select_that_fits_the_pool(self):
+        # 4.17: five pills in one row clipped into each other in the ~260 px
+        # pool at 1280-1440 px; a labelled select names every source in full.
+        tabs = self.src[self.src.index('id="edPoolTabs"'):]
+        tabs = tabs[:tabs.index("</select>")]
+        self.assertIn('<select id="edPoolSrcSelect"', tabs)
+        self.assertIn('onchange="edPoolSrc(this.value)"', tabs)
+        self.assertEqual(tabs.count("<option "), 5)
+        css = self.src[self.src.index(".ed-pool-tabs .ed-pool-src {"):]
+        rule = css[:css.index("}") + 1]
+        self.assertIn("min-width: 0", rule)
+
+    def test_all_five_tabs_are_still_there(self):
+        tabs = self.src[self.src.index('id="edPoolTabs"'):]
+        tabs = tabs[:tabs.index("</div>")]
+        for src in ("film", "other", "gallery", "images", "sound"):
+            self.assertIn('data-src="%s"' % src, tabs)
 
 
 class OneNoticeSurface(unittest.TestCase):
@@ -4998,9 +5115,12 @@ class TimelineVersions(unittest.TestCase):
         # sbeAdopt sets the mode dropdown to agree with the document on every
         # load, and that call was marking the document dirty and queueing a
         # write — so every OPEN of every film produced a save nobody made.
+        # FILM-33 moved the actual dirtying into sbeMusicCommit (the shared
+        # writer every soundtrack gesture now goes through), so the guard's
+        # job is to return before THAT is ever reached.
         fn = extract_function("sbeSetMusicMode", self.src)
         self.assertIn("if (String(SBE.audio.mode || 'under') === mode) return;", fn)
-        self.assertLess(fn.index("=== mode) return"), fn.index("SBE.dirty = true"))
+        self.assertLess(fn.index("=== mode) return"), fn.index("sbeMusicCommit("))
 
     def test_the_lane_has_nothing_left_to_guard(self):
         # The guard is gone because the thing it guarded is gone: snapshots
@@ -5066,6 +5186,14 @@ class TimelineVersions(unittest.TestCase):
         # name. See docs/EDITOR_SAVE_MODEL.md §4.
         self.assertIn("your saved draft is untouched", paint)
         self.assertNotIn("Nothing has been changed", paint)
+
+    def test_the_bar_says_WHAT_changed_when_the_server_names_it(self):
+        # FILM-54: `b.diff` is `edit_diff_summary`'s answer, server-side —
+        # "1 clip changed: 02 brightness +0.30" instead of the two counts
+        # matching being the only thing on screen.
+        paint = extract_function("sbePaintRecovery", self.src)
+        self.assertIn("b.diff", paint)
+        self.assertLess(paint.index("b.diff"), paint.index("your saved draft"))
         # The offer is painted on adopt; nothing calls sbeRecover for you.
         adopt = extract_function("sbeAdopt", self.src)
         self.assertIn("sbePaintRecovery()", adopt)
@@ -6252,6 +6380,31 @@ class TheEverydayGesturesThatWereMissing(unittest.TestCase):
         # dirty, push an undo step that undoes nothing and queue a save.
         self.assertIn("nothing to give", fn)
 
+    def test_a_chord_is_let_through_a_field_because_it_cannot_be_a_character(self):
+        # FILM-36: dragging the Brightness or Zoom slider leaves focus on a
+        # range input, and the field guard used to hide ⌘S/⌘Z/⌘⇧Z/⌘E behind
+        # it entirely — the browser's own "Save Page As" fired instead, or
+        # nothing did. These four chords are let through BEFORE the field
+        # guard because a modifier held is never someone typing a character.
+        before_guard = self.keys[:self.keys.index("if (inField) return;")]
+        self.assertIn("sbeSaveNow()", before_guard)
+        self.assertIn("sbeUndo()", before_guard)
+        self.assertIn("sbeRedo()", before_guard)
+        self.assertIn("sbeRenderFilm()", before_guard)
+        # ...and it is scoped to those four, not every modifier chord — a
+        # text field's own ⌘A (select its text) or ⌘Z (undo typing) must
+        # keep working, which a blanket "any modifier" exemption would break.
+        self.assertNotIn("sbeSelectAll()", before_guard)
+        self.assertNotIn("sbeInspectToggle()", before_guard)
+
+    def test_space_plays_from_a_range_or_checkbox_but_not_a_text_field(self):
+        # A range or checkbox never uses Space to enter TEXT, so play/pause
+        # is not competing with anything the field would otherwise do with
+        # it — unlike a text input, where Space has to keep typing a space.
+        before_guard = self.keys[:self.keys.index("if (inField) return;")]
+        self.assertIn("t.type === 'range' || t.type === 'checkbox'", before_guard)
+        self.assertIn("sbeTogglePlay()", before_guard)
+
     def test_home_end_and_the_zoom_keys_exist(self):
         for bit in ("ev.key === 'Home'", "ev.key === 'End'", "sbeZoom("):
             self.assertIn(bit, self.keys, bit)
@@ -6334,10 +6487,26 @@ class TimelineMarkup(unittest.TestCase):
         fn = extract_function("sbeAuto", self.src)
         self.assertIn("THROWS AWAY", fn)
 
-    def test_the_render_discloses_that_the_concat_closes_gaps(self):
+    def test_the_render_warns_about_holes_without_blocking_it(self):
+        # FILM-27: the assembler now pads a hole with black at its exact
+        # length instead of closing it, so a native confirm() gating the
+        # render on "are you sure" was the wrong weight — and the wrong
+        # surface — for "this will show some black". The warning is in-app
+        # and does not stop the render.
+        # FILM-28: gaps_note is read once the JOB finishes (sbeRenderFinish),
+        # not in sbeRenderFilm itself, which now only starts it — the
+        # disclosure has to hold across the whole chain, same as the
+        # "never navigates" claim above.
         fn = extract_function("sbeRenderFilm", self.src)
-        self.assertIn("gaps_note", fn)
-        self.assertIn("CONCATENATES", fn)
+        self.assertIn("sbeNoticeHoles", fn)
+        self.assertNotIn("confirm(", fn)
+        chain = fn + extract_function("sbeRenderPoll", self.src) \
+            + extract_function("sbeRenderFinish", self.src)
+        self.assertIn("gaps_note", chain)
+        self.assertNotIn("confirm(", chain)
+        notice = extract_function("sbeNoticeHoles", self.src)
+        self.assertIn("play as black", notice)
+        self.assertIn("phos-toast-action", notice)
 
     def test_generate_shows_the_params_that_will_ACTUALLY_render(self):
         # make_job silently drops any form field it does not name, so the
@@ -6346,6 +6515,28 @@ class TimelineMarkup(unittest.TestCase):
         fn = extract_function("sbeGenSubmit", self.src)
         self.assertIn("r.params", fn)
         self.assertIn("sbeGenParams", fn)
+
+    def test_a_retake_sends_its_own_path_not_just_its_id(self):
+        # FILM-35: the server used to resolve retake_of by loading the SAVED
+        # edit.json and looking the clip id up in it — a clip split,
+        # duplicated or added since the last manual Save was not in that
+        # file yet, and the retake refused for a clip plainly on screen. The
+        # client already has the path; sending it is what lets the server
+        # skip the stale file entirely.
+        self.assertIn("retakePath: c.path", extract_function("sbeRetakeSel", self.src))
+        open_fn = extract_function("sbeGenOpen", self.src)
+        self.assertIn("_sbeRetakePath = (opts && opts.retakePath) || ''", open_fn)
+        submit = extract_function("sbeGenSubmit", self.src)
+        self.assertIn("fd.set('retake_path', _sbeRetakePath)", submit)
+
+    def test_the_landed_take_poll_no_longer_waits_for_a_clean_timeline(self):
+        # FILM-35: unsaved is the NORMAL state of a timeline someone is
+        # cutting — gating this on `!SBE.dirty` meant the notice almost
+        # never fired. sbeLoad(true) is already safe while dirty (it never
+        # adopts the arrangement, only refreshes facts around it).
+        tick = extract_function("sbeTick", self.src)
+        self.assertIn("if (SBE.awaitingClip && !SBE.drag && !SBE.saving) {", tick)
+        self.assertNotIn("SBE.awaitingClip && !SBE.dirty", tick)
 
     def test_the_preview_prefers_the_proxy_and_labels_the_fallback(self):
         fn = extract_function("sbeClipUrl", self.src)
@@ -6408,6 +6599,37 @@ class TimelineMarkup(unittest.TestCase):
         self.assertEqual(row.count("<video id="), 2)
         # The source is a player, not a second editor: no track, no trim.
         self.assertNotIn("sbe-track", row)
+
+    def test_the_source_monitor_collapses_while_nothing_is_loaded(self):
+        # FILM-37: "Nothing loaded" used to sit in the full 16:9 box
+        # regardless — about a third of the row, permanently. Collapsed to a
+        # 64px rail while empty, and it can never disagree with the bar's
+        # own "Nothing loaded" text: both read the exact same `!row`.
+        css = self.src[self.src.index(".sbe-monitors > .sbe-mon-src {"):]
+        css = css[:css.index(".sbe-monitors > .sbe-mon-prog")]
+        self.assertIn(".sbe-mon-src.is-empty { width: 64px; }", css)
+        fn = extract_function("sbePaintSource", self.src)
+        self.assertIn("mon.classList.toggle('is-empty', !row)", fn)
+        # The toggle happens before the SAME `if (!row)` branch that writes
+        # "Nothing loaded" — one test of the state, not two that could drift.
+        self.assertLess(fn.index("classList.toggle('is-empty'"),
+                        fn.index("'Nothing loaded'"))
+
+    def test_the_inspector_is_a_drawer_below_1600px(self):
+        # FILM-37: at 1366-1440px the rail shared width with the monitors
+        # through a JS-computed --sbe-rail-w that measured about 210px there
+        # — the "2x" speed control clipped inside it. Below 1600px it comes
+        # out of that row's width budget entirely (position: fixed) at a
+        # width wide enough to read every control: 320px.
+        css = self.src[self.src.index("@media (max-width: 1599px) {\n      .sbe-rail {"):]
+        css = css[:css.index("/* ---- the stage:")]
+        self.assertIn("position: fixed", css)
+        self.assertIn("width: 320px", css)
+        # It still toggles on the exact mechanism sbeInspectSet already
+        # flips — nothing about opening/closing it changed, only where an
+        # open one sits.
+        fn = extract_function("sbeInspectSet", self.src)
+        self.assertIn("rail.hidden = !SBE.inspect", fn)
 
     def test_only_one_monitor_ever_plays(self):
         # Two elements is two decoders only if both decode. sbePlay stops the
@@ -6669,7 +6891,12 @@ class TimelineMarkup(unittest.TestCase):
         self.assertNotIn("sbeTeardown()", wf)
         susp = extract_function("sbeSuspend", self.src)
         self.assertIn("sbeStop()", susp)                    # the picture stops
-        self.assertIn("sbeSave(true)", susp)                # the work is kept
+        # FILM-29: a tab switch is not the user pressing Save — it is the
+        # backup lane's job, same as sbeCloseDoc next to it. `sbeSave(true)`
+        # here would be a silent write to edit.json the owner explicitly
+        # refused ("autosave to edit.json" — docs/EDITOR_SAVE_MODEL.md §"Deliberately not built").
+        self.assertIn("sbeBackup(true)", susp)              # the work is kept…
+        self.assertNotIn("sbeSave(true)", susp)             # …without a silent manual save
         self.assertNotIn("SBE.open = false", susp)          # the document is not
 
     def test_the_document_only_closes_when_the_document_is_closed(self):
@@ -6691,7 +6918,7 @@ class TimelineMarkup(unittest.TestCase):
     def test_the_editor_tab_exists_and_is_always_reachable(self):
         # A tab with no board open is the whole point: "an editor that only
         # exists inside a storyboard is an editor most clips can never reach".
-        self.assertIn('<button data-workflow="editor">', self.src)
+        self.assertIn('<button data-workflow="editor"', self.src)
         self.assertIn(">Editor<", self.src)
         # It MUST be in the localStorage restore list or the tab never comes
         # back across a reload — the trap the comment beside it documents.
@@ -6717,6 +6944,22 @@ class TimelineMarkup(unittest.TestCase):
         self.assertNotIn("if (!SB.id) return", fn)
         self.assertIn("edDoc()", fn)         # last document, remembered
         self.assertIn("edRemember(want)", fn)
+
+    def test_opening_the_already_open_film_resumes_it_rather_than_reloading(self):
+        # FILM-16: falling through to `sbeLoad()` below is a NON-QUIET load,
+        # which always adopts the server's last SAVED document — so "Open in
+        # Editor" on the film already open (the rail's step 3, or coming back
+        # from Storyboard to check a prompt) silently threw away every edit
+        # since the last Save. sbeResume() re-reads QUIETLY, which protects
+        # unsaved work; this must be checked and returned from BEFORE the
+        # unconditional `sbeLoad()` a few lines down.
+        fn = extract_function("sbeOpen", self.src)
+        self.assertIn("if (SBE.open && SBE.id === want) { sbeResume(); return; }", fn)
+        self.assertLess(fn.index("SBE.id === want) { sbeResume(); return; }"),
+                        fn.index("sbeLoad();"))
+        # sbeResume, in turn, re-reads quiet — never the adopting load.
+        resume = extract_function("sbeResume", self.src)
+        self.assertIn("sbeLoad(true)", resume)
 
     def test_the_narrow_layout_stops_stretching_so_the_page_can_scroll(self):
         # .layout is `flex: 1 1 auto` in a flex body, so the breakpoint's
@@ -6752,7 +6995,7 @@ class TimelineMarkup(unittest.TestCase):
         shots = extract_function("edPoolLoadFilmShots", self.src)
         self.assertIn("'/storyboard/get?id='", shots)
 
-    def test_adding_a_clip_lands_it_on_the_TRACK_and_saves(self):
+    def test_adding_a_clip_lands_it_on_the_TRACK_and_backs_up(self):
         # Not on the board, and not in a chip row waiting to be placed: the
         # click said "put this in my film", so it goes on the timeline.
         fn = extract_function("edPoolAdd", self.src)
@@ -6760,7 +7003,11 @@ class TimelineMarkup(unittest.TestCase):
         self.assertIn("sbePlaceUnplaced", fn)
         self.assertIn("sbeFilmDuration(cs)", fn)          # a CLICK: at the END
         self.assertIn("sbeInsertAt(cs, item, at)", fn)    # a DROP: where it fell
-        self.assertIn("sbeSave(true)", fn)
+        # FILM-29: `sbeMutate` above already marked this dirty and queued the
+        # crash backup. A follow-up `sbeSave(true)` here was a second, silent
+        # write to edit.json the user never pressed Save for.
+        self.assertNotIn("sbeSave(true)", fn)
+        self.assertIn("sbeMutate(cs =>", fn)
 
     def test_adding_a_clip_from_another_film_uses_the_import_subset_param(self):
         # `only=` has been on the server since the import shipped and no
@@ -6789,6 +7036,32 @@ class TimelineMarkup(unittest.TestCase):
         # …and the first screenful does not wait for a callback, because
         # intersection callbacks do not run in an occluded tab.
         self.assertIn(".slice(0, 12)", obs)
+
+    def test_the_pool_plus_lands_at_the_playhead_not_always_the_end(self):
+        # FILM-40: "+" always meant "put this at the end" — a clip swapped
+        # in mid-cut meant a click here and then a drag all the way back to
+        # where you actually were. ⌥+click keeps the old behaviour for the
+        # one time "the end" is actually wanted.
+        fn = extract_function("edPoolPaint", self.src)
+        self.assertIn("edPoolAdd(' + i +\n        ', event.altKey ? undefined : SBE.playhead)", fn)
+
+    def test_the_empty_pool_does_not_contradict_a_timeline_that_has_clips(self):
+        # FILM-40: "This __SEQ__ has no rendered clips yet" while 9 clips
+        # sat on the timeline — a film cut from imported or Video-tab clips
+        # has nothing of its OWN in this pool source, which is a different,
+        # true sentence.
+        fn = extract_function("edPoolPaint", self.src)
+        self.assertIn("(SBE.clips || []).length", fn)
+        self.assertIn("Nothing left to add from this __SEQ__", fn)
+
+    def test_the_60_row_cap_has_a_way_past_it(self):
+        # FILM-40: "60 of 75 shown." with no way to see the rest.
+        fn = extract_function("edPoolPaint", self.src)
+        self.assertIn("edPoolShowAll()", fn)
+        self.assertIn("Show all ", fn)
+        show_all = extract_function("edPoolShowAll", self.src)
+        self.assertIn("ED.limit = Infinity", show_all)
+        self.assertIn("edPoolPaint()", show_all)
 
     # ---- relink ---------------------------------------------------------
     def test_the_relink_banner_says_how_many_and_offers_one_button(self):
@@ -6880,6 +7153,60 @@ class TimelineMarkup(unittest.TestCase):
         self.assertIn(".sbe-clip.is-slug", css)
         self.assertIn(".sbe-clip.is-still", css)
 
+    def test_a_video_clip_shows_a_poster_from_its_proxy_only(self):
+        # FILM-39: video clips had no filmstrip at all — one first-frame
+        # poster now, taken from the PROXY (never the original: a clip with
+        # no proxy is exactly the one flagged SLOW for the same reason, no
+        # fast seek), and never requested for offline media (that file is
+        # already known not to answer).
+        fn = extract_function("sbePaintTrack", self.src)
+        self.assertIn("kind === 'video' && c.proxy && !offline", fn)
+        self.assertIn("/storyboard/edit/poster?id=", fn)
+        self.assertIn("String(c.proxy).split('/').pop()", fn)
+        # The route is board-scoped like the proxy video route it mirrors —
+        # `id=` before `name=`, not a bare clip path.
+        route = fn[fn.index("/storyboard/edit/poster?id="):]
+        self.assertLess(route.index("&name="), route.index("&w="))
+
+    def test_the_two_clip_sound_lanes_are_not_both_called_A1(self):
+        # FILM-39: "Clip sound A" and "Clip sound B" were both labelled
+        # <i>A1</i> in the gutter — the one place a glance is supposed to
+        # tell the two lanes apart.
+        gutter = self.src[self.src.index('id="sbeGutter"'):]
+        gutter = gutter[:gutter.index('sbe-mix-row')]
+        self.assertIn("<i>A1a</i>", gutter)
+        self.assertIn("<i>A1b</i>", gutter)
+        self.assertNotIn("<i>A1</i>", gutter)
+
+    def test_the_slow_flag_explains_itself_instead_of_saying_SLOW(self):
+        # FILM-39: "SLOW" was jargon with no tooltip and no action. It means
+        # no proxy yet — scrubbing decodes from the source GOP — which is
+        # exactly what Prepare fixes.
+        fn = extract_function("sbePaintTrack", self.src)
+        self.assertNotIn("'SLOW'", fn)
+        # 4.17: the flag is also the fix — its title says a click runs it.
+        self.assertIn("click to run Prepare", fn)
+
+    def test_a_genuine_open_lands_at_the_top_and_fits_a_long_film(self):
+        # FILM-57/39: the playhead used to survive a switch to a different
+        # film (a short film opened after a long one could land PAST ITS
+        # OWN END, on black) and the zoom stayed at the default regardless
+        # of length (a 2:52 film opened showing about 10s of it). Neither
+        # may fire on a quiet re-read, which must not move anything the
+        # user is already looking at.
+        fn = extract_function("sbeAdopt", self.src)
+        self.assertIn("if (!quiet) SBE.playhead = 0;", fn)
+        self.assertIn("if (!quiet) {\n    const fit = sbeZoomMin();", fn)
+        # The switch branch of sbeOpen (a DIFFERENT film already open) falls
+        # through to a bare `sbeLoad()` — no `quiet` argument, so it lands on
+        # sbeLoad's non-quiet default and reaches this same `!quiet` branch.
+        # A switch between two open films is not a special case; it is one
+        # more genuine open.
+        op = extract_function("sbeOpen", self.src)
+        self.assertIn("if (SBE.open && SBE.id && SBE.id !== want) sbeCloseDoc({ quiet: true });", op)
+        self.assertIn("sbeLoad();", op)
+        self.assertNotIn("sbeLoad(true)", op)
+
     def test_the_brightness_slider_previews_live_and_commits_once(self):
         # oninput at pointer speed would push eighty undo steps and eighty
         # saves for one gesture; onchange fires once, when the drag ends.
@@ -6929,11 +7256,12 @@ class TimelineMarkup(unittest.TestCase):
         self.assertIn("ev.preventDefault()", start)
         add = extract_function("edPoolAdd", self.src)
         self.assertIn("if (ED.suppressClick && dropAt === undefined)", add)
-        # Add-at-the-end still works and still lands at the end — it is the +
-        # on the row now rather than the whole row, because clicking the row
-        # previews. `stopPropagation` is what keeps one press from doing both.
+        # The + is on the row now rather than the whole row, because
+        # clicking the row previews. `stopPropagation` is what keeps one
+        # press from doing both. FILM-40: it lands at the playhead now, not
+        # always the end — ⌥+click is the escape hatch back to "the end".
         pool = extract_function("edPoolPaint", self.src)
-        self.assertIn("edPoolAdd(' + i + ')", pool)
+        self.assertIn("edPoolAdd(' + i +\n        ', event.altKey ? undefined : SBE.playhead)", pool)
         self.assertIn("event.stopPropagation()", pool)
         self.assertIn('onpointerdown="edPoolDragStart(event,', pool)
 
@@ -7072,6 +7400,7 @@ ONESHOT_FUNCTIONS = (
     "osPartsText", "osPartsShort",
     "osRenderSummary", "osRenderAll", "osSetEngine", "osSetSeconds", "osSetQuality", "osSetCharacter",
     "osToggle", "osSplitPrompt", "osVerdict", "osPaintStatus", "oneshotOpenFromParams", "osWire",
+    "_osStoredSeconds", "_osApplyStoredPrefs",
     # the async ones osWire binds; the shim's fetch answers {ok:false}, so they are inert here
     "osPlanBeats", "osGenerate", "osUpload", "osClearAnchor", "osEstimate", "osStatusTick",
     "osStartStatus", "osStopStatus", "osLoadOptions", "oneshotTabEnter", "oneshotTabLeave",
@@ -7492,19 +7821,22 @@ class OneShotIsATab(unittest.TestCase):
         self.assertNotRegex(text, r"\btake\b", "the user reads 'one shot', never 'take'")
 
     # ---- the module, run -----------------------------------------------------
-    def test_entering_the_tab_is_one_minute_on_ltx_with_nothing_written(self):
+    def test_entering_the_tab_defaults_to_thirty_seconds_on_ltx_with_nothing_written(self):
+        # VA-15: the default was 60 s (6 parts, ~28 min committed before any
+        # price showed near Generate). Now 30 s (3 parts, ~15 min — the
+        # owner's own sample length).
         e = self.r["enter"]
-        self.assertEqual((e["engine"], e["seconds"], e["quality"]), ("ltx", 60, "balanced"))
+        self.assertEqual((e["engine"], e["seconds"], e["quality"]), ("ltx", 30, "balanced"))
         self.assertEqual(e["lengths"], ["30", "45", "60", "90", "120"])
-        self.assertEqual(e["activeLength"], ["60"])
+        self.assertEqual(e["activeLength"], ["30"])
         self.assertEqual(e["parts"], ["3 × 10 s", "4 × 10 s + 5 s", "6 × 10 s", "9 × 10 s", "12 × 10 s"])
         self.assertEqual(e["qualities"], ["quick", "balanced", "standard", "high"])
         self.assertEqual(e["characters"], ["", "bizarrotrn"])
         self.assertEqual(e["beats"], [])
         self.assertIn("the prompt carries the whole shot", e["beatsHint"])
-        self.assertEqual((e["rows"], e["first"]), (12, "0:00"))
+        self.assertEqual((e["rows"], e["first"]), (6, "0:00"))
         self.assertEqual((e["handoff"], e["handoffChips"]), ("last", ["last"]))
-        self.assertIn("1 min", e["summary"]); self.assertIn("6 parts of 10 s", e["summary"])
+        self.assertIn("30 s", e["summary"]); self.assertIn("3 parts of 10 s", e["summary"])
         self.assertEqual(self.r["len45"]["chip"], "4 × 10 s + 5 s")
         self.assertIn("4 × 10 s + 5 s", self.r["len45"]["summary"])
         self.assertFalse(e["characterBlockHidden"])
@@ -7512,7 +7844,7 @@ class OneShotIsATab(unittest.TestCase):
     def test_one_paragraph_is_a_complete_document(self):
         d = self.r["docPromptOnly"]
         self.assertEqual(d["prompt"], "A hen skates down Broadway at night.")
-        self.assertEqual((d["seconds"], d["engine"], d["quality"]), (60, "ltx", "balanced"))
+        self.assertEqual((d["seconds"], d["engine"], d["quality"]), (30, "ltx", "balanced"))
         self.assertNotIn("beats", d); self.assertNotIn("character_id", d); self.assertNotIn("image", d)
         self.assertEqual((d["light_lock"], d["retake"], d["handoff"]), ("on", "on", "last"))
 

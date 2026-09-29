@@ -39,6 +39,18 @@ If you updated and the panel still behaves like the old version, it is still run
 
 *"the macOS GPU watchdog killed a Metal command buffer"* — macOS itself stopped a GPU task that ran too long. It is a driver-level kill, not a Phosphene bug report. Phosphene retries the prompt encoding at a shorter length for the rest of the session. If it keeps happening, the message links to the GitHub issue where chip, macOS version and the crash log help most.
 
+## A character training run failed {#training-failed}
+
+*"training exited with code 1"* — the trainer stopped before finishing. Check the **Logs** tab for the actual reason: an out-of-memory kill (switch to a Mac with more RAM, or a smaller preset if one exists), a missing LTX-2.3 training download (the Train tab's own preflight card offers it), or a caption-encode timeout on a very long caption. Training under 24 GB always fails — that Mac cannot run it.
+
+## The panel says it's offline {#offline}
+
+*"Phosphene offline"*, and pressing **Generate** does nothing — the panel process isn't answering. Nothing you were typing is lost: the prompt stays as you left it, and the page reconnects and picks the queue back up on its own once the panel is running again. Start it from Pinokio's Phosphene sidebar if it doesn't come back within a few seconds.
+
+## The queue paused itself {#queue-paused}
+
+*"Queue paused: the last N renders failed the same way"* — after three renders in a row fail with the same problem, Phosphene stops burning through the rest of the queue on something a retry can't fix. Fix the cause the message names, then press **Resume**; or **Clear queue** to drop the rest and start over.
+
 ## The queue after a restart {#queue-restart}
 
 Restarting the panel resumes the queue: a queue that was paused when the panel stopped starts again on its own, and the log says so.

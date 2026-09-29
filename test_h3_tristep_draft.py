@@ -37,13 +37,32 @@ for _k, _d in (("LTX_STATE_DIR", "state"), ("LTX_OUTPUT_DIR", "out"),
 os.environ["PHOSPHENE_ANALYTICS_DISABLED"] = "1"
 os.environ["PHOSPHENE_DISABLE_VERSION_CHECK"] = "1"
 os.environ["LTX_H3_FORCE_CAPABLE"] = "1"
-os.environ["PHOSPHENE_SPEED_FACTOR"] = "1"
 os.environ.setdefault("LTX_PORT", "8302")
 sys.path.insert(0, str(ROOT))
 
 import mlx_ltx_panel as P  # noqa: E402
 
 SUBSET = "50:0,16,33,49"
+
+# PHOSPHENE_SPEED_FACTOR pins this suite's prices to the M4 Max tables. It was
+# set at import time and never removed, and pytest imports every module before
+# it runs any — so it leaked into every later suite in a whole-suite run
+# (test_vc01_ltx_estimate_honesty's low-RAM factor read 1.0). Scope it to this
+# module's own tests instead.
+_SPEED_PREV = None
+
+
+def setUpModule():
+    global _SPEED_PREV
+    _SPEED_PREV = os.environ.get("PHOSPHENE_SPEED_FACTOR")
+    os.environ["PHOSPHENE_SPEED_FACTOR"] = "1"
+
+
+def tearDownModule():
+    if _SPEED_PREV is None:
+        os.environ.pop("PHOSPHENE_SPEED_FACTOR", None)
+    else:
+        os.environ["PHOSPHENE_SPEED_FACTOR"] = _SPEED_PREV
 
 
 def _safetensors(path: Path, tensors: dict) -> None:
@@ -339,10 +358,14 @@ class TestEstimates(unittest.TestCase):
                 self.assertNotIn("facefix_min", cell)
 
     def test_the_face_fix_note_prices_the_draft(self):
+        # H3-26: "draft's time again" was wrong on any canvas that isn't the
+        # 640x384 Draft one — the checkbox this note describes is offered
+        # whenever H3.upscale_modes allows ltx_x2, not only on Draft. Fixed
+        # to "the same time again", tier-agnostic.
         P._H3_EXPORT_NOTES.clear()
         self.assertIn(f"About {P.FACE_FIX_DRAFT_5S_MIN:g} min more",
                       P._h3_export_notes(640, 384)["ltx_x2"])
-        self.assertIn("draft's time again", P._h3_export_notes(768, 448)["ltx_x2"])
+        self.assertIn("the same time again", P._h3_export_notes(768, 448)["ltx_x2"])
 
     def test_storyboard_prices_a_draft_at_three_steps_when_installed(self):
         with unittest.mock.patch.object(P, "h3_tristep_status", lambda: {"available": True}), \
@@ -610,7 +633,11 @@ class TestUiContract(unittest.TestCase):
         self.assertIn('data-h3-speed="best"', html)
         self.assertLess(html.index('id="h3SpeedRow"'), html.index('id="qualityLabelName"'))
         self.assertNotIn('id="h3TurboGroup"', html)
-        self.assertIn("3 steps — about 4× faster, great for drafts and most shots.", html)
+        # H3-40: the Fast pill's title used to state the MECHANISM ("3
+        # steps"); it now states the TRADE-OFF a user is actually choosing
+        # between (speed vs sharpness), matching the qs-meta line above it.
+        self.assertIn("About 4× faster than Best, a touch softer on fine detail", html)
+        self.assertIn("sharpest faces and detail", html)
         # Upscale & Face Fix beside Generate, bound to the same state.
         self.assertIn('id="h3FaceFixFooter" onchange="setH3FaceFixAfter(this.checked)"', html)
         self.assertLess(html.index('id="h3FaceFixFooter"'), html.index('id="genBtn"'))

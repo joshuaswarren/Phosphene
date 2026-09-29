@@ -283,7 +283,7 @@ The surfaces render events cannot see. One event per action, no free text.
 
 | prop | type | example | why |
 |---|---|---|---|
-| `feature` | string | `"storyboard_plan"` | **Closed vocabulary**: `storyboard_plan`, `storyboard_export`, `editor_open`, `editor_export`, `civitai_download`, `sample_character`, `train_start`, `enhance_prompt`. Unknown names are dropped locally, never sent |
+| `feature` | string | `"storyboard_plan"` | **Closed vocabulary**: `storyboard_plan`, `storyboard_export`, `editor_open`, `editor_export`, `civitai_download`, `sample_character`, `train_start`, `enhance_prompt`, `train_refused`. Unknown names are dropped locally, never sent. `train_start` fires only past `/train/start`'s RAM refusal (SYS-41) — a refused click counts as `train_refused` with `detail: "ram"` instead |
 | `detail` | string | `"nle"` | Optional, lowercase `[a-z0-9_.-]` only, ≤32 chars — a sub-choice within the feature |
 | `version` | string | `"4.9.7"` | As on `app_boot` |
 
@@ -324,6 +324,7 @@ event. This is not a heartbeat and the panel still has none.
 | `outcome` | string | `"failed"` | **Closed vocabulary**: `started`, `ok`, `failed`, `skipped` |
 | `error_class` | string | `"venv_broken"` | Only on `failed`, and only from the same closed taxonomy `render_failed` uses |
 | `version` | string | `"4.16.0"` | The build that reported it |
+| `ram_gb` | int | `16` | SYS-16: lets `first_queue` (this event) be sliced the same way `render_completed`'s `first_render` already is — the reviewer's finding was that activation is LOWEST on the machines that struggle most (36 GB 53%, 8 GB 57%, 16 GB 63%), and answering "first_queue vs first_render, per tier" needed this on both events, not a join against `app_boot` by install_id |
 
 **What this event deliberately does not carry**, and why: no path, no file
 name, no URL, no host, no byte count, and — unlike `render_failed` — **no
@@ -571,6 +572,7 @@ Env override: `PHOSPHENE_ANALYTICS_QUERY_KEY`.
 | `PHOSPHENE_ANALYTICS_API_HOST` | `https://us.posthog.com` | Query API host for the fleet view |
 | `PHOSPHENE_ANALYTICS_PROJECT` | `@current` | PostHog project id used in the query URL |
 | `PHOSPHENE_ANALYTICS_DISABLED` | *(unset)* | `1` disables everything, overriding the setting |
+| `PHOSPHENE_TEST_RIG` | *(unset)* | `1` sends events as normal but tags every one with `test_rig: true` (SYS-41). For the owner's own dev machine, a release-gate run, or a clean-room test install — anything that sends REAL telemetry on purpose (unlike an agent review worktree, which sets `PHOSPHENE_ANALYTICS_DISABLED=1` and sends nothing) but is not a real user. A fleet query excludes these with `WHERE NOT properties.test_rig`, instead of a hand-derived "which rows are probably the owner" heuristic. |
 
 ---
 

@@ -196,7 +196,7 @@ function sbeStripGain(y, top, H) {
 window.SBE = {
   open: false, id: '', title: '',
   edit: null, clips: [], audio: null, beats: null,
-  peaks: null, peaksFor: '', unplaced: [], pool: [], relink: [], prepare: {},
+  peaks: null, peaksFor: '', unplaced: [], pool: [], relink: [], offline: [], prepare: {},
   onMissing: null,
   proxyUrl: '', revision: 0, dirty: false, saving: false, conflict: 0,
   // THE SAVE'S OWN BOOKKEEPING. `savePending` is the save that arrived while
@@ -251,7 +251,8 @@ window.SBE = {
   // The soundtrack's own drag. Separate from `drag` because the two lanes are
   // separate objects and a pointer is only ever on one of them.
   musicDrag: null, audioDrag: null,
-  music: '', musicEl: null, musicOk: true, rendering: false, muteToasted: false,
+  music: '', musicEl: null, musicOk: true, rendering: false, renderJob: '',
+  renderPollTimer: null, muteToasted: false,
   // `dropAt` is where the insertion line is painted while something is being
   // dragged onto the track — null when nothing is. `lastTs` is the wall clock
   // the transport falls back on for the clips that carry no <video> to read a
@@ -2782,6 +2783,94 @@ function sbeTrim(clips, id, edge, filmTime, opts) {
   return { clips: clips, ok: true };
 }
 
+// FILM-03: SLIP. Every cut on a music video is butt-joined, so the only way
+// to fix a mouth that is off the words is to change WHICH SECONDS OF THE
+// TAKE play in a slot that does not move. A trim changes the slot's length;
+// a slip does not touch it at all — `start` and `end` move together by the
+// same source-second delta, `film_start`/`film_end` are untouched, and the
+// move is clamped so the window never runs off the source. Because the slot
+// is unchanged, the neighbours, the gaps and any linked/unlinked sound need
+// no carry — nothing about the film's TIMING moved, only what is shown in it.
+function sbeSlip(clips, id, deltaSrcSeconds) {
+  const c = sbeById(clips, id);
+  if (!c) return { clips: clips, ok: false, why: 'gone' };
+  if (c.locked) return { clips: clips, ok: false, why: 'locked' };
+  const len = sbeNum(c.end) - sbeNum(c.start);
+  if (len <= 0) return { clips: clips, ok: false, why: 'edge' };
+  const srcDur = sbeNum(c.duration, 0) || Infinity;
+  let start = sbeNum(c.start) + sbeNum(deltaSrcSeconds);
+  start = Math.max(0, Math.min(srcDur - len, start));
+  const applied = sbeRound(start - sbeNum(c.start));
+  if (Math.abs(applied) < 1e-9) {
+    return { clips: clips, ok: false,
+             why: (deltaSrcSeconds < 0 ? 'Already at the start of the take — nothing to give.'
+                                       : 'Already at the end of the take — nothing to give.') };
+  }
+  c.start = sbeRound(sbeNum(c.start) + applied);
+  c.end = sbeRound(sbeNum(c.end) + applied);
+  c.source = 'human';
+  return { clips: clips, ok: true, applied: applied };
+}
+
+// One frame (⇧ for ten) at a time — the keyboard half of slip, the same
+// shape as `sbeNudge` one function up. ⌥, and ⌥. so the plain arrows stay
+// the playhead's and ⌥←/→ stays the whole-clip nudge.
+function sbeSlipNudge(dir, big) {
+  const id = SBE.sel;
+  if (!id) return;
+  const c = sbeById(SBE.clips, id);
+  if (!c || sbeKind(c) !== 'video') return;
+  const d = ((big ? 10 : 1) * (dir < 0 ? -1 : 1)) / sbeFps() * sbeSpeed(c);
+  const ok = sbeMutate(cs => sbeSlip(cs, id, d));
+  if (ok) {
+    phosToast('Slipped ' + (d > 0 ? '+' : '') + Math.round(d * sbeFps() / sbeSpeed(c)) + ' f.',
+              { duration: 2000 });
+  }
+}
+
+// FILM-03: ROLL. The cut between two shots is one point in the film; a roll
+// moves that point without moving anything else — the shot before gets
+// longer by exactly what the shot after gets shorter, the total length of
+// the pair (and the whole film) does not change, and neither picture's OWN
+// trim moves at its far end. Only legal on a SHARED cut — `prev.film_end ===
+// next.film_start`, i.e. no hole between them — which is the one place a
+// plain trim's "grow into the gap" rule has no room to work with (the gap is
+// zero), and exactly the case Premiere's roll tool exists for.
+function sbeRollEdit(clips, prevId, nextId, deltaFilmSeconds) {
+  const prev = sbeById(clips, prevId);
+  const next = sbeById(clips, nextId);
+  if (!prev || !next) return { clips: clips, ok: false, why: 'gone' };
+  if (prev.locked || next.locked) return { clips: clips, ok: false, why: 'locked' };
+  if (Math.abs(sbeNum(prev.film_end) - sbeNum(next.film_start)) > 1e-6) {
+    return { clips: clips, ok: false, why: 'Those two shots do not share a cut.' };
+  }
+  const spPrev = sbeSpeed(prev), spNext = sbeSpeed(next);
+  let d = sbeNum(deltaFilmSeconds);
+  // Neither side may shrink past the minimum clip length, and neither may
+  // grow past what its OWN take has left at that end.
+  const prevLen = sbeNum(prev.film_end) - sbeNum(prev.film_start);
+  const nextLen = sbeNum(next.film_end) - sbeNum(next.film_start);
+  const prevRoom = sbeNum(prev.duration, 0) ? (sbeNum(prev.duration) - sbeNum(prev.end)) / spPrev : Infinity;
+  const nextRoom = sbeNum(next.start) / spNext;
+  const hi = Math.min(prevRoom, nextLen - SBE_MIN_CLIP);
+  const lo = Math.max(-nextRoom, -(prevLen - SBE_MIN_CLIP));
+  d = sbeRound(Math.max(lo, Math.min(hi, d)));
+  if (Math.abs(d) < 1e-9) {
+    return { clips: clips, ok: false,
+             why: (deltaFilmSeconds < 0 ? 'The shot before is already as short as it can be.'
+                                        : 'The shot after is already as short as it can be.') };
+  }
+  // Only the SOURCE windows move by hand; `_gap` before each clip is
+  // untouched (next's stays 0 — still no hole), so `sbeLayout` derives both
+  // new positions from the new lengths and the cut lands exactly at the
+  // moved point, same as it was a single boundary all along.
+  prev.end = sbeRound(sbeNum(prev.end) + d * spPrev);
+  next.start = sbeRound(sbeNum(next.start) + d * spNext);
+  prev.source = 'human'; next.source = 'human';
+  sbeLayout(clips);
+  return { clips: clips, ok: true, applied: d };
+}
+
 // DUPLICATE: the same shot again, right after itself, with everything it
 // carries — window, speed, fades, grade, mute — and its sound LINKED: a
 // copied J-cut strip would sit under the original's seconds, which is the
@@ -2908,6 +2997,167 @@ function sbeNewId() {
          (Date.now() % 65536).toString(16);
 }
 
+// ---------------------------------------------------------------------------
+// FILM-58: COPY / PASTE — clips, or attributes onto a selection.
+// ---------------------------------------------------------------------------
+// What a "paste attributes" carries: everything about HOW a shot is shown,
+// nothing about what it IS or where it sits.
+const SBE_PASTE_ATTR_FIELDS = ['adjust', 'frame', 'fx', 'speed'];
+
+function sbeClipboardCopy(clips, ids) {
+  const items = (ids || []).map(id => sbeById(clips, id)).filter(Boolean)
+    .map(c => JSON.parse(JSON.stringify(c)));
+  items.sort((a, b) => sbeNum(a.film_start) - sbeNum(b.film_start));
+  return items;
+}
+
+// PASTE ATTRIBUTES, from the one clip copied, onto every clip in `ids` —
+// grade, frame, fades and speed; never the path, the window or the slot.
+function sbeClipboardPasteAttrs(clips, ids, source) {
+  if (!source) return { clips: clips, ok: false, why: 'nothing copied' };
+  let out = clips.slice();
+  let touched = 0;
+  for (const id of ids || []) {
+    const i = out.findIndex(c => String(c.id) === String(id));
+    if (i < 0) continue;
+    const c = out[i];
+    if (c.locked || sbeKind(c) === 'slug') continue;
+    const b = Object.assign({}, c);
+    for (const f of SBE_PASTE_ATTR_FIELDS) {
+      // EDITOR-5 (Codex 4.17.0): SPEED IS TIMING, NOT A LOOK. Copied as a
+      // field it changed the clock while the window and the slot stayed put
+      // — a 5 s window at 2x in a 5 s slot, which Save and the backup
+      // refused (clip_length_mismatch). It goes through the one speed
+      // operation below, which re-lays the film; a still has no clock.
+      if (f === 'speed') continue;
+      if (source[f] !== undefined) b[f] = JSON.parse(JSON.stringify(source[f])); else delete b[f];
+    }
+    out[i] = b;
+    if (sbeKind(b) === 'video' && sbeKind(source) === 'video') {
+      const r = sbeSetSpeed(out, b.id, sbeSpeed(source));
+      if (r.ok) out = r.clips;
+    }
+    touched++;
+  }
+  return { clips: out, ok: touched > 0, why: touched ? '' : 'nothing to paste onto' };
+}
+
+// PASTE CLIPS, inserted at a film time in copied order — each a new clip
+// (new id), carrying the source's own look (grade/frame/fx/speed) with it,
+// the same "insert, ripple everything after" `sbeInsertAt` already does.
+function sbeClipboardPasteClips(clips, items, at) {
+  let cs = clips;
+  let want = Math.max(0, sbeNum(at));
+  const added = [];
+  for (const src of items || []) {
+    const kind = sbeKind(src);
+    const filmLen = Math.max(SBE_MIN_CLIP,
+      (sbeNum(src.end, 0) - sbeNum(src.start, 0)) / (sbeSpeed(src) || 1));
+    const item = { path: src.path, proxy: src.proxy || null, kind: kind,
+                   duration_s: filmLen, title: src.title || '', n: src.n };
+    const r = sbeInsertAt(cs, item, want);
+    if (!r.ok) continue;
+    cs = r.clips;
+    const c = sbeById(cs, r.added.id);
+    if (c) {
+      if (src.adjust) c.adjust = JSON.parse(JSON.stringify(src.adjust));
+      if (src.frame) c.frame = JSON.parse(JSON.stringify(src.frame));
+      if (src.fx) c.fx = JSON.parse(JSON.stringify(src.fx));
+      if (src.speed !== undefined) c.speed = src.speed;
+      if (kind === 'video') {
+        const sp = sbeSpeed(c);
+        c.start = sbeRound(sbeNum(src.start, 0));
+        c.end = sbeRound(sbeNum(src.start, 0) + filmLen * sp);
+        c.duration = src.duration || null;
+      }
+    }
+    added.push(r.added.id);
+    want += filmLen;
+  }
+  return { clips: cs, ok: added.length > 0, added: added,
+           why: added.length ? '' : 'nothing could be pasted' };
+}
+
+function sbeClipCopy() {
+  const ids = sbeSelIds();
+  if (!ids.length) { phosToast('Select a clip first.', {}); return; }
+  SBE.clipboard = sbeClipboardCopy(SBE.clips, ids);
+  phosToast((SBE.clipboard.length === 1 ? 'Clip copied.' : SBE.clipboard.length + ' clips copied.'),
+            { duration: 2500 });
+}
+// ONE COMMAND, TWO MEANINGS — the same split Premiere spreads across Paste
+// and Paste Attributes: with something selected, ⌘V pastes the copied
+// clip's LOOK onto it (grade, frame, fades, speed); with nothing selected,
+// or more than one clip copied, it pastes the clip(s) themselves at the
+// playhead. Both are named in the toast, so which one just happened is
+// never a guess.
+function sbeClipPaste() {
+  if (!SBE.open || !SBE.id) return;
+  const clip = SBE.clipboard || [];
+  if (!clip.length) { phosToast('Nothing copied yet — ⌘C a clip first.', {}); return; }
+  const selIds = sbeSelIds();
+  if (clip.length === 1 && selIds.length >= 1) {
+    const ok = sbeMutate(cs => sbeClipboardPasteAttrs(cs, selIds, clip[0]));
+    if (ok) {
+      phosToast('Grade, frame, fades and speed pasted onto ' + selIds.length
+                + (selIds.length === 1 ? ' clip.' : ' clips.'), { kind: 'success', duration: 4000 });
+    }
+    return;
+  }
+  const ok = sbeMutate(cs => sbeClipboardPasteClips(cs, clip, SBE.playhead));
+  if (ok) {
+    phosToast((clip.length === 1 ? 'Clip' : clip.length + ' clips') + ' pasted at '
+              + sbeFmtTime(SBE.playhead) + '.', { kind: 'success', duration: 4000 });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// FILM-58: SEQUENCE ASPECT — 16:9 / 9:16 / 1:1, a whole-film choice the same
+// shape Film look is: stored in `edit.settings`, so it reaches the render
+// AND stays true for whoever opens the __SEQ__ next.
+// ---------------------------------------------------------------------------
+const SBE_SEQ_ASPECTS = { '16:9': 16 / 9, '9:16': 9 / 16, '1:1': 1 };
+function sbeSeqAspect() {
+  const key = ((SBE.edit || {}).settings || {}).aspect;
+  return (key && SBE_SEQ_ASPECTS[key]) ? key : '16:9';
+}
+function sbeSetSeqAspect(key) {
+  if (!SBE.open || !SBE.id) return;
+  if (!SBE_SEQ_ASPECTS[key]) return;
+  SBE.edit = SBE.edit || {};
+  SBE.edit.settings = Object.assign({}, SBE.edit.settings || {}, { aspect: key });
+  SBE.dirty = true;
+  sbeSetState('unsaved changes', 'dirty');
+  sbePaintChrome();
+  sbeQueueSave();
+}
+
+// ---------------------------------------------------------------------------
+// FILM-58: MARKERS — beat and lyric cues, on their own lane on the ruler.
+// A marker names a SECOND, not a clip; it survives every re-cut, re-take
+// and reorder untouched, which is the point — a beat the Director cut to
+// stays where the beat is even after the shot at that second changes three
+// times. `kind` is `beat` | `lyric` | `note`, all painted the same way and
+// told apart by colour and the tooltip.
+// ---------------------------------------------------------------------------
+function sbeMarkerAdd(markers, at, kind, label) {
+  const m = { id: sbeNewId(), at: Math.max(0, sbeRound(sbeNum(at))),
+             kind: (kind || 'note'), label: String(label || '') };
+  return (markers || []).concat([m]).sort((a, b) => sbeNum(a.at) - sbeNum(b.at));
+}
+function sbeMarkerRemove(markers, id) {
+  return (markers || []).filter(m => String(m.id) !== String(id));
+}
+function sbeMarkerSetLabel(markers, id, label) {
+  return (markers || []).map(m => String(m.id) === String(id)
+    ? Object.assign({}, m, { label: String(label || '') }) : m);
+}
+function sbeMarkerSetKind(markers, id, kind) {
+  const k = (kind === 'beat' || kind === 'lyric') ? kind : 'note';
+  return (markers || []).map(m => String(m.id) === String(id)
+    ? Object.assign({}, m, { kind: k }) : m);
+}
+
 // A clip the board has rendered but the timeline has never seen. `slot` is
 // where the person who ordered it wanted it — carried on the board by
 // edit/generate — so a shot generated for a hole lands in that hole rather than
@@ -2952,6 +3202,72 @@ function sbePlaceUnplaced(clips, item, filmStart) {
   return { clips: out, ok: true, added: c };
 }
 
+// FILM-08: REPLACE. "Place" and pool "+" always APPEND — swapping one shot
+// in a 52-shot music video meant pushing every later shot off the beat, or
+// doing an overwrite by hand. Replace is the other half: the SLOT does not
+// move (film_start/film_end, so nothing else on the film shifts), and
+// neither do the things that belong to the slot rather than the take —
+// adjustments, frame, fx, transitions, lock. Only the source changes: path,
+// proxy and the in/out window, its in-point clamped to whatever the new take
+// actually has. A take too short to fill the slot is refused (EDITOR-4).
+function sbeReplaceClip(clips, id, item) {
+  const c = sbeById(clips, id);
+  if (!c) return { clips: clips, ok: false, why: 'gone' };
+  if (c.locked) return { clips: clips, ok: false, why: 'locked' };
+  const filmLen = Math.max(SBE_MIN_CLIP, sbeNum(c.film_end) - sbeNum(c.film_start));
+  const i = clips.indexOf(c);
+  // A STILL HAS NO SOURCE WINDOW OF ITS OWN — it holds for its slot, at 1x,
+  // the way the server derives it (normalise_edit). The kind follows the
+  // new source: a picture swapped in for a video used to stay `kind: video`
+  // and play a .png through a <video> element.
+  if (item.kind === 'still') {
+    const st = Object.assign({}, c, {
+      kind: 'still', path: item.path, proxy: item.proxy || null,
+      duration: null, start: 0, end: sbeRound(filmLen),
+      n: (item.n !== undefined ? item.n : c.n),
+      title: item.title || c.title, source: 'human',
+    });
+    delete st.speed;
+    const outS = clips.slice();
+    outS[i] = st;
+    return { clips: outS, ok: true, replaced: st };
+  }
+  const sp = sbeSpeed(c);
+  const need = filmLen * sp;
+  const srcDur = sbeNum(item.duration_s, 0) || need;
+  // EDITOR-4 (Codex 4.17.0): A TAKE SHORTER THAN THE SLOT CANNOT FILL IT.
+  // This used to clamp `end` to the take and keep the slot, answering ok:
+  // a 4 s take in a 5 s slot — a `clip_length_mismatch` document that
+  // blocked Save, the crash backup and Render until it was undone. The slot
+  // is the promise Replace makes (nothing else on the film moves), so a
+  // take that cannot keep it is refused, with the numbers.
+  if (srcDur + 0.001 < need) {
+    const f = v => (Math.round(v * 10) / 10).toFixed(1) + 's';
+    return { clips: clips, ok: false,
+             why: 'That take is ' + f(srcDur) + ' long and this slot needs ' +
+                  f(need) + (Math.abs(sp - 1) > 1e-9 ? ' at ' + sp + 'x' : '') +
+                  '. Trim the clip to ' + f(srcDur / sp) + ' or less first, ' +
+                  'or pick a longer take.' };
+  }
+  // Keep the OLD in-point where it can — a replace that keeps its manual
+  // offset is more often right than one that silently resets to zero — and
+  // clamp it back if the new take is too short to honour it.
+  let start = Math.max(0, sbeNum(c.start, 0));
+  if (start + need > srcDur) start = Math.max(0, srcDur - need);
+  const end = start + need;
+  const b = Object.assign({}, c, {
+    kind: 'video',
+    path: item.path, proxy: item.proxy || null,
+    duration: srcDur || null,
+    start: sbeRound(start), end: sbeRound(end),
+    n: (item.n !== undefined ? item.n : c.n),
+    title: item.title || c.title, source: 'human',
+  });
+  const out = clips.slice();
+  out[i] = b;
+  return { clips: out, ok: true, replaced: b };
+}
+
 // ---------------------------------------------------------------------------
 // THE THREE KINDS
 // ---------------------------------------------------------------------------
@@ -2983,6 +3299,75 @@ function sbeBright(c) {
 // drift, the badge says approximate, and the render is the exact one.
 function sbeBrightnessCss(b) {
   return Math.max(0, sbeRound(1 + 2 * sbeNum(b)));
+}
+
+// FILM-14: the 5-slider grade — exposure, contrast, saturation, temp, tint —
+// a sibling of legacy `brightness` under the same `adjust`, mirroring
+// `clip_grade()` in storyboard_editor.py exactly (same ranges, same
+// neutral defaults) so the Inspector shows what the render will do.
+const SBE_GRADE_EXPOSURE_MAX = 0.5;
+const SBE_GRADE_CONTRAST_MIN = 0.5, SBE_GRADE_CONTRAST_MAX = 1.8;
+const SBE_GRADE_SATURATION_MIN = 0.0, SBE_GRADE_SATURATION_MAX = 2.5;
+const SBE_GRADE_TEMP_TINT_MAX = 1.0;
+const SBE_GRADE_FIELDS = {
+  exposure: [-SBE_GRADE_EXPOSURE_MAX, SBE_GRADE_EXPOSURE_MAX, 0],
+  contrast: [SBE_GRADE_CONTRAST_MIN, SBE_GRADE_CONTRAST_MAX, 1],
+  saturation: [SBE_GRADE_SATURATION_MIN, SBE_GRADE_SATURATION_MAX, 1],
+  temp: [-SBE_GRADE_TEMP_TINT_MAX, SBE_GRADE_TEMP_TINT_MAX, 0],
+  tint: [-SBE_GRADE_TEMP_TINT_MAX, SBE_GRADE_TEMP_TINT_MAX, 0],
+};
+function sbeGrade(c) {
+  const a = (c && c.adjust) || {};
+  const out = {};
+  for (const key of Object.keys(SBE_GRADE_FIELDS)) {
+    const [lo, hi, def] = SBE_GRADE_FIELDS[key];
+    out[key] = sbeRound(Math.max(lo, Math.min(hi, sbeNum(a[key], def))));
+  }
+  return out;
+}
+function sbeGradeIsNeutral(c) {
+  const g = sbeGrade(c);
+  for (const key of Object.keys(SBE_GRADE_FIELDS)) {
+    if (Math.abs(g[key] - SBE_GRADE_FIELDS[key][2]) >= 1e-9) return false;
+  }
+  return true;
+}
+// One field, one clip — the mirror of `sbeSetBrightness`, and neutral is
+// absent on the way back to the model too: a slider dragged to its default
+// must leave no dead key in `adjust`, the same rule the server enforces on
+// save (`normalise_edit`).
+function sbeSetGrade(clips, id, field, v) {
+  const c = sbeById(clips, id);
+  if (!c) return { clips: clips, ok: false, why: 'gone' };
+  if (c.locked) return { clips: clips, ok: false, why: 'locked' };
+  const lim = SBE_GRADE_FIELDS[field];
+  if (!lim) return { clips: clips, ok: false, why: 'unknown field' };
+  const [lo, hi, def] = lim;
+  const val = sbeRound(Math.max(lo, Math.min(hi, sbeNum(v))));
+  const adj = Object.assign({}, c.adjust || {});
+  if (Math.abs(val - def) < 1e-9) delete adj[field]; else adj[field] = val;
+  c.adjust = Object.keys(adj).length ? adj : undefined;
+  return { clips: clips, ok: true };
+}
+// COPY GRADE → SELECTION. One clip's five numbers, stamped onto every other
+// selected clip, as one undo step — the same shape `sbeAlternateSel` and
+// every other "apply this arrangement to the selection" verb here uses.
+function sbeCopyGrade(clips, fromId, toIds) {
+  const src = sbeById(clips, fromId);
+  if (!src) return { clips: clips, ok: false, why: 'gone' };
+  const g = sbeGrade(src);
+  let touched = 0;
+  for (const id of toIds || []) {
+    if (String(id) === String(fromId)) continue;
+    const c = sbeById(clips, id);
+    if (!c || c.locked || sbeKind(c) === 'slug') continue;
+    for (const key of Object.keys(SBE_GRADE_FIELDS)) {
+      const r = sbeSetGrade(clips, id, key, g[key]);
+      if (!r.ok) continue;
+    }
+    touched++;
+  }
+  return { clips: clips, ok: touched > 0, why: touched ? '' : 'nothing to copy it onto' };
 }
 
 // FRAMING — the mirror of `clip_frame()`: zoom 1–3 and the anchor as
@@ -3125,9 +3510,22 @@ function sbeCleanClip(c) {
     out.duration = null;
     if (kind === 'slug') { out.path = null; out.proxy = null; }
   }
+  // THE GRADE TRAVELS WITH THE CLIP (4.17.0 render check). This used to
+  // rebuild `adjust` as brightness alone, so FILM-14's exposure / contrast /
+  // saturation / temp / tint — every per-clip grade and every Match colour —
+  // lived on screen and was dropped by the next Save: the render, the backup
+  // and the NLE exports never saw it. Neutral stays absent, as the server
+  // writes it (validate_edit checks each key's own range).
+  const adj = {};
   const b = sbeBright(out);
-  if (Math.abs(b) < 1e-6) delete out.adjust;
-  else out.adjust = { brightness: sbeRound(b) };
+  if (Math.abs(b) >= 1e-6) adj.brightness = sbeRound(b);
+  if (kind !== 'slug') {
+    const g = sbeGrade(c);
+    for (const key of Object.keys(SBE_GRADE_FIELDS)) {
+      if (Math.abs(g[key] - SBE_GRADE_FIELDS[key][2]) >= 1e-9) adj[key] = g[key];
+    }
+  }
+  if (Object.keys(adj).length) out.adjust = adj; else delete out.adjust;
   // 1x is the absence of the field, the same way the server writes it.
   const sp = sbeSpeed(c);
   if (kind !== 'video' || Math.abs(sp - 1) < 1e-9) delete out.speed;
@@ -3156,6 +3554,10 @@ function sbeSaveBody(state) {
   // did and the backup's digest cannot differ from the save's over `[]`.
   const tracks = (typeof sbeTsClean === 'function') ? sbeTsClean(state.tracks || []) : [];
   if (tracks.length) edit.audio_tracks = tracks; else delete edit.audio_tracks;
+  // FILM-58: MARKERS, and no key when there are none — the server's absent
+  // key, the same rule the audio tracks just above follow.
+  const markers = (state.markers || []).map(m => Object.assign({}, m));
+  if (markers.length) edit.markers = markers; else delete edit.markers;
   edit.board_id = state.id;
   const body = { id: state.id, edit: edit };
   if (state.expect !== null && state.expect !== undefined) body.expect_revision = state.expect;
@@ -3201,6 +3603,37 @@ function sbeFmtTime(t) {
   const m = Math.floor(t / 60);
   const s = t - m * 60;
   return m + ':' + (s < 10 ? '0' : '') + s.toFixed(2);
+}
+
+// FILM-52: HH:MM:SS:FF. Hundredths of a second are the wrong unit for
+// lip-sync work — the nudge already counts in frames (sbeNudge ±1/±10) and
+// the owner does too — so a frame timecode is what the transport reads back
+// in, once somebody asks for it.
+function sbeFmtTC(t, fps) {
+  const f = Math.max(1, Math.round(sbeNum(fps, 24)) || 24);
+  t = Math.max(0, sbeNum(t));
+  let frames = Math.round(t * f);
+  const ff = frames % f;
+  let secs = Math.floor(frames / f);
+  const ss = secs % 60;
+  secs = Math.floor(secs / 60);
+  const mm = secs % 60;
+  const hh = Math.floor(secs / 60);
+  const p2 = (n) => (n < 10 ? '0' : '') + n;
+  return p2(hh) + ':' + p2(mm) + ':' + p2(ss) + ':' + p2(ff);
+}
+
+// The toggle, remembered per browser the same way a retake dismissal is
+// (sbeRetakeDismissed): read on paint, written on click, nothing round-trips
+// through the server because it changes nothing about the document.
+function sbeTimeMode() {
+  try { return localStorage.getItem('phos_editor_tcmode') === 'frames' ? 'frames' : 'seconds'; }
+  catch (e) { return 'seconds'; }
+}
+function sbeToggleTimeMode() {
+  try { localStorage.setItem('phos_editor_tcmode', sbeTimeMode() === 'frames' ? 'seconds' : 'frames'); }
+  catch (e) {}
+  sbePaintHead();
 }
 
 // ---------------------------------------------------------------------------
@@ -3494,15 +3927,37 @@ function sbeSoundModeSet(on, opts) {
   if (!quiet) sbePaint();
 }
 
+// FILM-57: A TOAST THAT DESCRIBES THE SCREEN OUTLIVES THE SCREEN. Picture
+// mode / Sound mode / side-panels-hidden are not news the user still needs
+// once they have switched to Storyboard or another tab — "Picture mode —
+// the picture takes the height…" turning up over a shot list describes a
+// screen that is not there. phosToast (queue.js) is a shared, global stack
+// with no notion of which tab asked for a message, and rightly so — most of
+// this file's 100+ toasts (a save failed, a take landed, a render finished)
+// are exactly as true after a tab switch as before it. Only the handful that
+// describe the CURRENT ON-SCREEN LAYOUT are wrong once you have left, so
+// only those go through here: tagged, and swept on the one signal this file
+// already has for "the user is leaving" (sbeSuspend, called from
+// workflowSwitch whenever the active tab stops being 'editor').
+function sbeViewToast(message, opts) {
+  if (typeof phosToast !== 'function') return null;
+  const el = phosToast(message, opts);
+  if (el && el.dataset) el.dataset.sbeViewToast = '1';
+  return el;
+}
+function sbeSweepViewToasts() {
+  if (typeof document !== 'object' || !document || !document.querySelectorAll) return;
+  document.querySelectorAll('.phos-toast[data-sbe-view-toast="1"]')
+    .forEach(el => { try { el.remove(); } catch (e) {} });
+}
+
 function sbeSoundModeToggle() {
   const on = !sbeSoundMode();
   sbeSoundModeSet(on);
-  if (typeof phosToast === 'function') {
-    phosToast(on
-      ? 'Sound mode — every sound lane at full height, the picture small. ⇧A or the ⌁ button brings the picture back.'
-      : 'Picture mode — the picture takes the height, the sound lanes are thin. Click a sound to select it; ⇧A for sound mode.',
-      { duration: 4000 });
-  }
+  sbeViewToast(on
+    ? 'Sound mode — every sound lane at full height, the picture small. ⇧A or the ⌁ button brings the picture back.'
+    : 'Picture mode — the picture takes the height, the sound lanes are thin. Click a sound to select it; ⇧A for sound mode.',
+    { duration: 4000 });
 }
 
 // THE VIEW GROUP'S OWN STATE, painted in one place: Source, Inspector, Sound
@@ -3626,9 +4081,9 @@ function sbePanelsToggle() {
   const hidden = !(document.body && document.body.classList.contains('ed-focus'));
   sbePanelsApply(hidden);
   sbePaint();
-  if (typeof phosToast === 'function' && hidden) {
-    phosToast('Side panels hidden — the media pool and the queue are out of the way. ` (or Panels in the View group) brings them back.',
-              { duration: 4000 });
+  if (hidden) {
+    sbeViewToast('Side panels hidden — the media pool and the queue are out of the way. ` (or Panels in the View group) brings them back.',
+                { duration: 4000 });
   }
 }
 
@@ -3737,6 +4192,16 @@ function edOpenBoard(id) {
 function sbeOpen(id, opts) {
   const want = String(id || SBE.id || edDoc() || '');
   if (!want) { edShowPicker(); return; }
+  // FILM-16: OPENING THE FILM THAT IS ALREADY OPEN IS NOT A LOAD. Falling
+  // through below calls `sbeLoad()` NON-QUIET, which always adopts the
+  // server's last SAVED document over whatever is on screen — so "Open in
+  // Editor" on the film you are already cutting (the rail's step 3, or
+  // coming back from Storyboard to check a prompt) silently discarded every
+  // edit since the last Save. sbeResume() is exactly the right verb for
+  // re-entering a document that is already open: it shows the screen,
+  // restarts the clock, and re-reads QUIETLY — which, unlike this path,
+  // protects unsaved work (sbeLoad's `quiet` branch, sbeAdoptMeta).
+  if (SBE.open && SBE.id === want) { sbeResume(); return; }
   if (SBE.open && SBE.id && SBE.id !== want) sbeCloseDoc({ quiet: true });
   SBE.open = true;
   SBE.id = want;
@@ -3768,7 +4233,16 @@ function sbeSuspend() {
   if (!SBE.open) return;
   sbeStop();
   sbeSrcStop();          // both screens, or the left one plays on in a tab nobody is looking at
-  if (SBE.dirty && !SBE.conflict) sbeSave(true);
+  // FILM-57: any toast describing THIS screen leaves with it.
+  sbeSweepViewToasts();
+  // FILM-29: NOT A SAVE. Switching tabs is not the user pressing Save — it is
+  // exactly the "autosave to edit.json" the owner refused, wearing the name
+  // of a different button (sbeCloseDoc already got this right; this call
+  // sat right next to it writing the real document instead). The backup lane
+  // is what a leave-without-saving is for; it never touches edit.json or the
+  // revision, and the recovery chip on the way back offers it like any other
+  // snapshot.
+  if (SBE.dirty && !SBE.conflict) sbeBackup(true);
   if (SBE.timer) { clearInterval(SBE.timer); SBE.timer = null; }
   window.removeEventListener('resize', sbePaint);
 }
@@ -3811,6 +4285,7 @@ function sbeCloseDoc(opts) {
   SBE.open = false;
   SBE.id = '';
   SBE.clips = [];
+  SBE.markers = [];       // EDITOR-1: a closed film's markers leave with it
   SBE.undo.length = 0; SBE.redo.length = 0;
   // The soundtrack field belongs to the document that just closed (SB5-11).
   SBE.musicFor = '';
@@ -3853,7 +4328,14 @@ async function sbeFilmsToggle() {
   let boards;
   try {
     const r = await (await fetch('/storyboard/list')).json();
-    boards = ((r && r.boards) || []).filter(b => (b.clips || 0) > 0 || b.id === SBE.id);
+    // FILM-43: `b.clips` counts board SHOTS with an output file — right
+    // for "X of Y rendered", wrong for "does this film have something to
+    // edit". A film cut from Video-tab or imported clips has a timeline
+    // and no shots of its own, so filtering on `clips > 0` alone dropped
+    // it from this list even though "No other __SEQ__ has clips yet" was
+    // never true for it. `has_timeline` is edit.json's own existence.
+    boards = ((r && r.boards) || [])
+      .filter(b => (b.clips || 0) > 0 || b.has_timeline || b.id === SBE.id);
   } catch (e) {
     note.textContent = 'The panel did not answer — try again.';
     return;
@@ -3941,6 +4423,7 @@ function sbeAdoptMeta(r) {
   SBE.unplaced = r.unplaced || [];
   SBE.pool = r.clips || [];
   SBE.relink = r.relink || [];
+  SBE.offline = r.offline || [];
   SBE.sections = r.sections || SBE.sections || [];
   SBE.prepare = r.prepare || {};
   const px = {};
@@ -3951,6 +4434,7 @@ function sbeAdoptMeta(r) {
     if (c && c.path && px[c.path]) c.proxy = px[c.path];
   }
   sbePaintRelink();
+  sbePaintOffline();
   if (ED.src === 'film') edPoolRefresh();
   sbeFetchPeaks();
   sbePaint();
@@ -3973,6 +4457,7 @@ function sbeAdopt(r, quiet) {
   SBE.unplaced = r.unplaced || [];
   SBE.pool = r.clips || [];
   SBE.relink = r.relink || [];
+  SBE.offline = r.offline || [];
   SBE.sections = r.sections || [];
   SBE.prepare = r.prepare || {};
   if (r.drafts) SBE.drafts = r.drafts;
@@ -3982,6 +4467,9 @@ function sbeAdopt(r, quiet) {
   SBE.overlays = (SBE.edit.overlays || []).map(o => Object.assign({}, o));
   SBE.transitions = (SBE.edit.transitions || []).map(t => Object.assign({}, t));
   SBE.tracks = sbeTsCopy(SBE.edit.audio_tracks || []);
+  // EDITOR-1: THE MARKERS ARE THE DOCUMENT'S TOO. They were never read back,
+  // so a reopened film showed none and the previous film's stayed on screen.
+  SBE.markers = (SBE.edit.markers || []).map(m => Object.assign({}, m));
   SBE.tsSet = []; SBE.tsDrag = null; SBE.tsDrop = null; SBE.selLane = '';
   SBE.ovSel = '';
   SBE.txSel = '';
@@ -4024,9 +4512,34 @@ function sbeAdopt(r, quiet) {
   sbePaintDraft();
   sbePaintRecovery();
   sbePaintRelink();
+  sbePaintOffline();
   sbeDeliverPaint();
+  if (typeof sbeRenderChipFor === 'function') sbeRenderChipFor(SBE.id);
   if (ED.src === 'film') edPoolRefresh();
   sbeFetchPeaks();
+  // FILM-57: THE PLAYHEAD IS THE FILM'S, NOT THE TAB'S. It used to survive a
+  // switch to a different film, so a short film opened after a long one
+  // could land PAST ITS OWN END — black, on open, with nothing playing and
+  // no obvious reason why. A genuine open (never a quiet re-read, which
+  // must not move anything the user is looking at) starts at the top, like
+  // opening a file anywhere else does.
+  if (!quiet) SBE.playhead = 0;
+  // FILM-57: UNDO SURVIVES A RELOAD, when it is safe to trust — see
+  // sbeRestoreUndoIfFresh's own comment on the fingerprint check. A genuine
+  // open is the one moment the just-adopted content is known and can be
+  // compared; a quiet re-read must not touch the stack any more than it
+  // touches anything else the user is looking at.
+  if (!quiet) sbeRestoreUndoIfFresh();
+  // FILM-39: OPEN LONG FILMS AT FIT. The default zoom showed about 10s of a
+  // 2:52 film with no sign there was more — the rest was a scroll nobody was
+  // told about. Only on a genuine OPEN (never a quiet re-read, which must
+  // not touch the view the user already set), and only when the film would
+  // not fit at the current zoom — a short film is unaffected, since "fit"
+  // would mean zooming IN, which nobody asked for.
+  if (!quiet) {
+    const fit = sbeZoomMin();
+    if (fit < SBE.pps) SBE.pps = fit;
+  }
   sbePaint();
   // Land on a picture, not on black. A timeline that opens dark reads as
   // broken for the second and a half before the first click.
@@ -4097,26 +4610,45 @@ function sbePaintProtected() {
   if (!el) return;
   if (!SBE.open || !SBE.id) { el.hidden = true; return; }
   const age = SBE.backedUpAt ? Math.round((Date.now() - SBE.backedUpAt) / 1000) : null;
-  // COLD IS "THERE IS UNSAVED WORK AND THE NET HAS NOT CAUGHT THIS TAB", and
-  // it is deliberately the SAME threshold the watchdog alarms on, so the chip
-  // and the banner can never disagree. Stated against `backedUpAt` rather than
-  // against `dirtyAt`: the outage this exists for froze `dirtyAt` in the past
-  // while `backedUpAt` stayed ahead of it, and every test written in terms of
-  // that pair read "protected" for seven hours. How long ago the net actually
-  // caught this tab cannot be faked by a stuck flag.
-  const cold = SBE.dirty && (!SBE.backedUpAt
-            || (Date.now() - SBE.backedUpAt) > SBE_SAVE_GRACE_MS);
+  // FILM-38: COLD NOW MEANS EXACTLY WHAT THE WATCHDOG (sbeTick) MEANS BY
+  // IT — the oldest unwritten change is older than the grace AND nothing has
+  // backed it up since. The comment here used to CLAIM the two could never
+  // disagree while actually comparing only against `backedUpAt`, which is
+  // cold the instant `dirty` becomes true and `backedUpAt` is not yet set —
+  // i.e. on every normal first edit, before the (now near-immediate, see
+  // FILM-06) snapshot has had even one network round trip to land. A single
+  // brightness change put a red "NOT PROTECTED" in the header on the very
+  // next paint. The real alarm was never that impatient; the chip should not
+  // have been either. `dirtyAt` freezing during the old stale-session outage
+  // is what the comment was guarding against — that outage is closed (see
+  // docs/EDITOR_SAVE_MODEL.md §5), and the watchdog itself has used `dirtyAt`
+  // safely this whole time.
+  const cold = SBE.dirty && !!SBE.dirtyAt
+            && (Date.now() - SBE.dirtyAt) > SBE_SAVE_GRACE_MS
+            && (SBE.backedUpAt || 0) < SBE.dirtyAt;
   let text;
-  if (age === null) text = SBE.dirty ? 'not backed up yet' : '';
+  if (age === null) text = SBE.dirty ? 'backing up…' : '';
   else if (age < 60) text = 'protected ' + age + 's ago';
   else text = 'protected ' + Math.round(age / 60) + 'm ago';
-  if (cold) text = 'NOT PROTECTED — ' + text;
+  if (cold) text = 'NOT PROTECTED — ' + (age === null ? 'not backed up yet' : text);
   // A SECOND EDITOR IS INFORMATION, NEVER A REASON TO STOP. It used to be the
   // reason this tab stopped writing entirely.
   if (SBE.otherEditor) text = (text ? text + ' · ' : '') + 'also open elsewhere';
-  el.textContent = text;
-  el.hidden = !text;
+  // FILM-37: the routine case ("protected 4s ago") used to sit in the header
+  // as its own always-visible chip, permanently spending width next to the
+  // title/draft-chip/state text — the four of them together are what
+  // truncated "saved · rev7" down to "saved · r" at 1366-1440px, well above
+  // the breakpoint that was supposed to fold the state text first. An
+  // ALARM (cold, or another tab open) earns that width, because it is the
+  // one thing in the header that is actionable; the routine case does not,
+  // so it moves into the status pill's own tooltip instead — still one
+  // click of hovering away, never fully gone.
+  const alarm = cold || SBE.otherEditor;
+  el.textContent = alarm ? text : '';
+  el.hidden = !alarm;
   el.classList.toggle('is-cold', !!cold);
+  const pill = sbeEl('sbeState');
+  if (pill) pill.title = text || '';
 }
 
 function sbeSetState(text, kind) {
@@ -4168,6 +4700,10 @@ function sbeSnapshot(audio) {
     // THE AUDIO TRACKS ARE THE ARRANGEMENT TOO — a strip placed and undone
     // must leave with the undo, not stay behind on its lane.
     tracks: SBE.tracks || [],
+    // FILM-58: MARKERS ARE PART OF THE ARRANGEMENT TOO — a beat cue dropped
+    // and undone leaves with the undo, the same rule every other lane here
+    // already follows.
+    markers: SBE.markers || [],
     audio: (audio === undefined)
       ? (SBE.audio || (SBE.edit && SBE.edit.audio) || null) : audio,
   });
@@ -4183,6 +4719,7 @@ function sbeRestore(json) {
   if (s.overlays !== undefined) SBE.overlays = s.overlays || [];
   if (s.transitions !== undefined) SBE.transitions = s.transitions || [];
   if (s.tracks !== undefined) SBE.tracks = s.tracks || [];
+  if (s.markers !== undefined) SBE.markers = s.markers || [];
   SBE.edit = SBE.edit || {};
   // ...and a restore never COMMITS a discovered track into the document. The
   // arrangement owns a soundtrack only once somebody has placed it (see
@@ -4213,6 +4750,27 @@ function sbeOvMutate(fn) {
   // added — the auto-key notice needs the id to be able to undo it — does not
   // have to guess which row is new.
   return res;
+}
+
+// Markers get their own tiny mutate, the same shape `sbeOvMutate` uses for
+// the overlay lane — one undo step, one save, no clip in the mix.
+function sbeMarkerMutate(fn) {
+  const before = sbeSnapshot();
+  SBE.markers = fn(SBE.markers || []);
+  SBE.undo.push(before);
+  if (SBE.undo.length > SBE_UNDO_MAX) SBE.undo.shift();
+  SBE.redo.length = 0;
+  SBE.dirty = true;
+  sbeSetState('unsaved changes', 'dirty');
+  sbePaint();
+  sbeQueueSave();
+  return true;
+}
+function sbeMarkerAtPlayhead() {
+  if (!SBE.open || !SBE.id) return;
+  sbeMarkerMutate(ms => sbeMarkerAdd(ms, SBE.playhead, 'note', ''));
+  phosToast('Marker at ' + sbeFmtTime(SBE.playhead) + '. Right-click it to remove.',
+            { duration: 3000 });
 }
 
 function sbeOvAddAt(item, at) {
@@ -4498,6 +5056,54 @@ function sbeCloseGapAt(t) {
   });
 }
 
+// FILM-27's "Close them": every hole, closed. `sbeCloseGapAt` re-reads
+// `sbeHoles` itself, so the SOONEST remaining hole is always at its
+// currently-correct position — closing one shifts every later hole earlier,
+// and re-reading rather than working off a stale list is what keeps this
+// from closing the wrong seconds on the second pass. `guard` is a render
+// giving up rather than looping forever if a locked clip blocks progress.
+function sbeCloseAllGaps() {
+  let closed = 0;
+  for (let guard = 0; guard < 500; guard++) {
+    const holes = sbeHoles(SBE.clips) || [];
+    if (!holes.length) break;
+    const h = holes[0];
+    if (!sbeCloseGapAt((sbeNum(h.film_start) + sbeNum(h.film_end)) / 2)) break;
+    closed++;
+  }
+  if (closed) {
+    phosToast(closed + ' hole' + (closed === 1 ? '' : 's') + ' closed.',
+              { kind: 'success', duration: 4000 });
+  }
+}
+
+// The render's hole warning — non-blocking, because a hole stopped being
+// something a render could get wrong the moment the assembler started
+// padding it with black instead of closing it. "Fill" opens Generate a
+// shot on the soonest hole; "Close them" ripples every hole shut instead.
+function sbeNoticeHoles(holes) {
+  if (!holes || !holes.length) return;
+  const total = holes.reduce((a, g) => a + sbeNum(g.duration), 0);
+  const t = phosToast(holes.length + ' hole' + (holes.length === 1 ? '' : 's') +
+            ' (' + total.toFixed(1) + 's) will play as black.',
+            { duration: 9000 });
+  if (!t) return;
+  const first = holes[0];
+  const fill = document.createElement('a');
+  fill.href = '#'; fill.className = 'phos-toast-action'; fill.textContent = 'Fill';
+  fill.onclick = (ev) => {
+    ev.preventDefault();
+    if (typeof sbeGenOpen === 'function') {
+      sbeGenOpen(sbeNum(first.film_start), sbeNum(first.duration));
+    }
+  };
+  const close = document.createElement('a');
+  close.href = '#'; close.className = 'phos-toast-action'; close.textContent = 'Close them';
+  close.onclick = (ev) => { ev.preventDefault(); sbeCloseAllGaps(); };
+  t.appendChild(fill);
+  t.appendChild(close);
+}
+
 // One frame at a time, on whatever is selected. Every NLE has this and this
 // one did not: the arrow keys moved the PLAYHEAD and there was no gesture at
 // all for "a hair later", short of dragging at a zoom high enough to see a
@@ -4519,6 +5125,87 @@ function sbeNudge(dir, big) {
     return;
   }
   sbeMutate(cs => sbeMoveGroup(cs, ids, d));
+}
+
+// FILM-57: UNDO SURVIVES A RELOAD — FOR EXACTLY THE STATE IT WAS BUILT
+// AGAINST. The stack (SBE.undo/SBE.redo) is in-memory only; a reload starts
+// both empty, which is correct behaviour it just cannot tell apart from "the
+// history is gone." What makes restoring it safe is not the film's id alone
+// — a reload always re-adopts the last SAVED document, so if the user had
+// unsaved edits sitting only in this tab, the screen coming back is NOT the
+// screen the stack was built for, and an undo stack pointing at states the
+// current arrangement never passed through is worse than no undo at all
+// (`sbeUndo` would restore a clip arrangement with no relationship to what
+// is on screen). So the persisted entry carries a FINGERPRINT of the exact
+// content it was saved beside, and is only ever adopted when that fingerprint
+// matches what just came back from the server — the one case where "the
+// stack's current position IS the screen" is actually true. Session-scoped
+// (sessionStorage, not localStorage) on purpose: this is "did I just reload
+// this tab", not "remember my edits across a browser restart three days
+// later" — the crash-backup lane already owns that promise, separately.
+const SBE_UNDO_STORE_PREFIX = 'phos_sbe_undo_';
+let _sbeUndoLastFingerprint = '';
+
+function sbeUndoStoreKey(id) { return SBE_UNDO_STORE_PREFIX + String(id || ''); }
+
+// Exactly the content an undo/redo entry would need to line up with — the
+// same fields sbeSnapshot() carries, so "the fingerprint matches" and "we are
+// at the position the stack thinks we are" are the same question.
+function sbeUndoFingerprint() {
+  return JSON.stringify({ clips: SBE.clips, overlays: SBE.overlays,
+                          tracks: SBE.tracks, transitions: SBE.transitions,
+                          markers: SBE.markers });
+}
+
+// Called from the tick, not from every push site — cheap (one fingerprint
+// compare) when nothing changed since the last write, and it catches every
+// mutation path (sbeMutate and the handful of call sites that push the
+// stack directly) without touching any of them.
+function sbePersistUndo() {
+  if (!SBE.open || !SBE.id) return;
+  // The dedup key is the CONTENT fingerprint plus the two stack depths, not
+  // the fingerprint alone — a Restore or Keep-version can empty the stacks
+  // without the current clips changing at all, and that transition is
+  // exactly the one this lane must not miss (an emptied stack has to clear
+  // its stored entry, or a later reload would resurrect undo history that
+  // no longer applies).
+  let mark;
+  try {
+    const fp = sbeUndoFingerprint();
+    mark = fp + '\u0000' + SBE.undo.length + '\u0000' + SBE.redo.length;
+    if (mark === _sbeUndoLastFingerprint) return;
+    const key = sbeUndoStoreKey(SBE.id);
+    if (!SBE.undo.length && !SBE.redo.length) {
+      sessionStorage.removeItem(key);
+    } else {
+      sessionStorage.setItem(key, JSON.stringify({
+        fp, undo: SBE.undo.slice(-SBE_UNDO_MAX), redo: SBE.redo.slice(-SBE_UNDO_MAX) }));
+    }
+    _sbeUndoLastFingerprint = mark;
+  } catch (e) {
+    // Quota, private browsing, storage disabled — undo simply does not
+    // survive a reload this session. Never a reason to break editing.
+  }
+}
+
+// Called once, right after a genuine (non-quiet) adopt — the one moment a
+// freshly-loaded document's content is known and can be compared.
+function sbeRestoreUndoIfFresh() {
+  if (!SBE.open || !SBE.id) return;
+  try {
+    const raw = sessionStorage.getItem(sbeUndoStoreKey(SBE.id));
+    if (!raw) return;
+    const entry = JSON.parse(raw);
+    const fp = sbeUndoFingerprint();
+    if (!entry || entry.fp !== fp) return;   // the screen moved on since this was written
+    if (Array.isArray(entry.undo)) SBE.undo = entry.undo.slice(-SBE_UNDO_MAX);
+    if (Array.isArray(entry.redo)) SBE.redo = entry.redo.slice(-SBE_UNDO_MAX);
+    // Matches sbePersistUndo's own dedup key — restoring the stack is not a
+    // change the very next tick needs to write straight back out.
+    _sbeUndoLastFingerprint = fp + '\u0000' + SBE.undo.length + '\u0000' + SBE.redo.length;
+  } catch (e) {
+    // A corrupt or inaccessible entry starts the film clean — same as today.
+  }
 }
 
 function sbeMutate(fn) {
@@ -4585,8 +5272,16 @@ function sbeQueueSave() {
   // alarm it exists to raise could never fire. Nothing may be allowed to
   // return from this function without first recording that there is unwritten
   // work and when it appeared.
+  const firstEditSinceClean = !SBE.dirtyAt;
   if (!SBE.dirtyAt) SBE.dirtyAt = Date.now();
   if (SBE.saveTimer) clearTimeout(SBE.saveTimer);
+  // FILM-06: THE FIRST EDIT OFF A CLEAN STATE IS THE ONE A QUICK RELOAD MOST
+  // OFTEN CATCHES — a reload inside the 1.4s debounce window used to leave a
+  // single change with no backup at all, silently. Nothing about the debounce
+  // helps here: it exists to stop a keystroke storm from writing on every
+  // keystroke, and the first keystroke off clean is never part of a storm
+  // yet. Write it now; the debounce still coalesces everything after it.
+  if (firstEditSinceClean) { sbeBackup(); return; }
   SBE.saveTimer = setTimeout(() => { SBE.saveTimer = null; sbeBackup(); }, 1400);
 }
 
@@ -4610,19 +5305,41 @@ async function sbeBackup(quiet) {
   // snapshot, pruned), so a new snapshot cannot eat an old one and there is
   // nothing left to guard. See docs/EDITOR_SAVE_MODEL.md §2.
   if (SBE.saveTimer) { clearTimeout(SBE.saveTimer); SBE.saveTimer = null; }
+  const body = sbeSaveBody({ id: SBE.id, edit: SBE.edit, clips: SBE.clips,
+                             overlays: SBE.overlays, tracks: SBE.tracks,
+                             transitions: SBE.transitions,
+                             markers: SBE.markers,
+                             expect: null });
+  // WHICH DRAFT THIS WAS COMPOSED FROM. The server files the backup under
+  // the draft that is active when the write LANDS, and this one is
+  // debounced — so without the name in the body, a backup of the draft you
+  // just left is offered back as the unsaved work of the one you opened.
+  body.draft = SBE.activeDraft || '';
+  body.session = SBE.session;
+  // FILM-57: A BACKUP OF NOTHING NEW IS NOT A BACKUP. The watchdog above
+  // re-arms sbeQueueSave on every tick the document is dirty, not-saving and
+  // not-already-timered — by design ("re-queueing is free"), so nothing
+  // unsaved is ever one dropped timer away from unprotected. What it could
+  // not know is that the timer it just armed fires against content already
+  // sitting in the last snapshot: the server dedups by digest (storyboard_
+  // editor.py's `write_backup`, "an identical snapshot is not a snapshot")
+  // so no new FILE was ever written by the loop, but the ROUND TRIP — a
+  // fetch, `claim_session`, a digest compare — fired every 1.4s regardless,
+  // measured at the reported "every 1.5 to 3 s forever" while the document
+  // sat dirty and untouched. This is the same fingerprint the server already
+  // keys its own dedup on, kept locally so the common case never leaves the
+  // tab at all. `quiet` (the suspend/close paths) still checks it — sending
+  // an identical body on close would be exactly the same pointless write,
+  // just once instead of in a loop.
+  // sbeSaveBody already folds clips/overlays/transitions/audio_tracks INTO
+  // `body.edit` (there is no separate top-level field for any of them) —
+  // so `body.edit`'s own JSON is the complete, deterministic content this
+  // backup would carry.
+  const sig = SBE.id + '\u0000' + body.draft + '\u0000' + JSON.stringify(body.edit);
+  if (SBE.backedUpAt && SBE.lastBackupSig === sig) return true;
   SBE.backingUp = true;
   let r;
   try {
-    const body = sbeSaveBody({ id: SBE.id, edit: SBE.edit, clips: SBE.clips,
-                               overlays: SBE.overlays, tracks: SBE.tracks,
-                               transitions: SBE.transitions,
-                               expect: null });
-    // WHICH DRAFT THIS WAS COMPOSED FROM. The server files the backup under
-    // the draft that is active when the write LANDS, and this one is
-    // debounced — so without the name in the body, a backup of the draft you
-    // just left is offered back as the unsaved work of the one you opened.
-    body.draft = SBE.activeDraft || '';
-    body.session = SBE.session;
     const res = await fetch('/storyboard/edit/backup', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body) });
@@ -4633,6 +5350,7 @@ async function sbeBackup(quiet) {
     SBE.backingUp = false;
   }
   if (r && r.ok) {
+    SBE.lastBackupSig = sig;
     SBE.backedUpAt = Date.now();
     // Somebody else is editing this film too. Worth saying; never worth
     // stopping for.
@@ -4659,6 +5377,35 @@ async function sbeBackup(quiet) {
                ') — press Save');
   return false;
 }
+
+// THE LAST CHANCE — FILM-06. A reload, a closed tab, ⌘R or Pinokio's own
+// panel restart give the 1.4s debounce in sbeQueueSave no time to land, and
+// until now nothing ever told the browser to wait for it. `beforeunload`
+// cannot await a fetch — the page is torn down before it would resolve — so
+// the one thing that still leaves WITH the request is
+// `navigator.sendBeacon`, which the browser guarantees to deliver even past
+// unload. Same door as the debounced backup (`/storyboard/edit/backup`),
+// same body `sbeSaveBody` already builds for it: this is not a new lane,
+// only a synchronous trigger on the one that exists.
+function sbeBeaconBackup() {
+  if (!SBE.open || !SBE.id || !SBE.dirty || SBE.conflict) return;
+  if (typeof navigator === 'undefined' || !navigator.sendBeacon) return;
+  try {
+    const body = sbeSaveBody({ id: SBE.id, edit: SBE.edit, clips: SBE.clips,
+                               overlays: SBE.overlays, tracks: SBE.tracks,
+                               transitions: SBE.transitions,
+                               markers: SBE.markers, expect: null });
+    body.draft = SBE.activeDraft || '';
+    body.session = SBE.session;
+    const blob = new Blob([JSON.stringify(body)], { type: 'application/json' });
+    navigator.sendBeacon('/storyboard/edit/backup', blob);
+  } catch (e) { /* best effort — the tab is already on its way out */ }
+}
+window.addEventListener('beforeunload', sbeBeaconBackup);
+// Safari and iOS fire `pagehide`, not `beforeunload`, on a real tab close —
+// belt and braces, and `sbeBeaconBackup` is a no-op the second time either
+// fires first and nothing is dirty any more.
+window.addEventListener('pagehide', sbeBeaconBackup);
 
 // THE OUTER HALF OF SAVING, AND IT EXISTS BECAUSE OF A REAL LOSS. The owner
 // cut for twenty minutes and nothing reached the disk: edit.json sat frozen
@@ -4754,6 +5501,7 @@ async function sbeSaveInner(quiet, force) {
   const body = sbeSaveBody({ id: SBE.id, edit: SBE.edit, clips: SBE.clips,
                              overlays: SBE.overlays, tracks: SBE.tracks,
                              transitions: SBE.transitions,
+                             markers: SBE.markers,
                              expect: force ? null : SBE.revision });
   // WHAT THIS REQUEST CARRIES, AND FOR WHICH DOCUMENT. The answer comes back
   // later, and by then the user may have trimmed a clip or opened another
@@ -4791,7 +5539,8 @@ async function sbeSaveInner(quiet, force) {
     // fields to fall out of date.
     const now = sbeSaveBody({ id: SBE.id, edit: SBE.edit, clips: SBE.clips,
                               overlays: SBE.overlays, tracks: SBE.tracks,
-                              transitions: SBE.transitions, expect: null });
+                              transitions: SBE.transitions,
+                              markers: SBE.markers, expect: null });
     const moved = JSON.stringify(now.edit) !== sentDoc;
     // Adopt the server's copy of the document, but NOT its clip array — the
     // user may have moved something in the milliseconds the save was in
@@ -4799,6 +5548,12 @@ async function sbeSaveInner(quiet, force) {
     // If the document itself moved, keep ALL of it and take only the number.
     SBE.edit = moved ? Object.assign({}, SBE.edit, { revision: rev })
                      : Object.assign({}, r.edit || {}, { clips: SBE.edit.clips || [] });
+    // EDITOR-11 (Codex 4.17.0): ...BUT ITS TIMINGS, WHEN NOTHING MOVED. Save
+    // heals sub-frame clip lengths (FILM-51) and cascades the positions after
+    // them, so the document on disk can differ from the one sent. Keeping
+    // the sent clips marked a cut "saved" that the preview played one way
+    // and the render another until a reload.
+    if (!moved) sbeAdoptSavedTimings(((r.edit || {}).clips) || []);
     SBE.revision = rev;
     SBE.unplaced = r.unplaced || [];
     SBE.prepare = r.prepare || SBE.prepare;
@@ -4863,6 +5618,42 @@ async function sbeSaveInner(quiet, force) {
   sbeSaveAlarm(r.error || 'the panel did not answer the save');
   if (!quiet) phosToast(r.error || 'Could not save the timeline.', { kind: 'danger' });
   return false;
+}
+
+// EDITOR-11: take the saved document's clip TIMINGS onto the clips on
+// screen — start/end, the slot, a split sound's placement — and nothing else
+// (selection, proxies and the undo stack stay). Only when the saved clips are
+// the same clips; a different set is not a heal and is left alone.
+function sbeAdoptSavedTimings(saved) {
+  if (!Array.isArray(saved) || !saved.length || saved.length !== (SBE.clips || []).length) {
+    return false;
+  }
+  const byId = {};
+  for (const x of saved) if (x && x.id !== undefined) byId[String(x.id)] = x;
+  if (SBE.clips.some(c => !byId[String(c.id)])) return false;
+  let changed = false;
+  const out = SBE.clips.map(c => {
+    const x = byId[String(c.id)];
+    const next = {};
+    for (const k of ['start', 'end', 'film_start', 'film_end']) {
+      if (x[k] !== undefined && x[k] !== null && Math.abs(sbeNum(x[k]) - sbeNum(c[k])) > 1e-9) {
+        next[k] = sbeNum(x[k]);
+      }
+    }
+    const xa = x.audio, ca = c.audio;
+    if (xa && ca && xa.film_start !== undefined && xa.film_start !== null
+        && Math.abs(sbeNum(xa.film_start) - sbeNum(ca.film_start)) > 1e-9) {
+      next.audio = Object.assign({}, ca, { film_start: sbeNum(xa.film_start) });
+    }
+    if (!Object.keys(next).length) return c;
+    changed = true;
+    return Object.assign({}, c, next);
+  });
+  if (!changed) return false;
+  for (const c of out) { delete c._pin; }
+  SBE.clips = sbeAdoptGaps(out);
+  sbeLayout(SBE.clips);
+  return true;
 }
 
 function sbeRenderErrors(errors) {
@@ -5227,8 +6018,8 @@ function sbeDraftRename(slug, was) {
 }
 
 // The verb the drafts rewrite dropped. It names the save ALREADY ON DISK —
-// no revision bump, no write to edit.json, nothing about the timeline
-// changes, which is exactly why it is safe to press at any moment.
+// no revision bump, no write to edit.json beyond one already needed to make
+// the label true, nothing else about the timeline changes.
 async function sbeKeepVersion() {
   const box = sbeEl('sbeVersName');
   const label = String((box && box.value) || '').trim();
@@ -5236,6 +6027,30 @@ async function sbeKeepVersion() {
     phosToast('Type a name for this save first — that is what makes it one ' +
               'you can find again.', {});
     if (box && box.focus) { try { box.focus(); } catch (e) {} }
+    return;
+  }
+  // FILM-30: NAME WHAT'S ON SCREEN, NOT WHAT'S ON DISK. `/storyboard/edit/
+  // version` archives a copy of edit.json exactly as it stands — it has no
+  // idea the editor is showing something newer. Without this, "Keep this
+  // version" against a dirty timeline silently named the PREVIOUS save while
+  // reading, to the user, as if it had captured what was in front of them.
+  // Same rule the render, the export and Relink already follow: an action
+  // that reads the file on disk saves first, or says why it could not.
+  // EDITOR-10 (Codex 4.17.0): ...AND NEVER DURING A CONFLICT. The save
+  // above was skipped whenever another tab was ahead, so Keep went straight
+  // to the server and named the arrangement ON DISK — the other tab's —
+  // while telling this tab its own had been kept. Until the conflict is
+  // settled there is no save of what is on this screen to name.
+  if (SBE.conflict) {
+    phosToast('Another tab saved this timeline after you opened it, so what is ' +
+              'on disk is not what is on your screen. Choose Load theirs or ' +
+              'Keep mine first, then name the version.',
+              { kind: 'danger', duration: 9000 });
+    return;
+  }
+  if (SBE.dirty && !(await sbeSave(true))) {
+    phosToast('Your current arrangement could not be saved, so it could not ' +
+              'be named. Fix the save first.', { kind: 'danger', duration: 8000 });
     return;
   }
   const fd = new URLSearchParams();
@@ -5392,9 +6207,13 @@ function sbePaintRecovery() {
   // counts and then declared that nothing had changed — a question about a
   // difference it could not name, over a document that had loaded correctly.
   // This says when, and how big, and leaves the decision where versions live.
+  // FILM-54: `b.diff` (from `edit_diff_summary`, the server side of
+  // `edit_digest`) says WHAT — "1 clip changed: 02 brightness +0.30" — so
+  // the two counts matching is no longer the only thing on screen.
   sbeEl('sbeRecoverWhat').textContent =
     'from ' + sbeAgo(b.at) + ' · ' + sbeNum(b.clips, 0) + ' clips · ' +
-    sbeFmtTime(b.duration) + ' — your saved draft is untouched.';
+    sbeFmtTime(b.duration) + (b.diff ? ' · ' + b.diff : '') +
+    ' — your saved draft is untouched.';
   sbePaintNotices();
 }
 
@@ -5430,13 +6249,26 @@ async function sbeRestoreVersion(file) {
   const fd = new URLSearchParams();
   fd.set('id', SBE.id);
   fd.set('file', file);
+  // FILM-23: A CONFLICT IS A REASON TO STOP, NOT A REASON TO SKIP THE SAVE
+  // AND CARRY ON. `!SBE.conflict` below used to be only a term inside the
+  // save guard — with a conflict set, that term made the whole condition
+  // false, so the save was skipped silently AND the restore proceeded,
+  // installing the server's copy over an arrangement the user had not been
+  // offered any way to keep. Face Fix already refuses outright; this now
+  // matches it.
+  if (SBE.conflict) {
+    phosToast('This film was changed in another tab — resolve that first; ' +
+              'restoring now would replace the arrangement on screen with ' +
+              'no way back to it.', { kind: 'danger', duration: 8000 });
+    return;
+  }
   // The arrangement on screen is about to be replaced, so it goes to disk
   // first — the server archives what it overwrites, and an unsaved drag would
   // otherwise be the one thing in this feature that history could not keep.
   // Checked, for the same reason `sbeDraftOp` checks its backup: if the save
   // 409s or errors the server archives the OLD document, restore overwrites,
   // and the work goes with the undo stack that could have brought it back.
-  if (SBE.dirty && !SBE.conflict && !(await sbeSave(true))) {
+  if (SBE.dirty && !(await sbeSave(true))) {
     phosToast('Your current arrangement could not be saved, so restoring ' +
               'would lose it. Fix the save first.',
               { kind: 'danger', duration: 8000 });
@@ -5747,6 +6579,24 @@ function sbeTlGrabKey(ev) {
   sbeTlPrefWrite(SBE.tlH);
 }
 
+// FILM-58: one small flag per marker, on the ruler. Click jumps the
+// playhead to it, right-click removes it — see the listeners in edInit.
+function sbeMarkerBands(markers, span) {
+  let out = '';
+  for (const m of markers || []) {
+    const at = sbeNum(m.at);
+    if (at < -1e-6 || at > span + 1e-6) continue;
+    const kind = (m && (m.kind === 'beat' || m.kind === 'lyric')) ? m.kind : 'note';
+    const word = kind === 'beat' ? 'Beat' : kind === 'lyric' ? 'Lyric' : 'Marker';
+    out += '<span class="sbe-marker is-' + kind + '" data-marker="' + escapeHtml(m.id)
+      + '" data-at="' + at.toFixed(4) + '" '
+      + 'style="left:' + sbePx(at).toFixed(1) + 'px" '
+      + 'title="' + escapeHtml((m.label ? m.label + ' · ' : '') + word + ' · '
+          + sbeFmtTime(at) + ' — click to jump, right-click to remove') + '"></span>';
+  }
+  return out;
+}
+
 function sbePaintRuler(span, width) {
   const r = sbeEl('sbeRuler');
   const steps = [0.5, 1, 2, 5, 10, 15, 30, 60, 120];
@@ -5770,6 +6620,7 @@ function sbePaintRuler(span, width) {
   // through the same music window the bed and the beat grid use, so a
   // trimmed or slid soundtrack moves its sections with it.
   html += sbeSectionBands(SBE.sections, SBE.audio, SBE.peaks ? SBE.peaks.duration : 0, span);
+  html += sbeMarkerBands(SBE.markers, span);
   r.innerHTML = html;
   r.style.width = width + 'px';
   if (r.classList) r.classList.toggle('has-sections', !!(SBE.sections && SBE.sections.length));
@@ -6341,7 +7192,26 @@ function sbePaintTrack() {
     const bright = sbeBright(c);
     const bad = SBE.errors.byId && SBE.errors.byId[c.id];
     const sp = sbeSpeed(c);
-    const flag = c.locked ? 'lock'
+    // FILM-15: OFFLINE OUTRANKS EVERY OTHER FLAG — a moved or trashed file
+    // is the one thing on this clip that stops it playing at all, so it is
+    // the one thing a glance at the track has to say first (only a live
+    // slip/roll HUD, FILM-03, which exists just for the length of a drag,
+    // sits above it).
+    const offline = sbeClipOffline(c);
+    // FILM-03: "slip +3 f" ON THE CLIP WHILE IT MOVES — the one place a
+    // number can answer "how far did I just move the picture inside its
+    // slot", which a slip or a roll drag has no other way to show (the slot
+    // itself does not move, so there is no gap or overlap to read it from).
+    let dragHud = '';
+    if (SBE.drag && SBE.drag.moved && SBE.slipHud !== undefined
+        && ((SBE.drag.mode === 'slip' && SBE.drag.id === c.id)
+            || (SBE.drag.mode === 'roll' && SBE.drag.roll
+                && (SBE.drag.roll.prevId === c.id || SBE.drag.roll.nextId === c.id)))) {
+      const f = Math.round(SBE.slipHud * sbeFps());
+      dragHud = 'slip ' + (f >= 0 ? '+' : '') + f + ' f';
+    }
+    const flag = dragHud ? dragHud : offline ? 'offline'
+      : (c.locked ? 'lock'
       : (Math.abs(sp - 1) >= 1e-6 ? sp.toFixed(2).replace(/\.?0+$/, '') + 'x'
       : (Math.abs(bright) >= 1e-6
           ? (bright > 0 ? '+' : '') + bright.toFixed(2)
@@ -6349,7 +7219,7 @@ function sbePaintTrack() {
           // none and a slug has no file at all, so flagging either as
           // un-scrubbable would be advice to run a Prepare that would do
           // nothing.
-          : (kind === 'video' && !c.proxy ? 'slow' : '')));
+          : (kind === 'video' && !c.proxy ? 'slow' : ''))));
     const cls = 'sbe-clip is-' + kind + (selMap[String(c.id)] ? ' is-sel' : '')
               + ((selN > 1 && String(c.id) === String(SBE.sel)) ? ' is-primary' : '')
               + (c.id === SBE.curId ? ' is-playing' : '')
@@ -6357,6 +7227,7 @@ function sbePaintTrack() {
               + (Math.abs(bright) >= 1e-6 ? ' is-graded' : '')
               + (Math.abs(sp - 1) >= 1e-6 ? ' is-retimed' : '')
               + (!sbeFramingIsNeutral(c) ? ' is-framed' : '')
+              + (offline ? ' is-offline' : '')
               + (flag ? ' has-flag' : '');
     // A still and a slug have no source window to report — their only number
     // is the hold, and printing "0.00→3.00" of a clock they do not have reads
@@ -6372,20 +7243,44 @@ function sbePaintTrack() {
     // The still paints its own picture behind its name. One <img> per still on
     // the track, which is the same budget the pool already spends per row and
     // nothing like the media-element cap a <video> would eat.
+    // FILM-39: A VIDEO CLIP NOW CARRIES ONE TOO — a cached first-frame JPEG
+    // from its proxy (never the original: a clip with no proxy is exactly the
+    // one flagged SLOW for the same reason, no fast seek, and asking ffmpeg to
+    // open the source for a poster would be the slow decode Prepare exists to
+    // avoid). Offline media gets no poster request at all — the file it would
+    // ask for is already known not to answer, so this is not one more 404 on
+    // top of the ones Relink already explains.
     const thumb = (kind === 'still' && c.path)
       ? '<img class="sbe-cl-thumb" alt="" src="/image?w=240&path=' +
         encodeURIComponent(c.path) + '">'
+      : (kind === 'video' && c.proxy && !offline)
+      ? '<img class="sbe-cl-thumb" alt="" loading="lazy" src="/storyboard/edit/poster?id='
+        + encodeURIComponent(SBE.id) + '&name='
+        + encodeURIComponent(String(c.proxy).split('/').pop()) + '&w=240">'
       : '';
     html += '<div class="' + cls + '" data-id="' + escapeHtml(c.id) + '" '
           + 'data-kind="' + escapeHtml(kind) + '" '
           + 'data-source="' + escapeHtml(c.source || 'auto') + '" '
-          + 'title="' + escapeHtml(label + (bad ? '\n' + bad[0].message : '')) + '" '
+          + 'title="' + escapeHtml(label
+              + (offline ? '\nMedia offline — ' + (c.path || '') +
+                           '. Relink to point at the file that has it now.' : '')
+              + (bad ? '\n' + bad[0].message : '')) + '" '
           + 'style="left:' + sbePx(c.film_start).toFixed(1) + 'px;width:' + w.toFixed(1) + 'px">'
           + thumb
           + '<div class="sbe-cl-name">' + escapeHtml(sbeNiceName(label)) + '</div>'
           + (w > 96 ? '<div class="sbe-cl-meta">' + escapeHtml(meta) + '</div>' : '')
-          + (flag ? '<div class="sbe-cl-flag">' + escapeHtml(flag) + '</div>' : '')
+          // FILM-39: "SLOW" was jargon with no tooltip and no action — it
+          // means "no proxy yet, so scrubbing decodes from the source GOP".
+          // A nested title on the flag itself (the innermost one a browser
+          // shows on hover) explains it in the same words Prepare uses,
+          // without touching the clip's own drag/select handling.
+          // 4.17: the flag is also the fix — a click runs Prepare
+          // (sbeOnTrackDown routes it before any drag/select handling).
+          + (flag === 'slow'
+              ? '<div class="sbe-cl-flag sbe-slow-flag" role="button" title="Slow to scrub until Prepare builds a proxy — click to run Prepare.">⧖</div>'
+              : (flag ? '<div class="sbe-cl-flag">' + escapeHtml(flag) + '</div>' : ''))
           + sbeSyncBadge(c)
+          + (w > 60 ? sbeSongSyncBadge(c) : '')
           + sbeFadeMarks(c)
           + '<div class="sbe-grip l"></div><div class="sbe-grip r"></div>'
           // THE TWO CORNER HANDLES, IN A BAND INSET FROM BOTH GRIPS. The
@@ -6472,6 +7367,80 @@ function sbeSyncBadge(c) {
            + 'with its own picture (' + (d > 0 ? 'late' : 'early') + '). '
            + 'Click to put it back under the frame it came from.') + '">'
        + escapeHtml(sbeDriftLabel(d)) + '</div>';
+}
+
+// FILM-05: "SYNC TO SONG". A singing shot is conditioned on one fixed
+// stretch of the track (`audio_start_time`); the position it BELONGS at is
+// that second plus however much its own head has been trimmed
+// (`audio_start_time + start`), and the app never compared that against
+// where the shot actually sits. Measured on the owner's cut: 16 of 19 a2v
+// clips sat 4 to 9 frames off — his own hand corrections, recorded nowhere.
+function sbeSongSyncOffset(c, shot) {
+  if (!c || sbeKind(c) !== 'video' || !shot) return null;
+  if (String(shot.mode || '').toLowerCase() !== 'a2v') return null;
+  const ast = shot.audio_start_time;
+  if (ast === null || ast === undefined) return null;
+  const expected = sbeNum(ast) + sbeNum(c.start, 0);
+  return sbeRound(sbeNum(c.film_start) - expected);
+}
+
+// FILM-05 item 4: AUTO-LOCK AGAINST MOVES THAT BREAK SONG SYNC. A trim or a
+// roll leaves the offset above untouched — the film side and the source
+// side of the mapping move together, by construction (a head trim moves the
+// slot WITH the in-point; see sbeTrim) — but a plain MOVE, a multi-select
+// MOVE or a REORDER slides only the slot: `film_start` changes, `start`
+// does not, and the offset breaks silently with no gesture to catch it.
+// This is the exact silent failure FILM-05 exists to surface, so a clip
+// conditioned on the song refuses those three gestures outright. Slip stays
+// open — it is the sanctioned way to correct the offset (`sbeSnapToSong`,
+// FILM-03's own gesture) — and so does trim/roll, neither of which can move
+// the offset. Editor-side only: the board's own lock is FILM-21's, a
+// different surface entirely.
+function sbeSongLocked(c) {
+  if (!c) return false;
+  const shot = sbeShotForClip(c);
+  if (!shot || String(shot.mode || '').toLowerCase() !== 'a2v') return false;
+  const ast = shot.audio_start_time;
+  return ast !== null && ast !== undefined;
+}
+
+// The readout: "♪ +0.19 s vs song". Absent when the offset is under half a
+// frame — a clip dead on its mark has nothing to say, the same rule
+// `sbeSyncBadge` follows for the J/L-cut flag.
+function sbeSongSyncBadge(c) {
+  if (sbeKind(c) !== 'video') return '';
+  const shot = sbeShotForClip(c);
+  const off = sbeSongSyncOffset(c, shot);
+  if (off === null || Math.abs(off) < 0.5 / sbeFps()) return '';
+  const s = (off > 0 ? '+' : '') + off.toFixed(2) + ' s';
+  return '<div class="sbe-songsync" data-songsync="' + escapeHtml(c.id) + '" '
+       + 'title="' + escapeHtml('This shot sits ' + s + ' vs the song it was conditioned on '
+           + '(' + (off > 0 ? 'late' : 'early') + '). Click to snap it back — a slip, the slot stays put.')
+       + '">♪ ' + escapeHtml(s) + '</div>';
+}
+
+// ONE CLICK, AND IT USES SLIP: the slot (film_start/film_end) does not
+// move — only which seconds of the take play in it, exactly the FILM-03
+// gesture, applied by the number FILM-05 measures instead of by hand.
+function sbeSnapToSong(id) {
+  const c = sbeById(SBE.clips, id);
+  if (!c) return;
+  const shot = sbeShotForClip(c);
+  const off = sbeSongSyncOffset(c, shot);
+  if (off === null || Math.abs(off) < 1e-6) return;
+  // offset = film_start - (audio_start_time + start), so zeroing it means
+  // start_new = film_start - audio_start_time = start + offset: the delta
+  // IS the offset, not its negation — a slot that sits LATE (offset > 0)
+  // needs LATER source content too, so `start` moves forward by the same
+  // amount the slot is ahead by.
+  const ok = sbeMutate(cs => sbeSlip(cs, id, off));
+  if (ok) {
+    const df = Math.round(off * sbeFps());
+    phosToast('Snapped to the song — ' + (df >= 0 ? '+' : '') + df + ' f.',
+              { kind: 'success', duration: 4000 });
+  } else {
+    phosToast('Could not snap it — the take does not have that much head or tail left.', {});
+  }
 }
 
 // THE SOUND, UNDER THE PICTURE THAT MADE IT. One strip per video clip,
@@ -7076,6 +8045,9 @@ async function sbeTsAddSoundPath(path, tid, at) {
     phosToast('Open a __SEQ__ first — a sound belongs to a timeline.', {});
     return false;
   }
+  // FILM-32: same as edPoolAdd — the import this awaits can outlast the
+  // film that asked for it.
+  const wantId = SBE.id;
   const fd = new URLSearchParams();
   fd.set('id', SBE.id);
   fd.set('path', String(path || ''));
@@ -7083,6 +8055,7 @@ async function sbeTsAddSoundPath(path, tid, at) {
   try {
     r = await (await fetch('/storyboard/edit/add-sound', { method: 'POST', body: fd })).json();
   } catch (e) { r = { ok: false, error: String(e) }; }
+  if (SBE.id !== wantId) return false;
   if (!r || !r.ok) {
     phosToast((r && r.error) || 'That sound could not be added.', { kind: 'danger' });
     return false;
@@ -8650,8 +9623,13 @@ function sbePaintHead() {
   sbeCbarPlayhead();
   const t = sbeEl('sbeTime');
   if (t) {
-    t.innerHTML = escapeHtml(sbeFmtTime(SBE.playhead)) +
-      ' <span>/ ' + escapeHtml(sbeFmtTime(sbeFilmDuration(SBE.clips))) + '</span>';
+    const frames = sbeTimeMode() === 'frames';
+    const fmt = frames ? (x) => sbeFmtTC(x, sbeFps()) : sbeFmtTime;
+    t.innerHTML = escapeHtml(fmt(SBE.playhead)) +
+      ' <span>/ ' + escapeHtml(fmt(sbeFilmDuration(SBE.clips))) + '</span>';
+    t.title = frames
+      ? 'HH:MM:SS:FF at ' + sbeFps() + ' fps. Click for seconds.'
+      : 'Minutes:seconds. Click for a frame timecode.';
   }
 }
 
@@ -9075,6 +10053,31 @@ function sbeCbarModel() {
              + 'keeping the face and the sound. It runs in the queue; when it '
              + 'lands, a line above the timeline offers to swap it in — same '
              + 'cut, same in and out points. The original file is not changed.' },
+    // FILM-53: Retake was reachable only from the Inspector's Advanced
+    // block — rare, but not THAT rare, and a right-click was the more
+    // natural reach for it. Same verb, same dialog; now on the clip bar and
+    // in the menu too.
+    { id: 'sbeCbRetake', act: 'sbeRetakeSel()', label: 'Retake',
+      why: !n ? noSel
+           : (many ? 'Pick one clip — each retake is its own render.'
+              : (!vid || !sbeShotForClip(c) ? 'Only a clip that came from a storyboard shot '
+                                              + 'can be retaken — it has no prompt to start from.'
+                 : '')),
+      title: 'Renders a new take of this shot — same character, a new seed, the prompt to edit. '
+             + 'When it lands you choose whether it replaces this clip.' },
+    // FILM-08: "Replace with…" picks the newest rendered alternate for the
+    // SAME hole this clip sits in — not any alternate anywhere, which would
+    // need a picker this menu has no room for; the unplaced list's own
+    // "Swap in" button is that picker.
+    { id: 'sbeCbReplace', act: 'sbeReplaceSelWithAlt()', label: 'Replace with…',
+      why: !n ? noSel
+           : (many ? 'Pick one clip.'
+              : (!vid ? 'Only a video clip can be replaced.'
+                 : (!sbeAltForClip(c) ? 'No rendered alternate for this shot is waiting — drag '
+                                        + 'one from the media pool, or ⌥-drop it onto this clip.'
+                    : ''))),
+      title: 'Swaps in the newest rendered alternate for this shot. Keeps the slot, the trim, '
+             + 'adjustments and transitions — only the picture changes.' },
   ];
   // The one readout that makes the rest of the row legible.
   // A SOUND IS NAMED AS A SOUND, so "Duplicate" beside it reads as copying
@@ -9694,7 +10697,7 @@ function sbePaintInspector() {
     // `adjust.brightness` on disk, because a label is not worth a data
     // migration — and it is PRESENTED here, beside the fades, because this is
     // where a person looks for it.
-    sect('Effects', adjust + fadeRow('in', e.fade_in) + fadeRow('out', e.fade_out)
+    sect('Effects', adjust + sbeGradeRows(c) + fadeRow('in', e.fade_in) + fadeRow('out', e.fade_out)
          + ((kind !== 'slug') ? (() => {
              const fr = sbeFraming(c);
              const on = !sbeFramingIsNeutral(c);
@@ -9774,6 +10777,79 @@ function sbeBrightCommit(v) {
   sbeQueueSave();
 }
 
+// FILM-14: the 5-slider grade's row markup, matching the existing brightness
+// slider's shape exactly — a slug has no colour to grade.
+function sbeGradeRows(c) {
+  if (!c || sbeKind(c) === 'slug') return '';
+  const g = sbeGrade(c);
+  const row = (label, field, step, fmt) => {
+    const [lo, hi] = SBE_GRADE_FIELDS[field];
+    return '<span class="sbe-fade-row"><label for="sbeGrade' + field + '">' + label + '</label>'
+      + '<input type="range" id="sbeGrade' + field + '" min="' + lo + '" max="' + hi + '" step="' + step + '" '
+      + 'value="' + g[field] + '" oninput="sbeGradePreview(\'' + field + '\', this.value)" '
+      + 'onchange="sbeGradeCommit(\'' + field + '\', this.value)" onmouseup="sbeBlurControl()" '
+      + 'title="Approximate on screen, exact in the render.">'
+      + '<span class="sbe-adj-val" id="sbeGrade' + field + 'Val">' + fmt(g[field]) + '</span></span>';
+  };
+  const notNeutral = !sbeGradeIsNeutral(c);
+  return row('Exposure', 'exposure', '0.01', (v) => (v > 0 ? '+' : '') + v.toFixed(2))
+       + row('Contrast', 'contrast', '0.01', (v) => v.toFixed(2) + 'x')
+       + row('Saturation', 'saturation', '0.01', (v) => v.toFixed(2) + 'x')
+       + row('Temp', 'temp', '0.01', (v) => (v > 0 ? '+' : '') + v.toFixed(2))
+       + row('Tint', 'tint', '0.01', (v) => (v > 0 ? '+' : '') + v.toFixed(2))
+       + (notNeutral
+          ? '<span class="sbe-fade-row"><button type="button" class="ghost-btn" '
+            + 'onclick="sbeGradeResetSel()">Reset grade</button>'
+            + (sbeSelCount() > 1
+               ? '<button type="button" class="ghost-btn" onclick="sbeCopyGradeSel()" '
+                 + 'title="Copies this clip\'s five grade numbers onto every other selected clip. '
+                 + 'One Undo puts them all back.">Copy grade → selection</button>'
+               : '') + '</span>'
+          : '');
+}
+
+// oninput paints the CSS preview only; onchange (drag end) is the edit —
+// the same split every slider in this inspector makes.
+function sbeGradePreview(field, v) {
+  const c = sbeById(SBE.clips, SBE.sel);
+  if (!c) return;
+  const [lo, hi] = SBE_GRADE_FIELDS[field];
+  const val = sbeRound(Math.max(lo, Math.min(hi, sbeNum(v))));
+  const out = sbeEl('sbeGrade' + field + 'Val');
+  if (out) {
+    out.textContent = (field === 'contrast' || field === 'saturation')
+      ? val.toFixed(2) + 'x' : (val > 0 ? '+' : '') + val.toFixed(2);
+  }
+  const preview = Object.assign({}, c, { adjust: Object.assign({}, c.adjust || {}, { [field]: val }) });
+  sbeApplyPreviewGrade(preview, sbeFraming(c));
+}
+function sbeGradeCommit(field, v) {
+  if (!SBE.sel) return;
+  const ok = sbeMutate(cs => sbeSetGrade(cs, SBE.sel, field, v));
+  if (!ok) { sbePaintInspector(); return; }
+}
+function sbeGradeResetSel() {
+  if (!SBE.sel) return;
+  const ok = sbeMutateEach([SBE.sel], (cs, id) => {
+    let res = { clips: cs, ok: true };
+    for (const key of Object.keys(SBE_GRADE_FIELDS)) {
+      res = sbeSetGrade(res.clips, id, key, SBE_GRADE_FIELDS[key][2]);
+      if (!res.ok) return res;
+    }
+    return res;
+  });
+  if (ok) phosToast('Grade reset.', { duration: 3000 });
+}
+function sbeCopyGradeSel() {
+  const ids = sbeSelIds();
+  if (!SBE.sel || ids.length < 2) return;
+  const ok = sbeMutate(cs => sbeCopyGrade(cs, SBE.sel, ids));
+  if (ok) {
+    phosToast('Grade copied to ' + (ids.length - 1) + ' clip(s). One Undo puts them all back.',
+              { kind: 'success', duration: 5000 });
+  }
+}
+
 // A CONTROL THAT KEEPS FOCUS EATS THE SPACE BAR — the next press re-clicks
 // it instead of toggling play. Every inspector commit hands focus back.
 function sbeBlurControl() {
@@ -9823,6 +10899,31 @@ function sbeFadePaint(t) {
 
 function sbeApplyPreviewFilter(b, frame) {
   const css = (Math.abs(sbeNum(b)) < 1e-6) ? '' : 'brightness(' + sbeBrightnessCss(b) + ')';
+  const v = sbeEl('sbeVideo');
+  const i = sbeEl('sbeStill');
+  if (v) v.style.filter = css;
+  if (i) i.style.filter = css;
+  sbeApplyPreviewFraming(frame);
+}
+
+// FILM-14: exposure/contrast/saturation preview cleanly onto CSS's own
+// brightness()/contrast()/saturate() — unlike ffmpeg's ADDITIVE brightness,
+// CSS contrast()/saturate() are ALREADY 1.0-centred multipliers, the exact
+// semantics eq=contrast/eq=saturation use, so these two need no
+// approximation at all. temp/tint have no CSS equivalent and are not
+// previewed on the stage; the render is exact regardless, same as the
+// brightness mismatch this function's sibling already documents.
+function sbeGradeCss(c) {
+  const g = sbeGrade(c);
+  const total = sbeBright(c) + g.exposure;
+  const parts = [];
+  if (Math.abs(total) >= 1e-6) parts.push('brightness(' + sbeBrightnessCss(total) + ')');
+  if (Math.abs(g.contrast - 1) >= 1e-6) parts.push('contrast(' + g.contrast.toFixed(3) + ')');
+  if (Math.abs(g.saturation - 1) >= 1e-6) parts.push('saturate(' + g.saturation.toFixed(3) + ')');
+  return parts.join(' ');
+}
+function sbeApplyPreviewGrade(c, frame) {
+  const css = sbeGradeCss(c);
   const v = sbeEl('sbeVideo');
   const i = sbeEl('sbeStill');
   if (v) v.style.filter = css;
@@ -9901,6 +11002,22 @@ function sbePaintChrome() {
     save.classList.toggle('ghost-btn', !(SBE.dirty && !SBE.saving));
   }
   sbePlayGlyph('sbePlayBtn', 'sbePlayUse', SBE.playing);
+  // FILM-14: FILM LOOK — the active pill follows the saved document, not a
+  // client-remembered preference like Deliver's format/size/finish, because
+  // the look is part of the film itself and has to agree with what a
+  // teammate opening the same __SEQ__ sees.
+  const lookWrap = sbeEl('sbeFilmLook');
+  if (lookWrap) {
+    const look = ((SBE.edit || {}).settings || {}).film_look || 'none';
+    lookWrap.querySelectorAll('.pill-btn').forEach(
+      b => b.classList.toggle('active', (b.dataset.look || 'none') === look));
+  }
+  const aspectWrap = sbeEl('sbeSeqAspect');
+  if (aspectWrap) {
+    const aspect = sbeSeqAspect();
+    aspectWrap.querySelectorAll('.pill-btn').forEach(
+      b => b.classList.toggle('active', b.dataset.aspect === aspect));
+  }
   sbePaintPanels();
   // The zoom slider is a VIEW of SBE.pps, not a second copy of it: the − / +
   // buttons, alt + wheel and a resize all move the handle by coming through
@@ -9949,12 +11066,27 @@ function sbePaintChrome() {
         ? sbeNum(u.slot.film_start) : sbeFilmDuration(SBE.clips);
       // The timecode is the same on every row, so it belongs on the button's
       // title rather than repeated thirteen times down a 230px column.
+      // FILM-08: a "Swap in" offer when this take was rendered for a hole a
+      // clip is already sitting in — an alternate (P1_s2, P2_s1…) of a shot
+      // that already has SOMETHING on the timeline, not a hole waiting to be
+      // filled. Matched by slot, not by `n`: the alternates are separate
+      // shots the planner made for the same position, so `n` differs.
+      const target = (u.slot && u.slot.film_start !== undefined)
+        ? (SBE.clips || []).find(x => Math.abs(sbeNum(x.film_start) - sbeNum(u.slot.film_start)) < 0.05)
+        : null;
+      const swap = (target && !target.locked)
+        ? '<button type="button" class="ghost-btn" onclick="sbeSwapIn(' + i + ')" ' +
+          'title="Replaces shot ' + escapeHtml(String(target.n !== undefined && target.n !== null ? target.n : '')) +
+          ' on the timeline with this take. Same slot, same trim, adjustments and transitions kept.">' +
+          'Swap in for shot ' + escapeHtml(String(target.n !== undefined && target.n !== null ? target.n : '?')) +
+          '</button>'
+        : '';
       return '<span class="sbe-chip" title="' +
         escapeHtml((u.title || ('shot ' + u.n)) + ' — would land at ' +
                    sbeFmtTime(at)) + '">' +
         '<b>' + escapeHtml(sbeNiceName(u.title || ('shot ' + u.n))) + '</b>' +
         '<span>' + escapeHtml(u.duration_s ? sbeNum(u.duration_s).toFixed(1) + 's' : (u.pass || '')) + '</span>' +
-        '<button type="button" class="ghost-btn" onclick="sbePlace(' + i + ')">Place</button></span>';
+        '<button type="button" class="ghost-btn" onclick="sbePlace(' + i + ')">Place</button>' + swap + '</span>';
     }).join('');
   }
   // prepare
@@ -10015,9 +11147,25 @@ function sbeSnapEnabled(ev) {
 
 function sbeOnTrackDown(ev) {
   const track = sbeEl('sbeTrack');
+  SBE.slipHud = undefined;
   // Same as the lane: the flag is a button, not part of the block.
   const badge = ev.target.closest('.sbe-sync');
   if (badge) { ev.preventDefault(); sbeResyncSel(badge.dataset.sync); return; }
+  // FILM-05: the song-sync flag — a different button, a different fix.
+  const songBadge = ev.target.closest('.sbe-songsync');
+  if (songBadge) { ev.preventDefault(); sbeSnapToSong(songBadge.dataset.songsync); return; }
+  // FILM-39: the SLOW flag names its own fix, so clicking it runs that fix —
+  // Prepare, which builds the proxies — instead of starting a drag.
+  const slowFlag = ev.target.closest('.sbe-slow-flag');
+  if (slowFlag) {
+    ev.preventDefault();
+    if (SBE.prepare && SBE.prepare.state === 'running') {
+      phosToast('Prepare is already running — smooth scrubbing arrives when it finishes.', {});
+    } else {
+      sbePrepare();
+    }
+    return;
+  }
   const gap = ev.target.closest('.sbe-gap');
   if (gap) {
     sbeGenOpen(sbeNum(gap.dataset.gapStart), sbeNum(gap.dataset.gapDur));
@@ -10133,9 +11281,49 @@ function sbeOnTrackDown(ev) {
   // trim is one clip's edge whatever else is selected, and a reorder chooses
   // one clip's neighbour.
   const many = sbeSelCount() > 1 && sbeSelHas(id);
-  const mode = grip ? (grip.classList.contains('r') ? 'trimR' : 'trimL')
+  // FILM-03: ⌥⌘-DRAG THE BODY IS SLIP. Neither modifier means anything on a
+  // body drag today (⌘ alone is ripple, which a bare body-move already
+  // reads), so the combination is free, and it is the same chord After
+  // Effects and Resolve both already use for it.
+  const wantSlip = !grip && ev.altKey && (ev.metaKey || ev.ctrlKey);
+  // ⌥-DRAG AN EDGE IS ROLL, but only where there is a cut to roll: the other
+  // side of THIS edge has to be a different clip with no gap between them.
+  // Anywhere else (the film's own head or tail, or a real hole) alt on an
+  // edge falls back to an ordinary trim — there is nothing for it to share.
+  let rollWith = null;
+  if (grip && ev.altKey && !ev.shiftKey && !ev.metaKey && !ev.ctrlKey) {
+    const i = SBE.clips.indexOf(c);
+    if (grip.classList.contains('r')) {
+      const nb = SBE.clips[i + 1];
+      if (nb && !nb.locked && Math.abs(sbeNum(nb.film_start) - sbeNum(c.film_end)) < 1e-6) {
+        rollWith = { prevId: c.id, nextId: nb.id };
+      }
+    } else {
+      const nb = SBE.clips[i - 1];
+      if (nb && !nb.locked && Math.abs(sbeNum(nb.film_end) - sbeNum(c.film_start)) < 1e-6) {
+        rollWith = { prevId: nb.id, nextId: c.id };
+      }
+    }
+  }
+  const mode = rollWith ? 'roll'
+               : wantSlip ? 'slip'
+               : grip ? (grip.classList.contains('r') ? 'trimR' : 'trimL')
                : ((ev.shiftKey && ev.altKey) ? 'reorder'
                   : (many ? 'movemany' : 'move'));
+  // FILM-05 item 4: a clip conditioned on the song refuses move/movemany/
+  // reorder — see sbeSongLocked. Trim, roll and slip are untouched by this
+  // check (none of them can move the offset; slip is how you fix it).
+  if (mode === 'move' || mode === 'movemany' || mode === 'reorder') {
+    const ids = (mode === 'movemany') ? sbeSelIds() : [id];
+    const lockedId = ids.find(i => sbeSongLocked(sbeById(SBE.clips, i)));
+    if (lockedId) {
+      phosToast('That shot is conditioned on the song, so moving or reordering '
+                + 'it is blocked — it would throw off the sync. Use the ♪ badge '
+                + '(Snap to song) or slip it instead, or unlink its sound first.',
+                { duration: 8000 });
+      return;
+    }
+  }
   // ⌘ / CTRL IS RIPPLE: the gesture also slides everything after the clip,
   // the way it did before 2026-09-05. Read again on every move so it can be
   // pressed or released mid-drag, as in Premiere.
@@ -10143,6 +11331,8 @@ function sbeOnTrackDown(ev) {
                fs0: sbeNum(c.film_start), fe0: sbeNum(c.film_end), moved: false,
                ripple: !!(ev.metaKey || ev.ctrlKey),
                ids: (mode === 'movemany') ? sbeSelIds() : null,
+               s0: sbeNum(c.start), sp: sbeSpeed(c),
+               roll: rollWith,
                toggle: toggle, collapse: collapse,
                before: JSON.stringify(SBE.clips) };
   if (mode === 'move' || mode === 'movemany') {
@@ -10184,6 +11374,16 @@ function sbeOnTrackMove(ev) {
     // pulling the drop index onto a beat would mean nothing.
     const r = sbeReorderTo(SBE.clips, d.id, Math.max(0, d.t0 + dt));
     if (r.ok) SBE.clips = r.clips;
+  } else if (d.mode === 'slip') {
+    // FILM-03. No snap: a slip does not choose a TIME either, it chooses
+    // which seconds of the take fill a slot that is not moving.
+    SBE.clips = JSON.parse(d.before);
+    const r = sbeSlip(SBE.clips, d.id, dt * d.sp);
+    if (r.ok) { SBE.clips = r.clips; SBE.slipHud = r.applied; }
+  } else if (d.mode === 'roll') {
+    SBE.clips = JSON.parse(d.before);
+    const r = sbeRollEdit(SBE.clips, d.roll.prevId, d.roll.nextId, dt);
+    if (r.ok) { SBE.clips = r.clips; SBE.slipHud = r.applied; }
   } else {
     // A SHOT DRAGGED UP ONTO THE SOURCE MONITOR loads there and the track
     // stays exactly as it was — the block springs back while it is over it.
@@ -10394,7 +11594,7 @@ async function sbeShowFrameAt(t) {
     return;
   }
   const kind = sbeKind(c);
-  sbeApplyPreviewFilter(sbeBright(c), sbeFraming(c));
+  sbeApplyPreviewGrade(c, sbeFraming(c));
   if (kind === 'slug') {
     // NO FILE, SO NOTHING TO LOAD. Both layers off leaves the stage's own
     // black, which is the frame the render will write — the one case where the
@@ -10562,6 +11762,11 @@ function sbePaintSource() {
   const mon = sbeEl('sbeSrcMon');
   if (mon) mon.hidden = !sbeSrcShown();
   const row = SBE.source;
+  // FILM-37: collapsed to a rail while nothing is loaded — see the CSS
+  // comment on .sbe-mon-src.is-empty for why. `!row` is the exact same test
+  // the rest of this function already uses to decide "nothing loaded", so
+  // the collapse can never show one answer while the bar says another.
+  if (mon && mon.classList) mon.classList.toggle('is-empty', !row);
   const name = sbeEl('sbeSrcName');
   const add = sbeEl('sbeSrcAddBtn');
   const play = sbeEl('sbeSrcPlayBtn');
@@ -10619,10 +11824,21 @@ function sbeSetMusicMode(v) {
   if (el) el.value = mode;
   if (SBE.audio) {
     if (String(SBE.audio.mode || 'under') === mode) return;
-    SBE.audio.mode = mode;
-    SBE.dirty = true;
-    sbeSetState('unsaved changes', 'dirty');
-    sbeQueueSave();
+    // FILM-33: THROUGH THE ONE WRITER, LIKE EVERY OTHER SOUNDTRACK GESTURE.
+    // This used to mutate `SBE.audio.mode` in place. A clean save replaces
+    // `SBE.edit` with a FRESH object built from the server's answer
+    // (`SBE.edit = Object.assign({}, r.edit || {}, ...)`) but never touches
+    // `SBE.audio` — so after the first save the two silently point at
+    // different objects, and every mode change after that mutates the
+    // orphaned one. `sbeSaveBody` reads `SBE.edit.audio`, so the change was
+    // real on screen and never reached the file: "Replace" (the music-video
+    // mode) reopened as "Under", the clips' own audio back beneath the song.
+    // `sbeSetAudio` writes both references to the same new object;
+    // `sbeMusicCommit` gives the change undo and the queued backup every
+    // other soundtrack edit already gets.
+    const beforeJson = JSON.stringify(SBE.audio);
+    sbeSetAudio(Object.assign({}, SBE.audio, { mode: mode }));
+    sbeMusicCommit(beforeJson);
   }
   // Only `replace` needs saying: it is the one that destroys something.
   const warn = sbeEl('sbeMusicWarn');
@@ -10650,9 +11866,8 @@ window.ED = { src: 'film', rows: [], films: [], film: '', loading: false,
 
 function edPoolSrc(name) {
   ED.src = name;
-  const tabs = document.getElementById('edPoolTabs');
-  if (tabs) tabs.querySelectorAll('.pill-btn').forEach(b =>
-    b.classList.toggle('active', b.dataset.src === name));
+  const sel = document.getElementById('edPoolSrcSelect');
+  if (sel && sel.value !== name) sel.value = name;
   const pick = document.getElementById('edPoolFilm');
   if (pick) pick.hidden = (name !== 'other');
   // Upload belongs to the source that shows what was uploaded.
@@ -10696,8 +11911,8 @@ async function edPoolUpload(files) {
   if (ED.src !== 'images') edPoolSrc('images'); else await edPoolRefresh(true);
   if (done) {
     phosToast(done + (done === 1 ? ' file is' : ' files are') +
-              ' in the pool — press + to put it at the end, or drag it onto '
-              + 'the track.',
+              ' in the pool — press + to put it at the playhead, or drag it '
+              + 'onto the track.',
               { kind: 'success', duration: 5000 });
   }
   for (const msg of bad) phosToast(msg, { kind: 'danger', duration: 7000 });
@@ -10818,6 +12033,10 @@ async function edPoolLoadFilms() {
 
 function edPoolPickFilm(id) { ED.film = id; ED.limit = 60; edPoolRefresh(); }
 
+// FILM-40: the one way past the pool's 60-row cap. Repaints only — the rows
+// are already fetched, this just stops slicing them.
+function edPoolShowAll() { ED.limit = Infinity; edPoolPaint(); }
+
 async function edPoolLoadFilmShots(id) {
   if (!id) return [];
   let r;
@@ -10862,7 +12081,14 @@ function edPoolPaint() {
           ? (ED.films && ED.films.length
               ? 'That __SEQ__ has no rendered clips yet.'
               : 'No other __SEQS__ yet. Every __SEQ__ you make shows up here to borrow clips from.')
-        : 'This __SEQ__ has no rendered clips yet. Render its shots in Storyboard, or take one from another source above.') + '</span>';
+        // FILM-40: THIS EMPTY STATE CONTRADICTED THE TIMELINE IT SAT NEXT
+        // TO. "No rendered clips yet" is about the BOARD (this pool's own
+        // source, the shots it rendered) — a film cut from imported or
+        // Video-tab clips can have plenty on the timeline and nothing here
+        // to borrow FROM, which is a different, true sentence.
+        : ((SBE.clips || []).length
+            ? 'Nothing left to add from this __SEQ__’s own shots — every clip on the timeline came from somewhere else.'
+            : 'This __SEQ__ has no rendered clips yet. Render its shots in Storyboard, or take one from another source above.')) + '</span>';
     if (note) note.textContent = '';
     return;
   }
@@ -10903,9 +12129,16 @@ function edPoolPaint() {
       ? '<button type="button" class="ed-pool-add" ' +
         'title="Put this sound on an audio track at the playhead" ' +
         'onclick="event.stopPropagation();edPoolSound(' + i + ')">+</button>'
+      // FILM-40: "+" USED TO MEAN "put this at the end", always — so a clip
+      // swapped in mid-cut meant a click here and then a drag all the way
+      // back to where you actually were. It inserts at the playhead now
+      // (a ripple, like a drop does), which is where you were just looking;
+      // ⌥+click keeps the old "append at the end" for the one time that is
+      // actually what somebody wants.
       : '<button type="button" class="ed-pool-add" ' +
-        'title="Put this clip at the end of the __SEQ__" ' +
-        'onclick="event.stopPropagation();edPoolAdd(' + i + ')">+</button>') +
+        'title="Put this clip at the playhead (⌥ for the end of the __SEQ__)" ' +
+        'onclick="event.stopPropagation();edPoolAdd(' + i +
+        ', event.altKey ? undefined : SBE.playhead)">+</button>') +
     // A VIDEO CAN GIVE ITS SOUND ALONE — onto an audio track, at the playhead,
     // with no picture.
     ((!r.kind || r.kind === 'video')
@@ -10932,10 +12165,15 @@ function edPoolPaint() {
     sbePaintSource();
   }
   if (note) {
-    note.textContent = rows.length > show.length
-      ? (show.length + ' of ' + rows.length + ' shown.')
-      : (rows.length + ' clip' + (rows.length === 1 ? '' : 's') +
-         ' · click one to watch it, + to put it at the end, or drag it onto the track.');
+    // FILM-40: "60 of 75 shown." used to be the whole sentence — a cap with
+    // no way past it. One link past the cap that raises it to "everything",
+    // the same shape the search filter's own note already uses elsewhere.
+    note.innerHTML = rows.length > show.length
+      ? (show.length + ' of ' + rows.length + ' shown. ' +
+         '<a href="#" onclick="event.preventDefault();edPoolShowAll();">Show all ' +
+         rows.length + '</a>')
+      : escapeHtml(rows.length + ' clip' + (rows.length === 1 ? '' : 's') +
+         ' · click one to watch it, + to put it at the playhead, or drag it onto the track.');
   }
 }
 
@@ -10974,7 +12212,7 @@ function edPoolObserve(list) {
 
 // THE VERB. A clip joins the timeline, gets its proxy built before it lands,
 // and the user does not move: adding to a cut is not a reason to leave it.
-async function edPoolAdd(i, dropAt) {
+async function edPoolAdd(i, dropAt, overwriteId) {
   const list = document.getElementById('edPoolList');
   const row = ((list || {})._rows || [])[i];
   if (!row) return;
@@ -10999,6 +12237,12 @@ async function edPoolAdd(i, dropAt) {
       ? ('reading ' + (row.title || 'that image') + '…')
       : ('building the proxy for ' + (row.title || 'that clip') + '…');
   }
+  // FILM-32: WHICH FILM THIS WAS FOR. The proxy build below is the slow
+  // part — real footage, sometimes several seconds — and nothing stopped
+  // the user from switching films while it ran. The clip landed in
+  // whichever film happened to be open when the AWAIT returned, not the
+  // one it was dropped onto.
+  const wantId = SBE.id;
   const fd = new URLSearchParams();
   fd.set('id', SBE.id);
   if (isStill) { fd.set('kind', 'still'); fd.set('path', row.path); }
@@ -11008,6 +12252,14 @@ async function edPoolAdd(i, dropAt) {
   let r;
   try { r = await (await fetch('/storyboard/edit/add-clip', { method: 'POST', body: fd })).json(); }
   catch (e) { r = { ok: false, error: String(e) }; }
+  if (SBE.id !== wantId) {
+    // Too late to land it here, and wrong to land it where the user is now.
+    // The build already happened server-side and the clip sits in the pool
+    // (and, if `wantId`'s edit is reopened, in its "unplaced" list) — a
+    // quiet re-read of the CURRENT film covers the note this leaves blank.
+    if (note) note.textContent = '';
+    return;
+  }
   if (!r.ok) {
     if (note) note.textContent = '';
     phosToast(r.error || 'That clip could not be added.', { kind: 'danger' });
@@ -11021,12 +12273,14 @@ async function edPoolAdd(i, dropAt) {
                          : (c.duration_s || row.duration_s || null)),
     title: c.title || row.title || '', n: c.n,
   };
-  // A CLICK LANDS AT THE END; A DROP LANDS WHERE IT WAS DROPPED. The first
-  // cannot move anybody's cuts, which is why it is still the default verb; the
-  // second was ASKED for, and a drop that ignored where the pointer was would
-  // be a drag with no meaning.
+  // A CLICK LANDS AT THE END; A DROP LANDS WHERE IT WAS DROPPED; A ⌥-DROP ON
+  // A CLIP REPLACES IT. The first cannot move anybody's cuts, which is why
+  // it is still the default verb; the second was ASKED for, and a drop that
+  // ignored where the pointer was would be a drag with no meaning; the
+  // third (FILM-08) never ripples anything — the slot is not touched.
   let at;
   const ok = sbeMutate(cs => {
+    if (overwriteId) { at = (sbeById(cs, overwriteId) || {}).film_start; return sbeReplaceClip(cs, overwriteId, item); }
     if (dropAt === undefined || dropAt === null) {
       at = sbeFilmDuration(cs);
       return sbePlaceUnplaced(cs, item, at);
@@ -11035,10 +12289,15 @@ async function edPoolAdd(i, dropAt) {
     return sbeInsertAt(cs, item, at);
   });
   if (!ok) { if (note) note.textContent = ''; return; }
-  await sbeSave(true);
+  // FILM-29: `sbeMutate` above already marked this dirty and queued the
+  // crash backup (immediately, on a clean timeline — see sbeQueueSave). A
+  // manual save here was a second, silent write to edit.json the user never
+  // pressed Save for. `sbeLoad(true)` below already refuses to clobber a
+  // dirty document (see sbeAdoptMeta), so nothing needs the write to land
+  // first.
   if (note) note.textContent = '';
-  phosToast('Added at ' + sbeFmtTime(at) +
-            (isStill ? ' · still' : ' · proxy ready.'),
+  phosToast(overwriteId ? 'Replaced the clip at ' + sbeFmtTime(sbeNum(at)) + '. Same cut, same timings.'
+            : ('Added at ' + sbeFmtTime(at) + (isStill ? ' · still' : ' · proxy ready.')),
             { kind: 'success', duration: 4000 });
   // The board may have gained a shot (an import), and the payload's `unplaced`
   // and `clips` are now stale. Re-read quietly; nothing on screen moves.
@@ -11162,6 +12421,14 @@ function edPoolDragMove(ev) {
   track.classList.toggle('is-dropping', !!over);
   SBE.dropAt = over ? edPoolDropTime(ev, track) : null;
   SBE.tsDrop = (onTracks && d.row.kind !== 'still') ? onTracks : null;
+  // FILM-08: ⌥-DROP IS OVERWRITE. Dropped square over a clip's own picture
+  // with ⌥ held, it REPLACES that clip instead of inserting and rippling —
+  // the modifier "Place" and a plain drop never had, so a swap always meant
+  // pushing every later shot off the beat by hand.
+  SBE.dropOverwriteId = (over && ev.altKey && d.row.kind !== 'sound')
+    ? (sbeClipAt(SBE.clips, sbeTimeFromEvent(ev, track)) || {}).id || null
+    : null;
+  track.classList.toggle('is-overwriting', !!SBE.dropOverwriteId);
   sbePaintTrack();
   sbePaintTracks();
 }
@@ -11192,9 +12459,11 @@ async function edPoolDragEnd(ev) {
   if (!d) return;
   if (d.ghost) d.ghost.remove();
   const track = sbeEl('sbeTrack');
-  if (track) track.classList.remove('is-dropping');
+  if (track) { track.classList.remove('is-dropping'); track.classList.remove('is-overwriting'); }
   const at = SBE.dropAt;
   SBE.dropAt = null;
+  const overwriteId = SBE.dropOverwriteId;
+  SBE.dropOverwriteId = null;
   const tsDrop = SBE.tsDrop;
   SBE.tsDrop = null;
   sbeSrcDropHover(null, false);
@@ -11211,6 +12480,7 @@ async function edPoolDragEnd(ev) {
   if (d.toSrc) { edPoolPreview(d.index); return; }
   if (tsDrop) { await edPoolSound(d.index, tsDrop.tid, tsDrop.at); return; }
   if (at === null || at === undefined) return;   // dropped in open space
+  if (overwriteId) { await edPoolAdd(d.index, at, overwriteId); return; }
   await edPoolAdd(d.index, at);
 }
 
@@ -11231,9 +12501,39 @@ function edAddSlug() {
     kind: 'slug', title: 'black', duration_s: secs,
   }, at));
   if (!ok) return;
-  sbeSave(true);
+  // FILM-29: same as edPoolAdd — sbeMutate already queued the crash backup.
+  // No extra silent write to edit.json.
   phosToast(secs.toFixed(1) + 's of black at ' + sbeFmtTime(at) + '.',
             { kind: 'success', duration: 3500 });
+}
+
+// ---------------------------------------------------------------------------
+// OFFLINE MEDIA — FILM-15. A moved or trashed file, named rather than found
+// out about from a black preview and a shorter, out-of-sync export.
+// ---------------------------------------------------------------------------
+// `SBE.offline` is a list of clip ids (see `_sbe_payload`) — a stat, not an
+// ffprobe, so it is cheap enough for every read. A file that exists but will
+// not decode reaches the assembler's own check instead, which pads it with
+// black rather than shortening the film (`_sb_timeline_segments`).
+function sbeClipOffline(c) {
+  if (!c || !c.path) return false;
+  const off = SBE.offline || [];
+  return off.indexOf(String(c.id)) >= 0 || off.indexOf(String(c.path)) >= 0;
+}
+
+function sbePaintOffline() {
+  const bar = sbeEl('sbeOffline');
+  if (!bar) return;
+  const ids = SBE.offline || [];
+  bar.hidden = !ids.length;
+  if (!ids.length) return;
+  const names = (SBE.clips || [])
+    .filter(c => sbeClipOffline(c))
+    .map(c => sbeNiceName(c.title || String(c.path || '').split('/').pop()));
+  sbeEl('sbeOfflineText').textContent =
+    ids.length + (ids.length === 1 ? ' clip is' : ' clips are') +
+    ' offline' + (names.length ? ' — ' + names.slice(0, 4).join(', ') +
+    (names.length > 4 ? ', …' : '') : '') + '.';
 }
 
 // ---------------------------------------------------------------------------
@@ -11299,7 +12599,16 @@ function sbeRetakeKeep(id, to) {
   sbePaintRelink();
 }
 async function sbeRetakeUse(id, to) {
-  if (SBE.dirty && !SBE.conflict && !(await sbeSave(true))) {
+  // FILM-23: see sbeRestoreVersion — a conflict must refuse outright, not
+  // silently skip the save and swap the take in over an arrangement the
+  // server has never seen.
+  if (SBE.conflict) {
+    phosToast('This film was changed in another tab — resolve that first; ' +
+              'the swap works on the saved file.',
+              { kind: 'danger', duration: 8000 });
+    return;
+  }
+  if (SBE.dirty && !(await sbeSave(true))) {
     phosToast('Your arrangement could not be saved, and the swap works on the saved file — fix the save first.',
               { kind: 'danger', duration: 8000 });
     return;
@@ -11411,11 +12720,21 @@ async function sbeRefreshOffers() {
 async function sbeRelink() {
   const btn = sbeEl('sbeRelinkBtn');
   if (btn) btn.disabled = true;
+  // FILM-23: see sbeRestoreVersion — a conflict must refuse outright, not
+  // silently skip the save and relink over an arrangement the server has
+  // never seen.
+  if (SBE.conflict) {
+    if (btn) btn.disabled = false;
+    phosToast('This film was changed in another tab — resolve that first; ' +
+              'relinking works on the saved file.',
+              { kind: 'danger', duration: 8000 });
+    return;
+  }
   // Save first: the server rewrites the file on disk, and an unsaved
   // arrangement would be rewritten out from under itself. CHECKED — a save
   // that did not land means the server is holding an older cut, and relinking
   // that one writes it back over what is on screen.
-  if (SBE.dirty && !SBE.conflict && !(await sbeSave(true))) {
+  if (SBE.dirty && !(await sbeSave(true))) {
     if (btn) btn.disabled = false;
     phosToast('Your arrangement could not be saved, and relinking works on ' +
               'the saved file — fix the save first.',
@@ -11523,7 +12842,7 @@ function sbeUnmuteFromRefusal() {
 async function sbeEnter(c, at) {
   const v = sbeEl('sbeVideo');
   const img = sbeEl('sbeStill');
-  sbeApplyPreviewFilter(sbeBright(c), sbeFraming(c));
+  sbeApplyPreviewGrade(c, sbeFraming(c));
   const kind = sbeKind(c);
   if (kind === 'video') {
     if (img) img.classList.remove('is-on');
@@ -11580,7 +12899,7 @@ async function sbePlay() {
         try { await v.play(); } catch (e2) {}
       }
     }
-    sbeApplyPreviewFilter(sbeBright(c), sbeFraming(c));
+    sbeApplyPreviewGrade(c, sbeFraming(c));
   } else {
     await sbeEnter(c);
   }
@@ -11630,8 +12949,35 @@ async function sbeFrame() {
       sbePaintTrack();
     }
   } else if (c) {
-    SBE.playhead = sbeNum(c.film_start) + Math.max(0, v.currentTime - sbeNum(c.start)) / sbeSpeed(c);
-    if (v.currentTime >= sbeNum(c.end) - 1e-3 || v.ended) {
+    // FILM-04: IN REPLACE MODE THE SONG DRIVES THE PLAYHEAD; the picture
+    // chases it with `playbackRate` rather than a seek. A seek is what gave
+    // the preview its 6-frame tolerance (SBE_STRIP_SLIP's sibling, the 0.25s
+    // in sbeMusicSync) — larger than most of the owner's real corrections
+    // (0.15 to 0.39s), so the tool could not show the drift it exists to fix.
+    const songT = sbeMusicMaster() ? sbeSongPlayhead() : null;
+    if (songT !== null) {
+      SBE.playhead = songT;
+      const wantV = sbeNum(c.start) + Math.max(0, songT - sbeNum(c.film_start)) * sbeSpeed(c);
+      const drift = wantV - v.currentTime;
+      const oneFrame = 1 / sbeFps();
+      try {
+        if (Math.abs(drift) >= 0.5) {
+          // Bigger than a rate ramp should ever have to close (a scrub, a
+          // stall, the clip that just loaded) — a seek is honest here.
+          v.currentTime = wantV;
+          v.playbackRate = sbeSpeed(c);
+        } else if (Math.abs(drift) > oneFrame) {
+          v.playbackRate = sbeSpeed(c) * (drift > 0 ? 1.02 : 0.98);
+        } else {
+          v.playbackRate = sbeSpeed(c);
+        }
+      } catch (e) {}
+    } else {
+      SBE.playhead = sbeNum(c.film_start) + Math.max(0, v.currentTime - sbeNum(c.start)) / sbeSpeed(c);
+    }
+    const cutNow = (songT !== null) ? SBE.playhead >= sbeNum(c.film_end) - 1e-3
+                                     : (v.currentTime >= sbeNum(c.end) - 1e-3 || v.ended);
+    if (cutNow) {
       const next = SBE.clips[SBE.clips.indexOf(c) + 1];
       if (!next) { sbeStop(); sbePaintHead(); return; }
       SBE.playing = false;                       // hold the loop across the cut
@@ -11702,6 +13048,32 @@ function sbeMusicAt(t) {
   if (t < w.film_start - 1e-3) return null;               // not in yet
   if (w.film_end !== null && t >= w.film_end) return null;  // out already
   return Math.max(0, w.head + (t - w.film_start));
+}
+
+// FILM-04: THE SONG IS THE MASTER CLOCK in Replace mode. Every picture on a
+// music video is conditioned on a fixed stretch of the song
+// (`audio_start_time`), so the song's own position is the ground truth for
+// where every clip's mouth SHOULD be — and it is the one clock in this page
+// a browser does not stall, seek or decode-jitter the way a <video> can.
+// Only while there is a song actually playing under everything: a board
+// with no soundtrack, or the "Under" mode where clips keep their own sound,
+// has no such ground truth and the picture stays the clock it always was.
+function sbeMusicMaster() {
+  return !!(SBE.audio && SBE.audio.mode === 'replace' && SBE.musicOk
+            && SBE.musicEl && !SBE.musicEl.paused);
+}
+// The inverse of `sbeMusicAt`: the film second the song's own `currentTime`
+// implies. Null before the song's window starts or after it ends, the same
+// two cases `sbeMusicAt` refuses — those are the only moments the picture
+// is still the better clock (a black head, a bed that has run out).
+function sbeSongPlayhead() {
+  const a = SBE.musicEl;
+  if (!a) return null;
+  const w = sbeMusicWindow(SBE.audio, SBE.peaks ? SBE.peaks.duration : 0);
+  const t = w.film_start + (a.currentTime - w.head);
+  if (t < w.film_start - 1e-3) return null;
+  if (w.film_end !== null && t >= w.film_end) return null;
+  return Math.max(0, t);
 }
 function sbeMusicPlay() {
   const a = SBE.musicEl;
@@ -12148,6 +13520,59 @@ function sbePlace(i) {
   }
 }
 
+// FILM-08: the newest unplaced take rendered for the SAME slot a clip sits
+// in — the thing "Replace with…" on the clip bar / context menu offers
+// without a picker. Last match wins: `unplaced` lists in the order the
+// server built it (render order), so the last one sharing this slot is the
+// most recent alternate.
+function sbeAltForClip(c) {
+  if (!c) return null;
+  let best = null;
+  for (const u of (SBE.unplaced || [])) {
+    if (u.slot && u.slot.film_start !== undefined
+        && Math.abs(sbeNum(u.slot.film_start) - sbeNum(c.film_start)) < 0.05) {
+      best = u;
+    }
+  }
+  return best;
+}
+
+function sbeReplaceSelWithAlt() {
+  const c = sbeById(SBE.clips, SBE.sel);
+  if (!c) return;
+  const u = sbeAltForClip(c);
+  if (!u) { phosToast('No rendered alternate for this shot is waiting.', {}); return; }
+  const item = { path: u.path, proxy: u.proxy || null, duration_s: u.duration_s, n: u.n, title: u.title };
+  const ok = sbeMutate(cs => sbeReplaceClip(cs, c.id, item));
+  if (ok) {
+    SBE.unplaced = (SBE.unplaced || []).filter(x => x !== u);
+    phosToast('Replaced with the rendered alternate. Same cut, same timings.',
+              { kind: 'success', duration: 5000 });
+    sbePaint();
+  }
+}
+
+// FILM-08: swap an unplaced alternate into the clip already sitting in the
+// hole it was rendered for. Same slot, same trim (clamped), adjustments,
+// frame and transitions — only the source changes. Unlike Place, this never
+// ripples anything: the film stays exactly as long as it was.
+function sbeSwapIn(i) {
+  const u = (SBE.unplaced || [])[i];
+  if (!u || !u.slot || u.slot.film_start === undefined) return;
+  const target = (SBE.clips || []).find(
+    x => Math.abs(sbeNum(x.film_start) - sbeNum(u.slot.film_start)) < 0.05);
+  if (!target) { phosToast('That slot is empty now — use Place instead.', {}); return; }
+  const item = { path: u.path, proxy: u.proxy || null,
+                 duration_s: u.duration_s, n: u.n, title: u.title };
+  const ok = sbeMutate(cs => sbeReplaceClip(cs, target.id, item));
+  if (ok) {
+    SBE.unplaced = SBE.unplaced.filter((_, k) => k !== i);
+    phosToast('Swapped in for shot ' + (target.n !== undefined && target.n !== null ? target.n : '')
+              + '. Same cut, same timings.', { kind: 'success', duration: 5000 });
+    sbePaint();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // PREPARE / AUTO / GENERATE / RENDER
 // ---------------------------------------------------------------------------
@@ -12191,6 +13616,185 @@ async function sbeAuto() {
   phosToast('Re-cut · ' + (r.edit.clips || []).length + ' clips.', { kind: 'success' });
 }
 
+// EDITOR-13 (Codex 4.17.0): THE ARRANGEMENT AN ANALYSIS MEASURES. Match
+// colour and Auto-align used to read the last SAVE, then apply to the clip on
+// screen with the same id — a replaced or trimmed clip got a correction
+// measured on its old file or window, and a clip added since was never
+// measured. The request now carries what is on screen (the save's own
+// serialisation), and each clip's fingerprint is kept so a proposal only
+// lands on the clip it was measured on. `place`: where it sits on the film
+// matters too (Auto-align reads the song under it; Match colour does not).
+function sbeAnalysisFp(c, place) {
+  if (!c) return '';
+  const f = [String(c.path || ''), sbeRound(c.start), sbeRound(c.end), sbeSpeed(c)];
+  if (place) f.push(sbeRound(c.film_start), sbeRound(c.film_end));
+  return JSON.stringify(f);
+}
+function sbeAnalysisSnapshot(fd, place) {
+  const body = sbeSaveBody({ id: SBE.id, edit: SBE.edit, clips: SBE.clips,
+                             overlays: SBE.overlays, tracks: SBE.tracks,
+                             transitions: SBE.transitions, markers: SBE.markers,
+                             expect: null });
+  fd.set('edit', JSON.stringify(body.edit));
+  const fp = {};
+  for (const c of (SBE.clips || [])) fp[String(c.id)] = sbeAnalysisFp(c, place);
+  return fp;
+}
+function sbeAnalysisFresh(id, fp, place) {
+  const c = sbeById(SBE.clips, id);
+  return !!c && fp[String(id)] !== undefined && sbeAnalysisFp(c, place) === fp[String(id)];
+}
+
+// FILM-05: "AUTO-ALIGN LIP-SYNC". A few seconds of CPU per shot, no render —
+// the scorer's own best-lag search, run against the song for every singing
+// shot on the film, and proposed rather than applied: one toast names how
+// many are off by more than a frame, and Accept applies every proposal as
+// ONE undo step (`sbeMutateEach`), same shape as every batch verb here.
+async function sbeAutoAlign() {
+  if (!SBE.open || !SBE.id) return;
+  const btn = sbeEl('sbeAlignBtn');
+  if (btn) btn.disabled = true;
+  const fd = new URLSearchParams();
+  fd.set('id', SBE.id);
+  // EDITOR-13: MEASURE WHAT IS ON SCREEN, and remember exactly what that
+  // was, so a proposal can only land on the clip it was measured on.
+  const fp = sbeAnalysisSnapshot(fd, true);
+  let r;
+  try { r = await (await fetch('/storyboard/edit/auto-align', { method: 'POST', body: fd })).json(); }
+  catch (e) { r = { ok: false, error: String(e) }; }
+  if (btn) btn.disabled = false;
+  if (!r || !r.ok) { phosToast((r && r.error) || 'Auto-align could not run.', { kind: 'danger' }); return; }
+  const props = (r.proposals || []).filter(p => sbeAnalysisFresh(p.id, fp, true));
+  // EDITOR-9: A SHOT THAT COULD NOT BE MEASURED IS NOT A SHOT IN SYNC. No
+  // face held, or too little voice or mouth motion to compare — said, and
+  // never folded into "already matches".
+  const skipped = (r.skipped || []).length;
+  const unmeasured = skipped
+    ? (skipped + (skipped === 1 ? ' singing shot' : ' singing shots') + ' could not be ' +
+       'measured (no face held, or too little voice to compare) and ' +
+       (skipped === 1 ? 'was' : 'were') + ' left alone.')
+    : '';
+  if (!props.length) {
+    if (skipped) {
+      phosToast(unmeasured + (sbeNum(r.checked, 0)
+                  ? ' The rest already match the song within a frame.' : ''),
+                { icon: 'ph-info', duration: 8000 });
+    } else if (!sbeNum(r.checked, 0)) {
+      phosToast('There are no singing (lip-sync) shots on this film to align.',
+                { duration: 5000 });
+    } else {
+      phosToast('Every singing shot already matches the song within a frame.',
+                { kind: 'success', duration: 5000 });
+    }
+    return;
+  }
+  const deltas = {};
+  const ids = [];
+  for (const p of props) { deltas[p.id] = sbeNum(p.delta_sec); ids.push(p.id); }
+  const el = phosToast(props.length + (props.length === 1 ? ' shot is' : ' shots are')
+                       + ' off the song by more than a frame.'
+                       + (unmeasured ? ' ' + unmeasured : ''),
+                       { icon: 'ph-info', duration: 20000 });
+  if (!el) return;
+  const a = document.createElement('a');
+  a.href = '#';
+  a.className = 'phos-toast-action';
+  a.textContent = 'Accept all (' + ids.length + ')';
+  a.onclick = (ev) => {
+    ev.preventDefault();
+    el.remove();
+    // A shot trimmed, slipped, moved or replaced since it was measured is
+    // not the shot the number is about — it is left alone, and said.
+    const live = ids.filter(id => sbeAnalysisFresh(id, fp, true));
+    const stale = ids.length - live.length;
+    if (!live.length) {
+      phosToast('Those shots changed after they were measured — run Auto-align again.',
+                { duration: 6000 });
+      return;
+    }
+    const ok = sbeMutateEach(live, (cs, id) => sbeSlip(cs, id, deltas[id]));
+    if (ok) {
+      phosToast('Snapped ' + live.length + ' shot(s) to the song. One Undo puts them all back.'
+                + (stale ? ' ' + stale + ' changed after they were measured and were left alone.' : ''),
+                { kind: 'success', duration: 6000 });
+    }
+  };
+  el.appendChild(a);
+}
+
+// FILM-14: "Match colour across the film". Proposals at full (100%)
+// strength are fetched once on open; the slider only SCALES them (cheap,
+// no round trip per drag) until Apply writes the scaled values as one
+// undo step. The hero is the one selected clip if exactly one is
+// selected when the dialog opens, else the server's own median.
+let _sbeMatchProposals = [];
+let _sbeMatchFp = {};
+async function sbeMatchColourOpen() {
+  if (!SBE.open || !SBE.id) return;
+  sbeEl('sbeMatchModal').classList.add('show');
+  sbeEl('sbeMatchGo').disabled = true;
+  sbeEl('sbeMatchStrength').value = 100;
+  sbeEl('sbeMatchStrengthHint').textContent = '100%';
+  sbeEl('sbeMatchWhere').textContent = 'Reading one frame from every clip…';
+  const heroId = (sbeSelCount() === 1) ? SBE.sel : '';
+  const fd = new URLSearchParams();
+  fd.set('id', SBE.id);
+  if (heroId) fd.set('ref', heroId);
+  _sbeMatchFp = sbeAnalysisSnapshot(fd, false);
+  let r;
+  try { r = await (await fetch('/storyboard/edit/match-colour', { method: 'POST', body: fd })).json(); }
+  catch (e) { r = { ok: false, error: String(e) }; }
+  if (!r || !r.ok) {
+    sbeEl('sbeMatchWhere').textContent = (r && r.error) || 'Could not read the film.';
+    return;
+  }
+  _sbeMatchProposals = (r.proposals || []).filter(p => sbeAnalysisFresh(p.id, _sbeMatchFp, false));
+  const hero = heroId ? sbeNiceName((sbeById(SBE.clips, heroId) || {}).title || 'this clip')
+                      : "the film's median";
+  sbeEl('sbeMatchWhere').textContent = _sbeMatchProposals.length
+    ? (_sbeMatchProposals.length + ' of ' + (r.proposals || []).length + (heroId ? '' : ' other')
+       + ' clip(s) differ from ' + hero + ' by more than a touch.')
+    : ('Every clip already matches ' + hero + '.');
+  sbeEl('sbeMatchGo').disabled = !_sbeMatchProposals.length;
+}
+function sbeMatchClose() { sbeEl('sbeMatchModal').classList.remove('show'); }
+function sbeMatchStrengthPreview(v) {
+  sbeEl('sbeMatchStrengthHint').textContent = Math.round(sbeNum(v)) + '%';
+}
+function sbeMatchApply() {
+  if (!_sbeMatchProposals.length) return;
+  const k = Math.max(0, Math.min(100, sbeNum(sbeEl('sbeMatchStrength').value, 100))) / 100;
+  // EDITOR-13: only onto the picture that was sampled.
+  const ids = _sbeMatchProposals.map(p => p.id)
+    .filter(id => sbeAnalysisFresh(id, _sbeMatchFp, false));
+  const stale = _sbeMatchProposals.length - ids.length;
+  if (!ids.length) {
+    sbeMatchClose();
+    phosToast('Those clips changed after they were sampled — open Match colour again.',
+              { duration: 6000 });
+    return;
+  }
+  const byId = {};
+  for (const p of _sbeMatchProposals) byId[p.id] = p;
+  const ok = sbeMutateEach(ids, (cs, id) => {
+    const p = byId[id];
+    let res = { clips: cs, ok: true };
+    for (const field of ['exposure', 'temp', 'tint']) {
+      res = sbeSetGrade(res.clips, id, field,
+        sbeGrade(sbeById(res.clips, id))[field] + sbeNum(p[field], 0) * k);
+      if (!res.ok) return res;
+    }
+    return res;
+  });
+  sbeMatchClose();
+  if (ok) {
+    phosToast('Colour matched on ' + ids.length + ' clip(s) at ' + Math.round(k * 100)
+              + '%. One Undo puts them all back.'
+              + (stale ? ' ' + stale + ' changed after they were sampled and were left alone.' : ''),
+              { kind: 'success', duration: 6000 });
+  }
+}
+
 let _sbeGenAt = 0;
 // THE SHOT A CLIP CAME FROM, from the pool the payload already carries.
 // By path — a clip on the timeline is a file, and the pool row for that
@@ -12206,20 +13810,54 @@ function sbeShotForClip(c) {
 // the new take comes back offered against THIS clip rather than as a loose
 // shot under the timeline.
 let _sbeRetakeOf = '';
+// FILM-35: THE CLIP'S OWN PATH, sent alongside its id. The server used to
+// resolve `retake_of` by loading the SAVED edit.json and looking the clip id
+// up in it — so a clip split, duplicated or added since the last manual Save
+// (the normal state of a timeline, under the save model) did not exist there
+// yet, and the retake refused with "that clip is not on this timeline any
+// more" while it sat selected on screen. The path is everything the server
+// actually needs (it matches the source shot by `draft_output`/
+// `final_output`), and the client already has it without asking anyone.
+let _sbeRetakePath = '';
 function sbeRetakeSel() {
   const c = sbeById(SBE.clips, SBE.sel);
   const shot = c ? sbeShotForClip(c) : null;
   if (!c || !shot) { phosToast('Only a clip that came from a shot can be retaken.', {}); return; }
   const len = Math.max(0.5, sbeNum(shot.duration_s, 0) || (sbeLen(c) * sbeSpeed(c) + 1));
-  sbeGenOpen(sbeNum(c.film_start), len, { retakeOf: c.id, prompt: shot.prompt || '',
-                                          name: shot.title || String(c.path).split('/').pop() });
+  sbeGenOpen(sbeNum(c.film_start), len, { retakeOf: c.id, retakePath: c.path,
+                                          prompt: shot.prompt || '',
+                                          name: shot.title || String(c.path).split('/').pop(),
+                                          summary: sbeRetakeSummary(shot) });
+}
+
+// FILM-53: WHAT WILL ACTUALLY RENDER, before the person queues it. The
+// dialog used to say only "LENGTH 7.7" and Draft/Delivery — nothing about
+// which mode, which engine, which stretch of the song a singing shot is
+// conditioned on, or the cost. "LTX a2v · song 0:09-0:16.6 · new seed ·
+// ~14 min", built from the same fields the render itself reads
+// (mode/audio_start_time) and the same per-shot cost model the board's own
+// estimate uses (est_min, from `shot_render_secs` on the server).
+function sbeRetakeSummary(shot) {
+  const mode = String(shot.mode || '').toLowerCase();
+  const bits = [mode === 'a2v' ? 'LTX a2v' : 'LTX'];
+  if (mode === 'a2v' && shot.audio) {
+    const t0 = sbeNum(shot.audio_start_time, 0);
+    const t1 = t0 + sbeNum(shot.duration_s, 0);
+    bits.push('song ' + sbeFmtTime(t0) + '-' + sbeFmtTime(t1));
+  }
+  bits.push('new seed');
+  const est = (shot.est_min || {}).draft;
+  if (est) bits.push('~' + (est < 1 ? '<1' : Math.round(est)) + ' min (draft)');
+  return bits.join(' · ');
 }
 
 function sbeGenOpen(filmStart, duration, opts) {
   _sbeGenAt = sbeNum(filmStart);
   _sbeRetakeOf = (opts && opts.retakeOf) || '';
+  _sbeRetakePath = (opts && opts.retakePath) || '';
   sbeEl('sbeGenWhere').textContent = _sbeRetakeOf
-    ? ('A new take of ' + (opts.name || 'this clip') + ': the same shot and character, a new ' +
+    ? (((opts && opts.summary) ? opts.summary + ' — ' : '')
+       + 'A new take of ' + (opts.name || 'this clip') + ': the same shot and character, a new ' +
        'seed, the prompt below to edit. When it lands, a line above the timeline offers it ' +
        'against this clip — Use it, or keep the old one.')
     : ('Nothing plays between ' + sbeFmtTime(filmStart) + ' and ' +
@@ -12256,6 +13894,7 @@ async function sbeGenSubmit() {
   fd.set('duration', String(sbeNum(sbeEl('sbeGenDuration').value, 5)));
   fd.set('film_start', String(_sbeGenAt));
   if (_sbeRetakeOf) fd.set('retake_of', _sbeRetakeOf);
+  if (_sbeRetakePath) fd.set('retake_path', _sbeRetakePath);
   const on = document.querySelector('#sbeGenPass .pill-btn.active');
   fd.set('pass', (on && on.dataset.pass) || 'draft');
   let r;
@@ -12288,11 +13927,35 @@ function sbeDeliverGet() {
   try { d = JSON.parse(localStorage.getItem('phos_deliver') || '{}') || {}; } catch (e) { d = {}; }
   return { format: SBE_DELIVER_FORMATS.indexOf(d.format) >= 0 ? d.format : 'h264',
            size: SBE_DELIVER_SIZES.indexOf(d.size) >= 0 ? d.size : 'native',
-           finish: SBE_DELIVER_FINISH.indexOf(d.finish) >= 0 ? d.finish : 'none' };
+           finish: SBE_DELIVER_FINISH.indexOf(d.finish) >= 0 ? d.finish : 'none',
+           // FILM-28: off by default — a mix graded by ear is not something
+           // a render should quietly retarget without being asked.
+           loudnorm: !!d.loudnorm };
 }
+// FILM-14: unlike Deliver's format/size/finish (a client preference posted
+// with each render), the Film look rides IN THE DOCUMENT — `edit.settings`,
+// which `sbeSaveBody` already carries through untouched — so it reaches the
+// film render AND the NLE export (both read `edit.json` off disk) and
+// stays true for whoever opens this __SEQ__ next.
+function sbeSetFilmLook(value) {
+  if (!SBE.open || !SBE.id) return;
+  SBE.edit = SBE.edit || {};
+  SBE.edit.settings = Object.assign({}, SBE.edit.settings || {}, { film_look: value || 'none' });
+  SBE.dirty = true;
+  sbeSetState('unsaved changes', 'dirty');
+  sbePaintChrome();
+  sbeQueueSave();
+}
+
 function sbeDeliverPick(key, value) {
   const d = sbeDeliverGet();
   d[key] = value;
+  try { localStorage.setItem('phos_deliver', JSON.stringify(d)); } catch (e) {}
+  sbeDeliverPaint();
+}
+function sbeDeliverToggleLoudnorm(on) {
+  const d = sbeDeliverGet();
+  d.loudnorm = !!on;
   try { localStorage.setItem('phos_deliver', JSON.stringify(d)); } catch (e) {}
   sbeDeliverPaint();
 }
@@ -12304,15 +13967,19 @@ function sbeDeliverPaint() {
     b.classList.toggle('active', b.dataset.size === d.size));
   document.querySelectorAll('#sbeDeliverFinish .pill-btn').forEach(b =>
     b.classList.toggle('active', b.dataset.finish === d.finish));
+  const lnBox = sbeEl('sbeDeliverLoudnorm');
+  if (lnBox && lnBox.checked !== d.loudnorm) lnBox.checked = d.loudnorm;
   const btn = sbeEl('sbeRenderBtn');
   if (btn && !SBE.rendering) {
     const short = ({ h264: '', hevc: 'HEVC', prores: 'ProRes' })[d.format];
     const size = d.size === 'native' ? '' : (d.size === '2160p' ? '4K' : '1080p');
     const fin = d.finish === 'none' ? '' : (d.finish === 'heavy_grain' ? 'heavy grain' : 'grain');
-    const tag = [short, size, fin].filter(Boolean).join(' ');
+    const ln = d.loudnorm ? '-14 LUFS' : '';
+    const tag = [short, size, fin, ln].filter(Boolean).join(' ');
     btn.textContent = tag ? ('Render · ' + tag) : 'Render';
     btn.title = 'Assemble the film as ' + ({ h264: 'H.264', hevc: 'HEVC', prores: 'ProRes 422 HQ' })[d.format]
       + (d.size === 'native' ? ', as cut' : (d.size === '2160p' ? ' at 4K' : ' at 1080p'))
+      + (d.loudnorm ? ', normalized to -14 LUFS' : '')
       + '. Change it under the arrow.';
   }
 }
@@ -12328,17 +13995,36 @@ async function sbeRenderFilm() {
               'first.', { kind: 'danger', duration: 8000 });
     return;
   }
-  const holes = sbeHoles(SBE.clips);
-  if (holes.length && !confirm(
-      holes.length + ' hole(s) totalling ' +
-      holes.reduce((a, g) => a + g.duration, 0).toFixed(2) + 's are still empty.\n\n' +
-      'The assembler CONCATENATES — a hole closes and everything after it slides ' +
-      'earlier, off the beat it was cut to.\n\nRender anyway?')) return;
+  // FILM-15: OFFLINE MEDIA BLOCKS THE RENDER, WITH THE LIST. Unlike a hole
+  // (FILM-27, below) an offline clip is not something the assembler can make
+  // honest on its own — it CAN pad the slot with black, but a film that
+  // quietly went silent-black where a real shot used to be is the exact
+  // "Rendered N clips" surprise this finding started from. Refuse here,
+  // named, before spending an encode on it.
+  if ((SBE.offline || []).length) {
+    sbePaintOffline();
+    const names = (SBE.clips || []).filter(c => sbeClipOffline(c))
+      .map(c => sbeNiceName(c.title || String(c.path || '').split('/').pop()));
+    phosToast((SBE.offline.length === 1 ? '1 clip is' : SBE.offline.length + ' clips are') +
+              ' offline' + (names.length ? ' — ' + names.slice(0, 4).join(', ') +
+              (names.length > 4 ? ', …' : '') : '') +
+              '. Relink or replace them before rendering.',
+              { kind: 'danger', duration: 9000 });
+    return;
+  }
+  // FILM-27: HOLES ARE NO LONGER DESTRUCTIVE. The assembler now pads every
+  // gap with black at its exact length instead of closing it and sliding
+  // everything after it — so the browser's own blocking "are you sure"
+  // dialog was the wrong weight for "this will show some black", in the
+  // one styled surface this app owns least. It warns in-app instead, and
+  // does not block: "Fill" opens Generate a shot on the first hole, "Close
+  // them" ripples every hole shut for whoever would rather have that.
+  sbeNoticeHoles(sbeHoles(SBE.clips));
   const btn = sbeEl('sbeRenderBtn');
   const prev = btn.textContent;
   SBE.rendering = true;
   btn.disabled = true;
-  btn.textContent = 'Assembling…';
+  btn.textContent = 'Starting…';
   sbeEl('sbeRenderNote').textContent =
     'One ffmpeg pass over ' + SBE.clips.length + ' clips. This takes as long as an encode takes.';
   const fd = new URLSearchParams();
@@ -12349,34 +14035,186 @@ async function sbeRenderFilm() {
   fd.set('format', dl.format);
   fd.set('size', dl.size);
   fd.set('finish', dl.finish);
-  let r;
-  try { r = await (await fetch('/storyboard/edit/render', { method: 'POST', body: fd })).json(); }
-  catch (e) { r = { ok: false, error: String(e) }; }
-  SBE.rendering = false;
-  btn.disabled = false;
-  btn.textContent = prev;
-  if (!r.ok) {
+  if (dl.loudnorm) fd.set('loudnorm', 'on');
+  // FILM-28: A JOB, NOT A BLOCKED REQUEST. The route used to hold the whole
+  // fetch open until ffmpeg finished — no progress, and closing the tab (or
+  // just impatience) had no way to say "stop". `edit/render/start` answers
+  // with a job id the moment the render is queued; sbeRenderPoll below is
+  // what actually watches it land.
+  let started;
+  try {
+    started = await (await fetch('/storyboard/edit/render/start',
+                                 { method: 'POST', body: fd })).json();
+  } catch (e) { started = { ok: false, error: String(e) }; }
+  if (!started.ok) {
+    SBE.rendering = false;
+    btn.disabled = false;
+    btn.textContent = prev;
     sbeEl('sbeRenderNote').textContent = '';
-    phosToast(r.error || 'The film could not be assembled.', { kind: 'danger', duration: 8000 });
+    phosToast(started.error || 'The render could not be started.',
+              { kind: 'danger', duration: 8000 });
     return;
   }
-  sbeEl('sbeRenderNote').textContent = (r.gaps_note || '') +
-    ' Wrote ' + Math.round(sbeNum(r.duration)) + 's to ' + (r.path || '').split('/').pop();
-  phosToast('Rendered ' + r.clips + ' clips · ' + Math.round(sbeNum(r.duration)) + 's' +
+  SBE.renderJob = started.job;
+  btn.textContent = 'Assembling…';
+  // EDITOR-12: THE FILM THIS RENDER IS OF, kept with the job — by the time
+  // it lands the Editor may be showing another film.
+  sbeRenderPoll(started.job, btn, prev, SBE.id, SBE.title || '');
+}
+
+// The job started above, watched to a finish. A fresh fetch every 1.2s
+// rather than one held-open connection — the same reasoning `sbeTick`
+// already uses for the save watchdog: a dropped poll costs nothing and
+// re-arms on its own, where a held-open request either times out silently
+// or, on some proxies, never notices the server went away at all.
+async function sbeRenderPoll(job, btn, prev, boardId, boardTitle) {
+  let r;
+  try { r = await (await fetch('/storyboard/edit/render/status?job=' +
+                               encodeURIComponent(job))).json(); }
+  catch (e) { r = { ok: false, error: String(e) }; }
+  if (SBE.renderJob !== job) return;   // superseded — a newer poll owns the UI now
+  if (!r.ok) {
+    sbeRenderSettle(btn, prev);
+    sbeEl('sbeRenderNote').textContent = '';
+    phosToast(r.error || 'Lost track of the render.', { kind: 'danger', duration: 8000 });
+    return;
+  }
+  if (r.state === 'running') {
+    sbeEl('sbeRenderNote').innerHTML =
+      'Rendering — ' + Math.round(sbeNum(r.elapsed_sec)) + 's so far. '
+      + '<a href="#" class="phos-toast-action" onclick="sbeRenderCancel();return false;">Cancel</a>';
+    SBE.renderPollTimer = setTimeout(() => sbeRenderPoll(job, btn, prev, boardId, boardTitle), 1200);
+    return;
+  }
+  sbeRenderSettle(btn, prev);
+  if (r.state === 'canceled') {
+    sbeEl('sbeRenderNote').textContent = '';
+    phosToast('Render canceled.', { duration: 4000 });
+    return;
+  }
+  if (r.state !== 'done' || !r.result || !r.result.ok) {
+    sbeEl('sbeRenderNote').textContent = '';
+    phosToast((r.result && r.result.error) || r.error ||
+              'The film could not be assembled.', { kind: 'danger', duration: 8000 });
+    return;
+  }
+  sbeRenderFinish(r.result, boardId, boardTitle);
+}
+
+function sbeRenderSettle(btn, prev) {
+  SBE.rendering = false;
+  SBE.renderJob = '';
+  if (SBE.renderPollTimer) { clearTimeout(SBE.renderPollTimer); SBE.renderPollTimer = null; }
+  btn.disabled = false;
+  btn.textContent = prev;
+}
+
+function sbeRenderCancel() {
+  const job = SBE.renderJob;
+  if (!job) return;
+  sbeEl('sbeRenderNote').textContent = 'Canceling…';
+  const fd = new URLSearchParams();
+  fd.set('job', job);
+  fetch('/storyboard/edit/render/cancel', { method: 'POST', body: fd }).catch(() => {});
+}
+
+// The success tail — unchanged from before the job split, just no longer
+// inline in sbeRenderFilm: it is reached from sbeRenderPoll the moment the
+// job's own status answers "done".
+function sbeRenderFinish(r, boardId, boardTitle) {
+  // EDITOR-12 (Codex 4.17.0): EVERYTHING HERE IS ABOUT THE FILM THAT WAS
+  // RENDERED, not the one open now. It used to read SBE.id at completion, so
+  // switching films mid-render gave film B film A's "Last render" chip, and
+  // Open / Show in Finder looked for A's file inside B.
+  const id = boardId || SBE.id;
+  const here = (id === SBE.id);
+  if (here) {
+    sbeEl('sbeRenderNote').textContent = (r.gaps_note || '') +
+      ' Wrote ' + Math.round(sbeNum(r.duration)) + 's to ' + (r.path || '').split('/').pop();
+  }
+  // FILM-24: THE RENDER STAYS ON THE TIMELINE. This used to end by switching
+  // to Storyboard and opening the Film screen — which, combined with the
+  // tab-entry race (FILM-02), sometimes landed on a DIFFERENT film's Film
+  // screen while a "Rendered N clips" toast sat over it. Rendering to check
+  // a cut is the normal loop, not a reason to leave the cut: the film is
+  // ready where the user already is, one click from either place they might
+  // want it.
+  const focus = (r.path || '').split('/').pop();
+  SBE.lastRenders = SBE.lastRenders || {};
+  SBE.lastRenders[id] = { focus: focus, r: r };
+  if (here) sbePaintRenderChip(id, focus, r);
+  const toastEl = phosToast((here ? 'Film ready' : '"' + (boardTitle || 'The other film') + '" is ready')
+            + ' · ' + Math.round(sbeNum(r.duration)) + 's' +
             (r.deliver && r.deliver.label ? ' · ' + r.deliver.label : '') +
             (r.deliver && r.deliver.format === 'prores'
               ? ' — a ProRes .mov: it opens in an NLE or QuickTime, not in this preview' : '') +
             (r.gaps_note ? ' — ' + r.gaps_note : ''),
             { kind: 'success', duration: (r.gaps_note || (r.deliver && r.deliver.format === 'prores')) ? 11000 : 6000 });
-  // The render ENDS ON THE FILM. Before this the timeline wrote an mp4 into
-  // mlx_outputs/storyboards/, printed one line of grey text under the button,
-  // and left the user looking at the timeline wondering where the film went.
-  // The Editor's document is not necessarily the storyboard's open board any
-  // more, so the board is opened before the film screen is asked for it.
-  const focus = (r.path || '').split('/').pop();
+  if (toastEl) {
+    const open = document.createElement('a');
+    open.href = '#'; open.className = 'phos-toast-action'; open.textContent = 'Open';
+    open.onclick = (ev) => { ev.preventDefault(); sbeOpenFilmScreen(id, focus); };
+    const reveal = document.createElement('a');
+    reveal.href = '#'; reveal.className = 'phos-toast-action'; reveal.textContent = 'Show in Finder';
+    reveal.onclick = (ev) => { ev.preventDefault(); sbeRevealRender(id, focus); };
+    toastEl.appendChild(open);
+    toastEl.appendChild(reveal);
+  }
+}
+
+// FILM-24's two actions, shared by the toast and the chip that outlives it.
+// "Open" is exactly what the render used to do on its own: switch to
+// Storyboard and land on this film's Film screen, focused on the file that
+// just came out. Now it is something the user asks for instead of something
+// that happens to them.
+async function sbeOpenFilmScreen(id, focus) {
   if (typeof workflowSwitch === 'function') workflowSwitch('storyboard');
-  if (SBE.id !== SB.id && typeof sbOpen === 'function') await sbOpen(SBE.id);
-  sbFilmOpen({ focus: focus });
+  if (id !== SB.id && typeof sbOpen === 'function') await sbOpen(id);
+  if (typeof sbFilmOpen === 'function') sbFilmOpen({ focus: focus });
+}
+
+async function sbeRevealRender(id, focus) {
+  const fd = new URLSearchParams();
+  fd.set('id', id);
+  if (focus) fd.set('name', focus);
+  try { await fetch('/storyboard/reveal', { method: 'POST', body: fd }); }
+  catch (e) {}
+}
+
+// THE LAST RENDER, next to the button that made it — so leaving the toast to
+// vanish (or leaving the tab and coming back) does not cost the one thing
+// most people actually want after a render: to look at it. Replaced by the
+// next render; there is only ever one.
+function sbePaintRenderChip(id, focus, r) {
+  const chip = sbeEl('sbeRenderChip');
+  if (!chip) return;
+  chip.innerHTML = '';
+  chip.hidden = false;
+  if (chip.dataset) chip.dataset.board = String(id || '');
+  const label = document.createElement('span');
+  label.className = 'sbe-render-chip-label';
+  label.textContent = 'Last render · ' + Math.round(sbeNum(r.duration)) + 's';
+  chip.appendChild(label);
+  const open = document.createElement('button');
+  open.type = 'button'; open.textContent = 'Open';
+  open.onclick = () => sbeOpenFilmScreen(id, focus);
+  chip.appendChild(open);
+  const reveal = document.createElement('button');
+  reveal.type = 'button'; reveal.textContent = 'Show in Finder';
+  reveal.onclick = () => sbeRevealRender(id, focus);
+  chip.appendChild(reveal);
+}
+
+// EDITOR-12: THE CHIP BELONGS TO A FILM. Opening another film shows that
+// film's last render (this session), or none — never the previous film's.
+function sbeRenderChipFor(id) {
+  const chip = sbeEl('sbeRenderChip');
+  if (!chip) return;
+  const last = (SBE.lastRenders || {})[id];
+  if (last) { sbePaintRenderChip(id, last.focus, last.r); return; }
+  chip.innerHTML = '';
+  chip.hidden = true;
+  if (chip.dataset) chip.dataset.board = '';
 }
 
 // ---------------------------------------------------------------------------
@@ -12462,6 +14300,9 @@ async function sbeTick() {
                    ' seconds — press Save to store them');
     }
   }
+  // FILM-57: the undo stack rides the same clock. Cheap when nothing has
+  // changed since the last write — see sbePersistUndo's own comment.
+  sbePersistUndo();
   const job = SBE.prepare || {};
   if (job.state === 'running') {
     try {
@@ -12503,7 +14344,14 @@ async function sbeTick() {
       } finally { SBE.fixBusy = false; }
     }
   }
-  if (SBE.awaitingClip && !SBE.dirty && !SBE.drag && !SBE.saving) {
+  // FILM-35: POLL WHILE DIRTY TOO. Under the save model, unsaved is the
+  // NORMAL state of a timeline someone is actively cutting — so gating this
+  // on `!SBE.dirty` meant the "new take landed" notice almost never fired
+  // for the person it exists for. The quiet re-read just below is already
+  // safe here: it never adopts the arrangement while dirty (sbeAdoptMeta),
+  // it only refreshes facts around it — proxies, `unplaced`, relink offers —
+  // which is exactly what this poll needs and nothing this poll could break.
+  if (SBE.awaitingClip && !SBE.drag && !SBE.saving) {
     const before = (SBE.unplaced || []).length;
     await sbeLoad(true);
     if ((SBE.unplaced || []).length > before) {
@@ -12518,7 +14366,36 @@ async function sbeTick() {
 document.addEventListener('keydown', (ev) => {
   if (!SBE.open || document.body.dataset.workflow !== 'editor') return;
   const t = ev.target;
-  if (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || '')) return;
+  const inField = t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || '');
+  // FILM-36: A CHORD CANNOT BE A CHARACTER. ⌘S/⌘Z/⌘⇧Z/⌘E never insert
+  // text into any field — the OS reserves them — so the field guard below
+  // does not need to hide the app's OWN meaning for them, and hiding it was
+  // the bug: dragging the Brightness or Zoom slider leaves focus on a range
+  // input, and the next ⌘S either did nothing or (unblocked by
+  // preventDefault) opened the browser's own "Save Page As". These four are
+  // the ones the model doc and the render key already document, so they are
+  // the ones let through — not every chord, which would also steal a text
+  // field's own ⌘A/⌘Z (select-all, undo-my-typing) out from under it.
+  if (inField && (ev.metaKey || ev.ctrlKey) && !ev.altKey) {
+    if (ev.key === 's' || ev.key === 'S') { ev.preventDefault(); sbeSaveNow(); return; }
+    if (ev.key === 'z' || ev.key === 'Z') {
+      ev.preventDefault();
+      ev.shiftKey ? sbeRedo() : sbeUndo();
+      return;
+    }
+    if ((ev.key === 'e' || ev.key === 'E') && !ev.shiftKey) {
+      ev.preventDefault(); sbeRenderFilm(); return;
+    }
+  }
+  // SPACE ON A RANGE OR CHECKBOX is the one plain (unmodified) key worth
+  // the same exemption: neither control uses it to enter TEXT, so play/pause
+  // is not competing with anything the field itself would have done with it
+  // — unlike a text input, where Space has to keep typing a space.
+  if (inField && ev.key === ' '
+      && (t.type === 'range' || t.type === 'checkbox')) {
+    ev.preventDefault(); sbeTogglePlay(); return;
+  }
+  if (inField) return;
   if (document.querySelector('.modal-bg.show')) return;
   const step = 1 / sbeFps();
   if (ev.key === ' ') { ev.preventDefault(); sbeTogglePlay(); return; }
@@ -12530,6 +14407,17 @@ document.addEventListener('keydown', (ev) => {
   if (ev.altKey && (ev.key === 'ArrowLeft' || ev.key === 'ArrowRight')) {
     ev.preventDefault();
     sbeNudge(ev.key === 'ArrowLeft' ? -1 : 1, ev.shiftKey);
+    return;
+  }
+  // FILM-03: SLIP, one frame (⇧ for ten) at a time. ⌥←/→ moves the whole clip
+  // (nudge, above); ⌥, and ⌥. change which seconds of the TAKE play in the
+  // same slot — the gesture a butt-joined lip-sync cut actually needs, since
+  // there is no neighbour to nudge into. `.code` alongside `.key`: alt
+  // remaps the character on some layouts, the same reason `` ` `` is read
+  // both ways below.
+  if (ev.altKey && (ev.key === ',' || ev.code === 'Comma' || ev.key === '.' || ev.code === 'Period')) {
+    ev.preventDefault();
+    sbeSlipNudge((ev.key === ',' || ev.code === 'Comma') ? -1 : 1, ev.shiftKey);
     return;
   }
   if (ev.key === 'ArrowLeft') { ev.preventDefault(); sbeStop(); sbeSeek(SBE.playhead - (ev.shiftKey ? step * 10 : step)); return; }
@@ -12628,10 +14516,25 @@ document.addEventListener('keydown', (ev) => {
     ev.shiftKey ? sbeRedo() : sbeUndo();
     return;
   }
-  if ((ev.key === 'm' || ev.key === 'M') && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
+  // FILM-58: M is MARKER, the letter every NLE this timeline aliases
+  // itself to (Premiere, Final Cut, Resolve) already gives it — mute moved
+  // to ⇧M, the same displacement `editor.ripple` already uses for its own
+  // delete key.
+  if (ev.key === 'm' && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
+    ev.preventDefault();
+    sbeMarkerAtPlayhead();
+    return;
+  }
+  if (ev.key === 'M' && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
     ev.preventDefault();
     SBE.muted ? sbeUnmuteFromRefusal() : sbeSetMute(true);
     return;
+  }
+  if ((ev.metaKey || ev.ctrlKey) && !ev.shiftKey && !ev.altKey && (ev.key === 'c' || ev.key === 'C')) {
+    ev.preventDefault(); sbeClipCopy(); return;
+  }
+  if ((ev.metaKey || ev.ctrlKey) && !ev.shiftKey && !ev.altKey && (ev.key === 'v' || ev.key === 'V')) {
+    ev.preventDefault(); sbeClipPaste(); return;
   }
   if (ev.key === 'Escape') {
     ev.preventDefault();
@@ -12793,6 +14696,11 @@ document.addEventListener('click', (ev) => {
     const el = document.getElementById(id);
     if (!el) continue;
     el.addEventListener('pointerdown', (ev) => {
+      // FILM-58: a marker is a button on the ruler, not part of the scrub
+      // surface — the same rule the sync flag and the fade handle already
+      // follow on the track itself.
+      const mk = ev.target.closest && ev.target.closest('.sbe-marker');
+      if (mk && id === 'sbeRuler') { ev.preventDefault(); sbeSeek(sbeNum(mk.dataset.at)); return; }
       sbeStop();
       el.setPointerCapture && el.setPointerCapture(ev.pointerId);
       el.dataset.scrub = '1';
@@ -12812,11 +14720,25 @@ document.addEventListener('click', (ev) => {
     el.addEventListener('pointerup', end);
     el.addEventListener('pointercancel', end);
   }
-  const tabs = document.getElementById('edPoolTabs');
-  if (tabs) {
-    tabs.addEventListener('click', (ev) => {
-      const b = ev.target.closest('.pill-btn');
-      if (b) edPoolSrc(b.dataset.src);
+  const ruler = document.getElementById('sbeRuler');
+  if (ruler) {
+    ruler.addEventListener('contextmenu', (ev) => {
+      const mk = ev.target.closest && ev.target.closest('.sbe-marker');
+      if (!mk) return;
+      ev.preventDefault();
+      sbeMarkerMutate(ms => sbeMarkerRemove(ms, mk.dataset.marker));
+    });
+    // Double-click CYCLES THE KIND — note -> beat -> lyric -> note — the
+    // gesture that needs no new keybinding and no menu for the two extra
+    // colours "beat and lyric cues" asks for.
+    ruler.addEventListener('dblclick', (ev) => {
+      const mk = ev.target.closest && ev.target.closest('.sbe-marker');
+      if (!mk) return;
+      ev.preventDefault();
+      const next = { note: 'beat', beat: 'lyric', lyric: 'note' };
+      const cur = mk.classList.contains('is-beat') ? 'beat'
+                : mk.classList.contains('is-lyric') ? 'lyric' : 'note';
+      sbeMarkerMutate(ms => sbeMarkerSetKind(ms, mk.dataset.marker, next[cur]));
     });
   }
   const pass = document.getElementById('sbeGenPass');
@@ -12839,7 +14761,12 @@ function workflowSwitch(name) {
   if (name === 'characters') name = 'manual';
   // Q4 tier uses the distilled A2V pipeline (no Q8 dev required).
   document.querySelectorAll('#workflowTabs button[data-workflow]')
-    .forEach(b => b.classList.toggle('active', b.dataset.workflow === name));
+    .forEach(b => {
+      const on = b.dataset.workflow === name;
+      b.classList.toggle('active', on);
+      // SYS-25: keep aria-selected in step with the visible .active state.
+      b.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
   const manual = document.getElementById('genForm');
   const studio = document.getElementById('studioSection');
   const train = document.getElementById('trainSection');
@@ -12981,7 +14908,7 @@ Object.assign(globalThis, {
   sbeSpeed, sbeSetSpeed, sbeSpeedCommit,
   sbeOvText, sbeHexColour, sbeRgba, sbeOvTextCommit, sbeOvTextPreview, edAddTitle,
   sbeSectionBands, sbeShotForClip, sbeRetakeSel, sbeRetakeDismissed,
-  sbeDeliverGet, sbeDeliverPick, sbeDeliverPaint, sbeDuplicate, sbeDuplicateSel,
+  sbeDeliverGet, sbeDeliverPick, sbeDeliverPaint, sbeDeliverToggleLoudnorm, sbeDuplicate, sbeDuplicateSel,
   sbeFraming, sbeFramingIsNeutral, sbeSetFraming, sbeApplyPreviewFraming, sbeFramingPreview,
   sbeFramingCommit, sbeFramingReset,
   sbeRetakeKeep, sbeRetakeUse, sbeFaceFixSel, sbeFaceFixSwap,
@@ -13004,7 +14931,7 @@ Object.assign(globalThis, {
   sbeLoad, sbeAdopt, sbeFetchPeaks, sbeMusicEditPath,
   sbePaintProtected, sbeSetState, sbeSnapshot, sbeRestore,
   sbeOvMutate, sbeOvAddAt, sbeOvSetPath, sbeMutate,
-  sbeUndo, sbeRedo, sbeQueueSave, sbeBackup,
+  sbeUndo, sbeRedo, sbeQueueSave, sbeBackup, sbeBeaconBackup,
   sbeSave, sbeSaveAlarm, sbeSaveAlarmClear, sbeSaveInner,
   sbeRenderErrors, sbeErrsToggle, sbeTakeTheirs, sbeForceSave,
   sbeSaveNow, sbeAgo, sbeVersionLine, sbeVersionsEl,
@@ -13033,16 +14960,16 @@ Object.assign(globalThis, {
   sbeShowFrameAt, sbeSrcUrl, edPoolPreview, sbeSrcPlay,
   sbeSrcStop, sbeSrcToggle, sbeSrcAdd, sbePaintSource,
   sbeMusicMode, sbeSetMusicMode, edPoolSrc, edPoolUpload,
-  edPoolUploadRow, edPoolRefresh, edPoolLoadFilms, edPoolPickFilm,
+  edPoolUploadRow, edPoolRefresh, edPoolLoadFilms, edPoolPickFilm, edPoolShowAll,
   edPoolLoadFilmShots, edPoolPaint, edPoolObserve, edPoolAdd,
   edPoolDragStart, edPoolDragMove, edPoolDragEnd, edAddSlug,
-  sbePaintRelink, sbeRelink, edPoolFocus, sbeTogglePlay,
+  sbePaintRelink, sbeRelink, sbeClipOffline, sbePaintOffline, edPoolFocus, sbeTogglePlay,
   sbeSetMute, sbeUnmuteFromRefusal, sbePlay, sbeStop,
   sbeFrame, sbeMusicPlay, sbeMusicSync, sbeStripSync,
   sbeStripStop, sbeZoomMin, sbeZoomTo, sbeZoom,
   sbeZoomSlide, sbeZoomFit, sbeJumpCut, sbeToggleSnap, sbeKeyHint,
   sbeOnTlWheel, sbePrepare, sbePrepareCancel,
-  sbeAuto, sbeGenClose, sbeGenSubmit, sbeRenderFilm,
+  sbeAuto, sbeGenClose, sbeGenSubmit, sbeRenderFilm, sbeRenderCancel,
   sbeExportNle, sbeTick, workflowSwitch,
   // inline-handler targets: generated markup resolves these through the
   // global scope (the v4.9.0 regression, PR #69)
@@ -13057,6 +14984,7 @@ Object.assign(globalThis, {
   sbeSelNormalise, sbeSelIds, sbeSelCount, sbeSelMap, sbeSelHas, sbeSelClips,
   sbeSelectOne, sbeSelectToggle, sbeSelectRange, sbeSelectAll, sbeSelectNone,
   sbeMutateEach, sbeGroupLimits, sbeMoveGroup, sbeCloseGapAt, sbeNudge,
+  sbeCloseAllGaps, sbeNoticeHoles,
   sbeCbarModel, sbePaintCbar, sbeCbarFit, sbeCbarStamp,
   sbeSplitWhy, sbeCbarPlayhead,
   sbeCtxOpen, sbeReorderSel, sbeSplitHere, sbeGenOpen,
@@ -13092,4 +15020,20 @@ Object.assign(globalThis, {
   sbeInspectRead, sbeInspectSet, sbeInspectToggle, sbeSrcMonToggle, sbeSrcClose,
   sbeFullscreen, sbePanelsRead, sbePanelsApply, sbePanelsToggle, sbePaintPanels,
   sbeProgInfo, sbePlayGlyph, sbeTlPrefKey,
+  // FILM package (2026-09-29 mega review): slip/roll, takes and replace,
+  // the frame timecode toggle, colour and the retake summary.
+  sbeFmtTC, sbeTimeMode, sbeToggleTimeMode, sbeSlip, sbeSlipNudge, sbeRollEdit,
+  sbeReplaceClip, sbeSwapIn, sbeAltForClip, sbeReplaceSelWithAlt, sbeRetakeSummary,
+  sbeMusicMaster, sbeSongPlayhead, sbeSongSyncOffset, sbeSongSyncBadge, sbeSnapToSong,
+  sbeAutoAlign,
+  // FILM-14: the grade — model, preview, commit, copy-to-selection.
+  sbeGrade, sbeGradeIsNeutral, sbeSetGrade, sbeCopyGrade, sbeGradeRows,
+  sbeGradePreview, sbeGradeCommit, sbeGradeResetSel, sbeCopyGradeSel,
+  sbeGradeCss, sbeApplyPreviewGrade, sbeSetFilmLook,
+  sbeMatchColourOpen, sbeMatchClose, sbeMatchStrengthPreview, sbeMatchApply,
+  // FILM-58: markers, copy/paste, sequence aspect.
+  sbeMarkerAdd, sbeMarkerRemove, sbeMarkerSetLabel, sbeMarkerSetKind,
+  sbeMarkerMutate, sbeMarkerAtPlayhead, sbeMarkerBands,
+  sbeClipCopy, sbeClipPaste, sbeClipboardCopy, sbeClipboardPasteAttrs, sbeClipboardPasteClips,
+  sbeSetSeqAspect, sbeSeqAspect,
 });

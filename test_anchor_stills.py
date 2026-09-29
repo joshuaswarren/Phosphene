@@ -159,7 +159,7 @@ def test_sidecar_guide_survives_the_reader(tmp_path):
 
 def test_clear_still_forgets_the_still_and_the_clip_made_from_it():
     board = {"shots": [{"n": 1, "still": "/a.png", "still_job_id": "j", "draft_job_id": "d",
-                        "draft_output": "/o.mp4", "status": "done"},
+                        "draft_output": "/o.mp4", "status": "done", "seed": 42},
                        {"n": 2, "still": "/b.png"}]}
     shot = p._sb_clear_still(board, 1)
     assert shot is board["shots"][0]
@@ -168,3 +168,37 @@ def test_clear_still_forgets_the_still_and_the_clip_made_from_it():
     assert shot["status"] == "pending"
     assert board["shots"][1]["still"] == "/b.png"          # only shot 1
     assert p._sb_clear_still(board, 9) is None
+
+
+def test_clear_still_reseeds_so_a_second_press_is_not_the_same_clip():
+    # FILM-11: the still job form pins the shot's own seed — without a
+    # reseed here, pressing "New still" twice rendered the same image twice.
+    board = {"shots": [{"n": 1, "still": "/a.png", "seed": 424242}]}
+    shot = p._sb_clear_still(board, 1)
+    assert shot["seed"] != 424242
+    assert isinstance(shot["seed"], int)
+
+
+def test_clear_still_never_deletes_a_user_uploaded_photo():
+    # FILM-11: a music-video shot's still is the user's own uploaded cast
+    # picture (music_video.py tags it still_source="user"). "New still" used
+    # to pop it unconditionally — on an a2v (singing) shot shot_wants_still()
+    # refuses to make a replacement, so the shot rendered lip-sync with NO
+    # image at all, silently discarding the user's photo for good.
+    board = {"shots": [{"n": 1, "mode": "a2v", "still": "/singer.png",
+                        "still_source": "user", "still_job_id": "j",
+                        "draft_job_id": "d", "draft_output": "/o.mp4",
+                        "status": "done", "seed": 7}]}
+    shot = p._sb_clear_still(board, 1)
+    assert shot["still"] == "/singer.png"           # kept — never deleted
+    assert shot["still_source"] == "user"
+    for k in ("still_job_id", "draft_job_id", "draft_output"):
+        assert k not in shot
+    assert shot["status"] == "pending"
+    assert shot["seed"] != 7                        # still reseeded
+
+    # A machine-made still (no still_source) keeps clearing as before, so a
+    # planner-authored board still gets a genuinely new composition.
+    board2 = {"shots": [{"n": 1, "still": "/anchor.png", "seed": 7}]}
+    shot2 = p._sb_clear_still(board2, 1)
+    assert "still" not in shot2
