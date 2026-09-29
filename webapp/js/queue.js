@@ -4897,6 +4897,7 @@ function _fitStagePlayerNow() {
     const free = stage.clientWidth - surface.offsetWidth;
     if (free >= PLAYER_SIDE_ACTIONS_MIN * 2) surface.setAttribute('data-fit', 'narrow');
     else surface.removeAttribute('data-fit');
+    fitPlayerActions();
   });
 }
 let _stageFitWired = false;
@@ -5194,6 +5195,37 @@ function selectOutput(path, options) {
   if (typeof _syncFinishAffordance === 'function') {
     try { _syncFinishAffordance(isPhoto ? null : o); } catch (e) {}
   }
+  fitPlayerActions();
+}
+
+// THE CLIP TOOLBAR FITS THE PLAYER (4.17.0 render check). 4.17 grew the
+// landscape toolbar to ten actions (Finish at, New take, Retake a moment, To
+// film …) and the only compact rule was a 1100 px VIEWPORT query, so at a
+// 1440 px window every label wrapped over two or three lines and the Finish
+// button sat on top of the clip's name. Labels never wrap now; the cluster is
+// measured against the player it sits on and, when it would take more than
+// ~70% of the width, sheds labels in two steps — the secondary actions first,
+// then everything but the priced Finish button (icons keep their tooltips).
+// The clip name/meta line stops where the cluster starts (--po-actions-w).
+// Beside-the-picture layouts (portrait, data-fit="narrow") are a column of
+// full labels and are left alone.
+function fitPlayerActions() {
+  const surface = document.querySelector('.stage-pane > .player-surface');
+  if (!surface) return;
+  const bar = surface.querySelector('.player-overlay-actions');
+  surface.removeAttribute('data-po-compact');
+  const beside = surface.hasAttribute('data-fit')
+    || surface.getAttribute('data-orient') === 'vertical';
+  if (!bar || beside || !surface.clientWidth || !bar.getClientRects().length) {
+    surface.style.removeProperty('--po-actions-w');
+    return;
+  }
+  const room = surface.clientWidth * 0.7;
+  for (const level of ['1', '2']) {
+    if (bar.getBoundingClientRect().width <= room) break;
+    surface.setAttribute('data-po-compact', level);
+  }
+  surface.style.setProperty('--po-actions-w', Math.ceil(bar.getBoundingClientRect().width) + 'px');
 }
 
 // Expand lightbox — full-viewport viewer for the active output. Reuses

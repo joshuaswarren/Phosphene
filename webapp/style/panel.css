@@ -7600,6 +7600,19 @@
       border-top: 1px solid rgba(255,255,255,0.08);
     }
 
+    /* Landscape toolbar sized to the player (fitPlayerActions, queue.js):
+       labels never wrap; data-po-compact="1" drops the secondary labels,
+       "2" every label but the priced Finish button. The clip name/meta stop
+       where the cluster starts instead of running underneath it. */
+    .player-overlay-actions { width: max-content; }
+    .po-act-label { white-space: nowrap; }
+    .player-surface:not([data-fit]):not([data-orient="vertical"]) .player-overlay-top {
+      padding-right: calc(var(--po-actions-w, 0px) + 24px);
+    }
+    .player-surface[data-po-compact] .po-act:not(#newTakeBtn):not(#continueSongBtn):not(#windowsContinueBtn) .po-act-label,
+    .player-surface[data-po-compact="2"] .po-act .po-act-label { display: none; }
+    .player-surface[data-po-compact] .po-act { padding: 6px 7px; }
+
     /* Compact mode at narrow widths — hide labels, keep icons. */
     @media (max-width: 1100px) {
       .po-act .po-act-label { display: none; }

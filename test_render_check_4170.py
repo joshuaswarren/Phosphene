@@ -196,5 +196,46 @@ console.log(JSON.stringify(els.audioStudioDurationWarn.style.display === 'none' 
         self.assertNotIn("Math.round(AUDIO_STUDIO.audioDuration)", src)
 
 
+class TheClipToolbarFitsThePlayer(unittest.TestCase):
+    """Render check at 1440x900: the 4.17 landscape toolbar (ten actions)
+    wrapped every label over 2-3 lines and the Finish button covered the
+    clip's name — the only compact rule was a 1100 px viewport query."""
+
+    def _level(self, surface_w, widths, attrs=None):
+        fn = extract_function("fitPlayerActions", QUEUE_JS)
+        js = """
+const attrs = %s; const style = {props: {}, setProperty(k, v) { this.props[k] = v; }, removeProperty(k) { delete this.props[k]; }};
+const W = %s;
+const bar = { getClientRects: () => [1], getBoundingClientRect: () => ({width: W[attrs['data-po-compact'] || '0']}) };
+const surface = { clientWidth: %d, style,
+  hasAttribute: k => k in attrs, getAttribute: k => (k in attrs ? attrs[k] : null),
+  setAttribute: (k, v) => { attrs[k] = v; }, removeAttribute: k => { delete attrs[k]; },
+  querySelector: () => bar };
+const document = { querySelector: () => surface };
+""" % (json.dumps(attrs or {}), json.dumps(widths), surface_w) + fn + """
+fitPlayerActions();
+console.log(JSON.stringify([attrs['data-po-compact'] || null, style.props['--po-actions-w'] || null]));
+"""
+        return _node(js)
+
+    def test_labels_drop_in_steps_until_the_cluster_fits(self):
+        W = {"0": 1000, "1": 620, "2": 560}
+        self.assertEqual(self._level(1500, W), [None, "1000px"])
+        self.assertEqual(self._level(908, W), ["1", "620px"])
+        self.assertEqual(self._level(711, W), ["2", "560px"])
+
+    def test_beside_the_picture_layouts_are_left_alone(self):
+        W = {"0": 1000, "1": 620, "2": 560}
+        self.assertEqual(self._level(300, W, {"data-orient": "vertical"}), [None, None])
+        self.assertEqual(self._level(300, W, {"data-fit": "narrow"}), [None, None])
+
+    def test_labels_never_wrap_and_both_layout_paths_refit(self):
+        css = (ROOT / "webapp" / "style" / "panel.css").read_text(encoding="utf-8")
+        self.assertIn(".po-act-label { white-space: nowrap; }", css)
+        self.assertIn('.player-surface[data-po-compact="2"] .po-act .po-act-label { display: none; }', css)
+        self.assertIn("padding-right: calc(var(--po-actions-w, 0px) + 24px);", css)
+        self.assertGreaterEqual(QUEUE_JS.count("fitPlayerActions();"), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

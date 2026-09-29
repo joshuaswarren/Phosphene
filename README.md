@@ -19,7 +19,7 @@
 
 </p>
 
-> **Current release: v4.17.0.** **Honest times, faces that survive, and films you can fix.** We used every flow on small and big Macs and fixed the 222 places it lied, lost work or made you hunt. Time estimates are for your Mac, not ours. Portrait and phone photos keep the face (right way up, right shape, with a crop you can drag). Stop, Clear queue and Hide have Undo or a confirm, and One Shot keeps its finished parts. Lip-sync is a Video mode with a 3 s draft, a sync verdict and Continue the song. The Editor gains Sync to song, Match colour, slip and roll edits, Replace and take history, and renders are versions you can cancel. Press Update in Pinokio, then restart. Full notes on the [releases page](https://github.com/mrbizarro/Phosphene/releases).
+> **Current release: v4.17.1.** **The clip toolbar fits again.** 4.17.0 added four actions to the player toolbar, and at a laptop-sized window their labels wrapped over two or three lines and covered the clip name; the toolbar now fits the player and drops secondary labels (icons keep their tooltips) when space is short. 4.17.0 was the big one: estimates for your Mac, faces kept in portrait and phone photos, Undo on Stop/Clear/Hide, Lip-sync as a Video mode, and an Editor with Sync to song, Match colour, slip and roll edits, Replace and versioned renders. Press Update in Pinokio, then restart. Full notes on the [releases page](https://github.com/mrbizarro/Phosphene/releases).
 
 ## Overview
 
