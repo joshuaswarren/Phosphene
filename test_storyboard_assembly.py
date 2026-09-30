@@ -1707,7 +1707,7 @@ class ImportShotsBetweenFilms(unittest.TestCase):
         self.assertEqual(len(dst["locations"]), 1)
 
     def test_the_cast_comes_too_so_wardrobe_survives(self):
-        cast = [{"id": "ariatrn", "trigger": "ariatrn", "wardrobe": "a red bikini"}]
+        cast = [{"id": "chartest_c", "trigger": "chartest_c", "wardrobe": "a red bikini"}]
         dst = self._board("a", [], cast=[])
         src = self._board("b", [self._shot(1, self.clips[0])], cast=cast)
         panel._sb_import_shots(dst, src)

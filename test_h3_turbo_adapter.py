@@ -308,8 +308,8 @@ class TestH3TurboAdaln(unittest.TestCase):
         self.assertEqual(P.h3_turbo_argv(resolved), ["--lora", f"{lx}:1.0"])
 
     def test_the_real_v4_adapter_has_51_pairs_when_present(self):
-        real = Path("/Users/salo/AI/projects/hailuo-mlx/codex/models/turbo-lora/"
-                    + P.H3_TURBO_V4_FILE)
+        real = (Path.home() / "AI/projects/hailuo-mlx/codex/models/turbo-lora"
+                / P.H3_TURBO_V4_FILE)
         if not real.is_file():
             self.skipTest("v4 adapter not on this machine")
         self.assertEqual(P.h3_lora_adaln_pairs(real), 51)

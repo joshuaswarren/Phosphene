@@ -48,9 +48,9 @@ MAX_HEADER_BYTES = 64 * 1024 * 1024
 #:   ===========================================  =========  =========
 #:   adapter                                      rank       median
 #:   ===========================================  =========  =========
-#:   ``elontrn_v2`` (validated recipe)            32         1.63e-03
-#:   ``ariatrn_v2`` (validated recipe)            32         1.45e-03
-#:   ``eltrumpo_v2`` (validated recipe)           32         1.41e-03
+#:   ``chartest_a_v2`` (validated recipe)            32         1.63e-03
+#:   ``chartest_c_v2`` (validated recipe)            32         1.45e-03
+#:   ``chartest_b_v2`` (validated recipe)           32         1.41e-03
 #:   ``bizarrotrn_v2`` (sample character)         32         8.84e-04
 #:   ``LTX2.3-Rogue…`` (third-party, works)       16         1.84e-03
 #:   ``Fantasy_Painterly`` (third-party, works)   32         5.36e-04

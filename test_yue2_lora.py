@@ -886,7 +886,7 @@ class TheVariationKeepsTheVoice(unittest.TestCase):
         root = Path(self.tmp.name)
         self.loras = root / "loras"
         (self.loras / L.USER_SUBDIR).mkdir(parents=True)
-        (self.loras / L.USER_SUBDIR / "freddie.safetensors").write_bytes(b"x")
+        (self.loras / L.USER_SUBDIR / "my_voice.safetensors").write_bytes(b"x")
         self._saved_loras = self.P.MUSIC_LORAS
         self.P.MUSIC_LORAS = self.loras
         self.addCleanup(lambda: setattr(self.P, "MUSIC_LORAS", self._saved_loras))
@@ -901,7 +901,7 @@ class TheVariationKeepsTheVoice(unittest.TestCase):
         (self.artifacts / "result.json").write_text("{}")
         self.side = Path(str(self.song) + ".json")
         self.addCleanup(self.side.unlink, True)
-        self.pick = f"{L.USER_SUBDIR}/freddie.safetensors"
+        self.pick = f"{L.USER_SUBDIR}/my_voice.safetensors"
         self.side.write_text(json.dumps({
             "engine": "music", "title": "Unplugged", "style": "warm soul",
             "lyrics": "[verse]\nooh", "mode": "full", "instrumental": False,

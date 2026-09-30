@@ -19,7 +19,7 @@
 
 </p>
 
-> **Current release: v4.17.1.** **The clip toolbar fits again.** 4.17.0 added four actions to the player toolbar, and at a laptop-sized window their labels wrapped over two or three lines and covered the clip name; the toolbar now fits the player and drops secondary labels (icons keep their tooltips) when space is short. 4.17.0 was the big one: estimates for your Mac, faces kept in portrait and phone photos, Undo on Stop/Clear/Hide, Lip-sync as a Video mode, and an Editor with Sync to song, Match colour, slip and roll edits, Replace and versioned renders. Press Update in Pinokio, then restart. Full notes on the [releases page](https://github.com/mrbizarro/Phosphene/releases).
+> **Current release: v4.17.2.** **Housekeeping: internal notes and example paths removed from the public repo.** No behavior change — this release cleans development notes and machine-specific example paths out of the public tree. 4.17.1: the clip toolbar now fits the player at a laptop-sized window instead of wrapping over the clip name. 4.17.0 was the big one: estimates for your Mac, faces kept in portrait and phone photos, Undo on Stop/Clear/Hide, Lip-sync as a Video mode, and an Editor with Sync to song, Match colour, slip and roll edits, Replace and versioned renders. Press Update in Pinokio, then restart. Full notes on the [releases page](https://github.com/mrbizarro/Phosphene/releases).
 
 ## Overview
 

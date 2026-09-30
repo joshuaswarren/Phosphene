@@ -2319,13 +2319,13 @@ TRAIN_PRESETS = {
     # high tier mirrors the validated CLI recipe (rank 32 / 100 epochs /
     # lr 1e-4 / 512px) — at 50 images that's the legacy 5000 steps. The
     # earlier 5e-5 LR was a mistake; 1e-4 is the proven default
-    # (Aria_v2, Bizarro_v2 both trained at 1e-4). 512px portrait-
+    # (Chartest_c_v2, Bizarro_v2 both trained at 1e-4). 512px portrait-
     # friendly resolution matches the lora-lab preprocess defaults.
     "high":   {"epochs": 100, "rank": 32, "lr": 1e-4, "resolution": 512,
                "seconds_per_step": 2.0,  "ram_peak_gb": 28,
                "label": "High",
                # Measured band for this recipe: 5.4e-04 (a third-party rank-32
-               # adapter that works) through 1.6e-03 (elontrn_v2). Everything
+               # adapter that works) through 1.6e-03 (chartest_a_v2). Everything
                # that has ever carried a face here was trained this way.
                "subtitle": "~100 epochs · rank 32 · 512px · validated for identity",
                "checkpoint_interval": 250,
@@ -3076,7 +3076,7 @@ def _suggest_trigger_token() -> str:
     are single digits, among the most common tokens the model knows, with
     a prior that has nothing to do with a face. Every trigger that has
     ever carried an identity here is letters-only and ends in `trn`
-    (`bizarrotrn` -> b / izarro / trn; `elontrn`; `ariatrn`), and the
+    (`bizarrotrn` -> b / izarro / trn, the earliest one), and the
     trainings reported in #62 as "active but no identity" all used the
     digit shape the panel itself suggested (`mmx26`, `sfw25`, `3Mar26`).
     Whether the digits are THE cause is being A/B'd; suggesting the shape
@@ -4162,9 +4162,10 @@ def _character_dataset_image(trigger: str) -> Path | None:
          successful face training (copies the first training image).
          New characters created via the Train tab end up here.
       2. lora-lab/dataset_<stem>_v2/images/<trigger>_001.png — the
-         lora-lab convention Mr Bizarro set up manually for ariatrn / bizarrotrn
-         pre-Train-tab automation. <stem> = trigger with trailing 'trn'
-         stripped (ariatrn → aria).
+         lora-lab convention Mr Bizarro set up manually for early
+         character LoRAs (e.g. bizarrotrn) before the Train-tab
+         automation existed. <stem> = trigger with trailing 'trn'
+         stripped (bizarrotrn → bizarro).
       3. lora-lab/dataset_<stem>*/images/<trigger>_*.png — any glob match
          under any dataset_<stem>* subdir (legacy fallback).
     Returns None when nothing resolvable exists — the UI paints a
@@ -29913,7 +29914,7 @@ def make_job(form: dict[str, list[str]] | dict[str, str], *,
             #           runs SLOWER than TC=0.0 and produces dust specks
             #   - 1.8 → clean caching, ~5 min wall vs ~6.3 min at 1.0,
             #           visibly cleaner output (matches Bizarrotrn v2 and
-            #           Salotrn v2 era when 1.8 shipped as default)
+            #           an early character LoRA era when 1.8 shipped as default)
             # Mr Bizarro confirmed visually 2026-05-20 on the chartest v3
             # diagnostic batch. Revert from the ill-calibrated 1.0 back
             # to 1.8.
@@ -37642,7 +37643,7 @@ def _character_sheet_view_prompt(view_phrase: str, wardrobe: str = "") -> str:
     re-states the outfit in words on top of that, for references where the
     clothing is partly out of frame."""
     # "centered in the frame, filling most of it" is load-bearing: the first
-    # live hidream run (ariatrn, seed 424242) drifted the profile view to the
+    # live hidream run (chartest_c, seed 424242) drifted the profile view to the
     # left edge of a mostly-empty wall — ref-conditioned edits keep identity
     # but freely re-stage composition unless told not to.
     # "same hair COLOR and STYLE" spelled out: with the bare "same hair" pin
@@ -37831,7 +37832,7 @@ def generate_character_sheet(character_id: str, *,
             view_dir.mkdir(parents=True, exist_ok=True)
             # Ref chaining: views after the first also get the FIRST
             # rendered view as a second reference. Measured on a dim,
-            # backlit avatar (ariatrn, hidream, seeds 424242/424243, three
+            # backlit avatar (chartest_c, hidream, seeds 424242/424243, three
             # prompt phrasings): the frontal render held the dark hair
             # every time while every solo side-angle render re-imagined it
             # platinum — at side angles the raw avatar under-specifies

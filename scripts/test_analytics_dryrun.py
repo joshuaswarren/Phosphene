@@ -329,8 +329,8 @@ class TestNoLeakage(AnalyticsTestCase):
     PROMPT = ("a weathered lighthouse keeper bizarrotrn turns toward camera, "
               "storm light raking his face")
     NEG = "blurry, extra fingers, watermark"
-    IMG = "/Users/salo/Desktop/private-photos/keeper-reference.png"
-    OUT = "/Users/salo/pinokio/drive/mlx_outputs/20260805_lighthouse_final.mp4"
+    IMG = "/Users/jane/Desktop/holiday-pics/keeper-reference.png"
+    OUT = "/Users/jane/pinokio/drive/mlx_outputs/20260805_lighthouse_final.mp4"
 
     def setUp(self):
         super().setUp()
@@ -353,7 +353,7 @@ class TestNoLeakage(AnalyticsTestCase):
         """No fragment of the user's content in ANY transmitted byte."""
         blob = self.spy.raw() + json.dumps(self.log_lines())
         for needle in (self.PROMPT, self.NEG, self.IMG, self.OUT,
-                       "lighthouse", "keeper-reference", "private-photos",
+                       "lighthouse", "keeper-reference", "holiday-pics",
                        "bizarrotrn", "/Users/", "Desktop", "mlx_outputs",
                        ".mp4", ".png"):
             self.assertNotIn(needle, blob,
@@ -407,7 +407,7 @@ class TestNoLeakage(AnalyticsTestCase):
         """Defense in depth: a future `**params` spread must not leak."""
         dirty = {
             "prompt": self.PROMPT, "image": self.IMG, "output_path": self.OUT,
-            "filename": "secret.mp4", "username": "salo", "lora_paths": [self.IMG],
+            "filename": "secret.mp4", "username": "jane", "lora_paths": [self.IMG],
             "engine": "ltx", "frames": 121,
         }
         clean = P._analytics_clean_props(dirty)
@@ -425,14 +425,14 @@ class TestNoLeakage(AnalyticsTestCase):
         self.assertLessEqual(len(long), P.ANALYTICS_STR_MAX)
 
     def test_scrub_strips_home_and_tilde_paths(self):
-        for raw in ("could not open /Users/salo/AI/notes.txt",
+        for raw in ("could not open /Users/jane/AI/notes.txt",
                     "missing ~/pinokio/api/phosphene.git/models/x.safetensors",
                     "bad /private/var/folders/t3/zz/T/render.mp4",
                     "nested /a/b/c/d/e.bin"):
             out = P._analytics_scrub_text(raw)
             self.assertIn("<path>", out, raw)
             self.assertNotIn("/Users/", out)
-            self.assertNotIn("salo", out)
+            self.assertNotIn("jane", out)
 
     def test_short_secrets_do_not_blank_ordinary_words(self):
         """A 3-char 'prompt' must not turn every error into <redacted>."""

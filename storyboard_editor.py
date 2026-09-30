@@ -4789,7 +4789,7 @@ def edit_sync_flags(edit: dict, *,
 # ===========================================================================
 # PART D — the film, as a project somebody else's editor can open
 # ===========================================================================
-# WHY A FOLDER AND NOT A FILE. An XML that names `/Users/salo/mlx_outputs/…`
+# WHY A FOLDER AND NOT A FILE. An XML that names `/Users/jane/mlx_outputs/…`
 # is a project that works on exactly one machine until the first time anything
 # moves, and then it is a timeline of red offline clips. Premiere and Resolve
 # both relink by NAME within the project's own directory before they give up,

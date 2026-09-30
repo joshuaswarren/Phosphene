@@ -276,15 +276,39 @@ The promote is: build the tree you want to publish, remove what must not go
 public, commit that tree onto `origin/main` with `commit-tree`, **verify the
 result before it is pushed**, then push exactly one commit.
 
+**`scripts/public_exclude.txt` is the single source of truth for "must never
+ship".** It exists because `docs/STATE.md` — the internal dev/agent handoff
+doc — shipped on public `main` since the very first commit that added it:
+beta and public were tree-identical, so nothing had ever actually curated
+this step. `scripts/public_leak_check.py <tree-ish>` reads that same file
+(so the removal list in step 1 and the verification in step 3 cannot drift
+apart) and additionally scans the whole tree's *content* against a private
+pattern list kept OUTSIDE the public tree (`scripts/public_leak_patterns.txt`
+— also on the exclude list, and separately hard-checked by the script: it
+would defeat the point to ship the very strings it exists to catch). The
+checker refuses to run its content check at all if that list is missing —
+fails closed, never a silent PASS — so a public checkout of the script can
+still verify paths but cannot claim to have done the content check. Both
+mechanisms are wired into the recipe below — run the leak check before every
+push, not just when you remember to.
+
 ```
 git fetch origin
 
 # 1. stage dev's tree, then remove what public main does not carry
 git read-tree --empty
 git read-tree <DEV-SHA>
-git rm --cached -q <scratch paths>        # currently: the dev-only scratch
-                                          # test files not on main — diff first,
-                                          # never guess this list
+git rm --cached -q $(cat scripts/public_exclude.txt | grep -v '^#' | grep -v '^$')
+                                          # scripts/public_exclude.txt is the ONE
+                                          # list of what must never ship (docs/STATE.md
+                                          # plus anything else added there) — it is
+                                          # also what public_leak_check.py verifies
+                                          # in step 3, so the two can't drift apart.
+                                          # If a release needs a ONE-OFF removal on
+                                          # top of that (a dev-only scratch test file
+                                          # not meant to become permanently excluded),
+                                          # `git rm --cached -q` it separately here —
+                                          # diff first, never guess that list.
 TREE=$(git write-tree)
 
 # 2. one snapshot commit, parented on public main
@@ -292,6 +316,9 @@ COMMIT=$(git commit-tree "$TREE" -p origin/main \
     -m "release(vX.Y.Z): <the release headline>")
 
 # 3. LEAK-VERIFY before pushing — this is the step that cannot be skipped
+python3 scripts/public_leak_check.py "$COMMIT"   # exit 0 = no excluded path,
+                                          # no banned private pattern, anywhere
+                                          # in the tree — MUST pass before continuing
 git diff --stat origin/main "$COMMIT"     # read EVERY path; expect only this
                                           # release's changes
 diff <(git ls-tree -r --name-only "$COMMIT" | sort) \

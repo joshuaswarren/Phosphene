@@ -1743,7 +1743,7 @@ class TestGeographyLaws(unittest.TestCase):
         warn = []
         spec = P._enforce_eyelines(
             self._spec({"character_id": "bizarrotrn", "eyeline": "right"},
-                       {"character_id": "ariatrn", "eyeline": "right"}), warn)
+                       {"character_id": "chartest_c", "eyeline": "right"}), warn)
         self.assertEqual(spec["shots"][1]["eyeline"], "left")
         self.assertIn("180-degree line", warn[0])
 
@@ -1751,7 +1751,7 @@ class TestGeographyLaws(unittest.TestCase):
         warn = []
         spec = P._enforce_eyelines(
             self._spec({"character_id": "bizarrotrn", "eyeline": "right"},
-                       {"character_id": "ariatrn", "eyeline": "left"}), warn)
+                       {"character_id": "chartest_c", "eyeline": "left"}), warn)
         self.assertEqual([s["eyeline"] for s in spec["shots"]], ["right", "left"])
         self.assertEqual(warn, [])
 
@@ -1766,7 +1766,7 @@ class TestGeographyLaws(unittest.TestCase):
     def test_a_cut_to_another_place_does_not_cross_the_line(self):
         warn = []
         spec = self._spec({"character_id": "bizarrotrn", "eyeline": "right"},
-                          {"character_id": "ariatrn", "eyeline": "right"})
+                          {"character_id": "chartest_c", "eyeline": "right"})
         spec["shots"][1]["location_id"] = "kitchen"
         P._enforce_eyelines(spec, warn)
         self.assertEqual(spec["shots"][1]["eyeline"], "right")
@@ -1818,16 +1818,16 @@ class TestGeographyLaws(unittest.TestCase):
     def test_both_laws_run_inside_plan_film(self):
         # A law that is only unit-tested is a law that can be left unwired.
         cast = [{"id": "bizarrotrn", "trigger": "bizarrotrn", "name": "Bizarro"},
-                {"id": "ariatrn", "trigger": "ariatrn", "name": "Aria"}]
+                {"id": "chartest_c", "trigger": "chartest_c", "name": "Chartest C"}]
         rows = [
             {"n": 1, "title": "A", "character_id": "bizarrotrn", "duration_s": 5,
              "camera": "static", "description": "bizarrotrn throws both arms wide and grins.",
              "settle": "he is still", "soundscape": "Hose water, no voices.",
              "music": "N/A", "location": "The car wash", "view": "establishing",
              "eyeline": "right"},
-            {"n": 2, "title": "B", "character_id": "ariatrn", "duration_s": 5,
+            {"n": 2, "title": "B", "character_id": "chartest_c", "duration_s": 5,
              "camera": "static",
-             "description": "ariatrn lifts the sponge from the car and shrugs.",
+             "description": "chartest_c lifts the sponge from the car and shrugs.",
              "settle": "she is still", "soundscape": "Hose water, no voices.",
              "music": "N/A", "location": "The car wash", "view": "reverse",
              "eyeline": "right"},
@@ -1838,7 +1838,7 @@ class TestGeographyLaws(unittest.TestCase):
         self.assertFalse(P.is_plan_error(spec), spec)
         self.assertEqual([s["eyeline"] for s in spec["shots"]], ["right", "left"])
         self.assertEqual(P._load_validator()[0](
-            spec, known_character_ids=["bizarrotrn", "ariatrn"]), [])
+            spec, known_character_ids=["bizarrotrn", "chartest_c"]), [])
         warns = spec["_planner"]["warnings"]
         self.assertTrue(any("180-degree line" in w for w in warns), warns)
         self.assertTrue(any("puts the car back in frame" in w for w in warns), warns)

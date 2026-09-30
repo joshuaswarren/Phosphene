@@ -2627,8 +2627,8 @@ async function trainInstall(key, onDone) {
 // Skip vowels + ambiguous letters (l, i, o → 1, 0). Mirrors the Python
 // _suggest_trigger_token; not a security boundary so the algorithms can
 // drift slightly — server has its own generator for non-JS callers.
-// Letters-only, `<3 consonants>trn` — the shape of every trigger that has
-// carried a face here (bizarrotrn, elontrn, ariatrn). The old `mrz07` shape
+// Letters-only, `<3 consonants>trn` — the shape of the earliest triggers
+// that carried a face here (e.g. bizarrotrn). The old `mrz07` shape
 // tokenizes to m / rz / 0 / 7: two single-digit tokens with a huge prior of
 // their own. Mirrors _suggest_trigger_token() server-side (#62).
 function trainGenerateTriggerJS() {

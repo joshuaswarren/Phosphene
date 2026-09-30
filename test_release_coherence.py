@@ -183,6 +183,93 @@ class ClaudeMdPinClaim(unittest.TestCase):
         )
 
 
+class ReleaseChecklistLeakGuard(unittest.TestCase):
+    """The promote ritual must cite the exclude list + leak-check gate by
+    name, not just describe read-tree/commit-tree in the abstract.
+
+    `docs/STATE.md` shipped on public `main` since the commit that added it
+    — beta and public were tree-identical the day this was found, so no
+    version of the promote recipe had ever actually curated what goes
+    public. `scripts/public_exclude.txt` (the removal list) and
+    `scripts/public_leak_check.py` (the verifier that reads the same list
+    plus a banned-content scan) exist to close that gap; this test keeps
+    the checklist from silently reverting to the old "trust the diff"
+    ritual with no named list or script backing it.
+    """
+
+    def test_public_exclude_list_and_leak_check_exist(self):
+        self.assertTrue(
+            os.path.isfile(os.path.join(REPO, "scripts", "public_exclude.txt")),
+            "scripts/public_exclude.txt is missing — it is the single "
+            "source of truth for what must never reach public main "
+            "(docs/STATE.md, at minimum).",
+        )
+        self.assertTrue(
+            os.path.isfile(os.path.join(REPO, "scripts", "public_leak_check.py")),
+            "scripts/public_leak_check.py is missing — the promote's "
+            "LEAK-VERIFY step has nothing to run.",
+        )
+
+    def test_checklist_references_exclude_list_and_leak_check(self):
+        checklist = _read("docs/RELEASE_CHECKLIST.md")
+        for token in ("scripts/public_exclude.txt", "scripts/public_leak_check.py"):
+            self.assertIn(
+                token,
+                checklist,
+                "docs/RELEASE_CHECKLIST.md's promote recipe no longer "
+                "names {!r} — a leak-verify step nobody can find by name "
+                "gets skipped the first time a promote is rushed."
+                .format(token),
+            )
+
+    def test_state_md_is_on_the_exclude_list(self):
+        exclude = _read("scripts/public_exclude.txt")
+        active = [
+            line.strip() for line in exclude.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        self.assertIn(
+            "docs/STATE.md",
+            active,
+            "docs/STATE.md fell off scripts/public_exclude.txt — it is the "
+            "internal dev/agent handoff doc and must never reach public main.",
+        )
+
+    def test_pattern_list_is_on_the_exclude_list(self):
+        # The content-check's pattern list necessarily spells out every
+        # string it detects, so shipping it publicly would republish exactly
+        # what it exists to catch — it must stay off every public snapshot,
+        # same as docs/STATE.md.
+        exclude = _read("scripts/public_exclude.txt")
+        active = [
+            line.strip() for line in exclude.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        self.assertIn(
+            "scripts/public_leak_patterns.txt",
+            active,
+            "scripts/public_leak_patterns.txt fell off "
+            "scripts/public_exclude.txt — the leak-check's pattern list "
+            "must never reach public main.",
+        )
+
+    def test_leak_check_has_no_hardcoded_patterns(self):
+        # The checker itself ships publicly. If a pattern list ever gets
+        # re-inlined into it directly (the mistake this test exists to
+        # catch — it happened once already), the script becomes its own
+        # leak the moment it's promoted, regardless of what the content
+        # scan finds elsewhere.
+        script = _read("scripts/public_leak_check.py")
+        self.assertNotIn(
+            "BANNED_PATTERNS",
+            script,
+            "scripts/public_leak_check.py defines BANNED_PATTERNS inline — "
+            "patterns must be loaded from the private pattern list "
+            "(scripts/public_leak_patterns.txt) at runtime, never hardcoded "
+            "in the script that ships publicly.",
+        )
+
+
 class ReleaseChecklistPromoteRitual(unittest.TestCase):
     """The checklist must never hand anyone the history-leaking branch push."""
 

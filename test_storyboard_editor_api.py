@@ -1176,7 +1176,7 @@ class GenerateIntoAGap(EditorCase):
 
     def test_an_uninstalled_character_is_refused_rather_than_rendering_a_stranger(self):
         with mock.patch.object(panel, "_sb_known_character_ids",
-                               return_value=["aria"]):
+                               return_value=["chartest_c"]):
             h = self.gen(character_id="ghost")
         self.assertEqual(h.status, 400)
         self.assertEqual(panel.STATE["queue"], [])
@@ -1186,24 +1186,24 @@ class GenerateIntoAGap(EditorCase):
 
     def test_an_INSTALLED_character_queues_with_its_face_lora_and_trigger(self):
         # Machine-independent: the character library is mocked, because a test
-        # that only passes on a Mac with `aria` trained is not a test.
-        face = self.root / "aria.safetensors"
+        # that only passes on a Mac with `chartest_c` trained is not a test.
+        face = self.root / "chartest_c.safetensors"
         face.write_bytes(b"lora")
-        rec = {"id": "aria", "trigger": "ariatrn",
+        rec = {"id": "chartest_c", "trigger": "chartest_c",
                "face_lora_path": str(face), "audio_lora_path": None}
         compat = {"ltx_compatible": True, "ltx_compat_reason": "",
                   "ltx_fusion_tally": None}
         with mock.patch.object(panel, "_sb_known_character_ids",
-                               return_value=["aria"]), \
+                               return_value=["chartest_c"]), \
              mock.patch.object(panel, "list_characters", return_value=[rec]), \
              mock.patch.object(panel, "_ltx_lora_compatibility",
                                return_value=compat):
-            h = self.gen(character_id="aria", trigger="ariatrn",
-                         prompt="ariatrn walks through the gate")
+            h = self.gen(character_id="chartest_c", trigger="chartest_c",
+                         prompt="chartest_c walks through the gate")
         self.assertEqual(h.status, 202)
         p = panel.STATE["queue"][0]["params"]
-        self.assertEqual(p["character_id"], "aria")
-        self.assertIn("ariatrn", p["prompt"])       # the trigger, mechanically
+        self.assertEqual(p["character_id"], "chartest_c")
+        self.assertIn("chartest_c", p["prompt"])       # the trigger, mechanically
         self.assertTrue(p["loras"])                 # the face actually loads
         # The pass quality was translated into the character vocabulary on the
         # way through, or this request would have been refused outright.
@@ -3683,10 +3683,10 @@ class LinkingFreezesTheOffset(unittest.TestCase):
         self.assertNotIn("audio", plain_mine)
 
 
-ENDCARD = Path("/Users/salo/pinokio/api/phosphene-dev.git/mlx_outputs/"
-               "endcard_phosphene_46_overlay_A.png")
-PULLOUT = Path("/Users/salo/pinokio/api/phosphene-dev.git/mlx_outputs/"
-               "h3_pullout_ending_turbo_aria.mp4")
+ENDCARD = (Path.home() / "pinokio/api/phosphene-dev.git/mlx_outputs/"
+           "endcard_phosphene_46_overlay_A.png")
+PULLOUT = (Path.home() / "pinokio/api/phosphene-dev.git/mlx_outputs/"
+           "h3_pullout_ending_turbo_chartest_c.mp4")
 
 
 class TheSoundsEnvelope(unittest.TestCase):
@@ -4330,9 +4330,9 @@ class AHoleShorterThanAFrame(unittest.TestCase):
 # runs on a fresh install and so the population the detector must refuse is
 # visible in the test rather than implied by it. The real reported card is
 # asserted too, when it happens to be present.
-PLATE_CARD = Path("/Users/salo/pinokio/api/phosphene-dev.git/panel_uploads/"
-                  "library/manual/20260820/uploads/"
-                  "1787241298782_ChatGPT_Image_Aug_20_2026_06_54_48_PM.png")
+PLATE_CARD = (Path.home() / "pinokio/api/phosphene-dev.git/panel_uploads/"
+              "library/manual/20260820/uploads/"
+              "1787241298782_ChatGPT_Image_Aug_20_2026_06_54_48_PM.png")
 
 
 def _burst(h, w):

@@ -355,8 +355,8 @@ class ValidatorSplit(unittest.TestCase):
         yield "bad_mode", _board([_shot(1, mode="montage")]), {}
         yield "empty_prompt", _board([_shot(1, prompt="  ")]), {}
         yield ("unknown_char",
-               _board([_shot(1, character_id="ariatrn", trigger="ariatrn",
-                             prompt="ariatrn walks")]),
+               _board([_shot(1, character_id="chartest_c", trigger="chartest_c",
+                             prompt="chartest_c walks")]),
                {"known_character_ids": ["bizarrotrn"]})
         yield ("missing_trigger",
                _board([_shot(1, character_id="bizarrotrn", trigger="bizarrotrn")]),
@@ -440,8 +440,8 @@ class ValidatorSplit(unittest.TestCase):
 
     def test_unknown_character_carries_the_installed_list(self):
         errs = sb.validate_storyboard_detail(
-            _board([_shot(1, character_id="ariatrn", trigger="ariatrn",
-                          prompt="ariatrn walks")]),
+            _board([_shot(1, character_id="chartest_c", trigger="chartest_c",
+                          prompt="chartest_c walks")]),
             known_character_ids=["bizarrotrn"])
         self.assertEqual(errs[0]["data"]["have"], ["bizarrotrn"])
 
@@ -552,7 +552,7 @@ class DialogueFitsTheShot(unittest.TestCase):
 
     def test_a_silent_shot_has_no_pacing_problem(self):
         self.assertIsNone(sb.shot_pacing_problem(
-            "ariatrn scrubs the door with a foam-loaded sponge", 4.04))
+            "chartest_c scrubs the door with a foam-loaded sponge", 4.04))
 
     def test_contractions_do_not_end_the_count_early(self):
         # A quote flanked by letters is an apostrophe, not the end of the
@@ -675,7 +675,7 @@ class TrainedVoiceActuallyLoads(unittest.TestCase):
     def test_a_silent_shot_still_leaves_the_voice_off(self):
         # The other half of the contract: a voice LoRA loaded onto a shot with
         # nothing to say is the babble this gate exists to prevent.
-        j = self._job("ariatrn a woman scrubs the door with a foam-loaded sponge")
+        j = self._job("chartest_c a woman scrubs the door with a foam-loaded sponge")
         self.assertEqual(j["no_voice"], "on")
 
     def test_an_empty_tag_is_not_a_line(self):
@@ -686,7 +686,7 @@ class TrainedVoiceActuallyLoads(unittest.TestCase):
         # nothing to say, or a line delivered by a stranger's voice.
         for p in ("bizarrotrn says: 'Ship it.'",
                   "A man says: <d>[English] Ship it.</d>",
-                  "ariatrn scrubs the door in silence"):
+                  "chartest_c scrubs the door in silence"):
             speaks_law = sb.shot_speech_problem(p) is None and bool(
                 sb._SPOKEN_WORDS_RE.search(p))
             speaks_gate = self._job(p)["no_voice"] == "off"
@@ -736,7 +736,7 @@ class Wardrobe(unittest.TestCase):
     def test_it_only_applies_to_the_character_it_belongs_to(self):
         w = sb.board_wardrobe({"cast": self.CAST})
         got = sb.compose_shot_prompt(
-            {"n": 1, "character_id": "ariatrn", "trigger": "ariatrn",
+            {"n": 1, "character_id": "chartest_c", "trigger": "chartest_c",
              "prompt": "a woman washes a car"}, {}, w)
         self.assertNotIn("Hawaiian", got)
 
@@ -801,17 +801,17 @@ class SpeechLawAtBoardLevel(unittest.TestCase):
     the second gibberish clip, and the GOOD ones from the board that fixed it.
     """
     BAD = ("bizarrotrn a man in a dark navy suit sits upright and addresses the camera",
-           "ariatrn a woman pushes her wet hair back and announces something to the lens",
+           "chartest_c a woman pushes her wet hair back and announces something to the lens",
            "bizarrotrn a man asks a dry follow-up question",
            "a weary man explains the situation to the room")
 
     GOOD = ("bizarrotrn announces in a big brassy showman's voice: "
             "'Ladies and gentlemen — version four point six.'",
-            "ariatrn says brightly and clearly: 'Update the app. "
+            "chartest_c says brightly and clearly: 'Update the app. "
             "There is a timeline editor now.'",
             "A man on a dune ridge says: <d>[English] They said this was impossible.</d>")
 
-    SILENT = ("ariatrn scrubs slow circles across the door with a foam-loaded sponge",
+    SILENT = ("chartest_c scrubs slow circles across the door with a foam-loaded sponge",
               "Tight on a sponge pressed against the panel, foam bulging and water running",
               "bizarrotrn walks to the window and looks out at the rain without a word")
 
@@ -1088,7 +1088,7 @@ class LocationViews(unittest.TestCase):
             self._shot("establishing", eyeline="right", pronoun="he"), self.LOCS)
         her = sb.compose_shot_prompt(
             dict(self._shot("reverse", eyeline="left", pronoun="she"),
-                 trigger="ariatrn", prompt="keeps scrubbing"), self.LOCS)
+                 trigger="chartest_c", prompt="keeps scrubbing"), self.LOCS)
         self.assertIn("his eyes fixed past the right edge of frame", him)
         self.assertIn("her eyes fixed past the left edge of frame", her)
         self.assertEqual(sb.eyeline_complement("right"), "left")

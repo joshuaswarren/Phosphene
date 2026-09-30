@@ -66,8 +66,8 @@ Add a job to the panel's queue. Returns immediately; the helper renders it async
 
 ```json
 [
-  {"path": "<panel-root>/mlx_models/loras/ariatrn_v2.safetensors", "strength": 1.0},
-  {"path": "<panel-root>/mlx_models/loras/ariatrn.audio.safetensors", "strength": 1.0}
+  {"path": "<panel-root>/mlx_models/loras/chartest_c_v2.safetensors", "strength": 1.0},
+  {"path": "<panel-root>/mlx_models/loras/chartest_c.audio.safetensors", "strength": 1.0}
 ]
 ```
 
