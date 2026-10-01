@@ -288,6 +288,24 @@ def post_music_install(h, path, qs, ctype) -> None:
     h._json(payload, code); return
 
 
+@get("/a2v/separator")
+def get_a2v_separator(h, parsed) -> None:
+    # "Listen to the voice only": can this install separate a vocal, and is
+    # an install running? File checks only - cheap enough to poll.
+    h._json(P.a2v_separator_status()); return
+
+
+@post("/a2v/separator/install")
+def post_a2v_separator_install(h, path, qs, ctype) -> None:
+    # The Lip-sync form's "Install vocal separation" button. Runs the same
+    # scripts/pinokio/a2v_stems_deps.sh that install.js and Update run.
+    _rb = h._read_form_body()
+    if _rb is None:
+        return
+    code, payload = P.a2v_separator_install_start()
+    h._json(payload, code); return
+
+
 @post("/music/cover/install")
 def post_music_cover_install(h, path, qs, ctype) -> None:
     # The opt-in ~2.8 GB that lets YuE2 read a score off a real recording.

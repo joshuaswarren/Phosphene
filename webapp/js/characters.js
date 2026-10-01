@@ -516,6 +516,7 @@ function audioStudioInit() {
   const _acsEl = document.getElementById('audioConditioningScale');
   if (!_acsEl || _acsEl.dataset.auto) audioConditioningScaleReset();
   audioStudioRenderLoraNote();
+  audioStudioRefreshSeparator();
   audioStudioApplyTierClamp();
   // VA-06: seed the price on every visit (not just after a slider drag) so
   // the estimate is on screen before Generate is ever pressed.
@@ -572,7 +573,93 @@ function audioStudioRenderLoraNote() {
     + ' from the Video tab will be applied here too: <b>' + names + '</b> — '
     + '<a href="#" onclick="event.preventDefault();workflowSwitch(\'manual\');'
     + 'var d=document.getElementById(\'lorasDetails\');if(d)d.open=true;'
-    + 'd&&d.scrollIntoView({block:\'start\'});">change</a>';
+    + 'd&&d.scrollIntoView({block:\'start\'});">change</a>'
+    + '<br>' + a2vLoraStageLine(window.PHOSPHENE_CAP_TIER === 'q4');
+}
+// Keep the face, free the mouth (lip-sync quality, 4.17.x): a face LoRA at
+// full strength mutes the singer, so on the Q8 lane Lip-sync leaves the LoRA
+// out while the performance is shaped and uses it for the face detail. The Q4
+// lane has no such seam — say that plainly instead.
+function a2vLoraStageLine(isQ4) {
+  return isQ4
+    ? 'On this Mac a LoRA shapes the whole lip-sync render, which can make the mouth move less \u2014 lower its strength if the mouth barely moves.'
+    : 'Lip-sync uses LoRAs for the face detail only, so they keep the likeness without stiffening the mouth.';
+}
+
+// VOCAL SEPARATION — "Listen to the voice only" needs it, and until 4.17 a
+// missing separator quietly rendered the FULL MIX (one line in the job log).
+// Install and Update put it in place now; this line says so when it is not,
+// and offers the same install from right here. PURE text builder so it is
+// tested by executing it.
+const A2V_SEPARATOR = { ready: null, timer: null };
+function audioStudioSeparatorNote(s, wantsStem) {
+  if (!s) return '';
+  const inst = s.install || {};
+  if (inst.active) {
+    const last = (inst.log || []).slice(-1)[0] || 'starting';
+    return '<b>Installing vocal separation\u2026</b> <span class="hint">' + escapeHtml(last) + '</span>';
+  }
+  // 4.17.3 review: the package can install while the 80 MB voice model fails
+  // to download (a network drop) - status then says ready:true, weights:false,
+  // install failed. The ready branch below used to swallow that failure and
+  // its Try again; say it, since the first render would stop to fetch it.
+  if (s.ready && s.weights === false && inst.state === 'failed' && wantsStem) {
+    return '<b>The voice model did not download:</b> ' + escapeHtml(inst.error || 'unknown error')
+      + ' <button type="button" class="ghost-btn" onclick="audioStudioInstallSeparator()">Try again</button>'
+      + ' <span class="hint">or leave it: the first voice-only render downloads it (about 80 MB).</span>';
+  }
+  if (s.ready) {
+    return inst.state === 'done' ? '<b>Vocal separation is installed.</b> The model will listen to the voice only.' : '';
+  }
+  if (!wantsStem) return '';
+  if (inst.state === 'failed') {
+    return '<b>Vocal separation did not install:</b> ' + escapeHtml(inst.error || 'unknown error')
+      + ' <button type="button" class="ghost-btn" onclick="audioStudioInstallSeparator()">Try again</button>'
+      + ' <span class="hint">or untick \u201cListen to the voice only\u201d to use the full mix.</span>';
+  }
+  return '<b>Vocal separation is not installed on this Mac yet</b>, so \u201cListen to the voice only\u201d cannot run. '
+    + '<button type="button" class="ghost-btn" onclick="audioStudioInstallSeparator()">Install it (about 90 MB, once)</button>'
+    + ' <span class="hint">or untick the box to render against the full mix.</span>';
+}
+function audioStudioRenderSeparator(s) {
+  if (s) A2V_SEPARATOR.last = s;
+  s = A2V_SEPARATOR.last;
+  const el = document.getElementById('audioStudioStemStatus');
+  if (!el) return;
+  const box = document.getElementById('audioStudioStemAuto');
+  const html = audioStudioSeparatorNote(s, !!(box && box.checked));
+  el.innerHTML = html;
+  el.style.display = html ? '' : 'none';
+}
+async function audioStudioRefreshSeparator() {
+  try {
+    const r = await fetch('/a2v/separator');
+    const s = await r.json();
+    A2V_SEPARATOR.ready = !!s.ready;
+    audioStudioRenderSeparator(s);
+    clearTimeout(A2V_SEPARATOR.timer);
+    if (s.install && s.install.active) {
+      A2V_SEPARATOR.timer = setTimeout(audioStudioRefreshSeparator, 1500);
+    }
+  } catch (e) { /* the form still works; the server refuses with the same words */ }
+}
+async function audioStudioInstallSeparator() {
+  try {
+    const r = await fetch('/a2v/separator/install', { method: 'POST', body: new URLSearchParams({}) });
+    const res = await r.json().catch(() => ({}));
+    if (!r.ok && !res.install) throw new Error(res.error || ('HTTP ' + r.status));
+  } catch (e) {
+    if (typeof phosToast === 'function') phosToast('Could not start the install: ' + (e.message || e), { kind: 'danger' });
+  }
+  audioStudioRefreshSeparator();
+}
+// The words the server answers a refused a2v submit with, or the raw text.
+function audioStudioSubmitError(status, txt) {
+  try {
+    const j = JSON.parse(txt);
+    if (j && j.error) return j.error;
+  } catch (e) { /* not JSON */ }
+  return 'HTTP ' + status + ' ' + txt;
 }
 
 async function audioStudioUploadAudio(file) {
@@ -1336,6 +1423,15 @@ async function audioStudioGenerate(opts) {
     return;
   }
 
+  // "Listen to the voice only" on a Mac without the separator: say so and
+  // offer the install instead of queueing a render the server refuses.
+  const _stemBox = document.getElementById('audioStudioStemAuto');
+  if (_stemBox && _stemBox.checked && A2V_SEPARATOR.ready === false) {
+    audioStudioRenderSeparator();
+    if (status) status.textContent = 'Install vocal separation first (just above), or untick \u201cListen to the voice only\u201d.';
+    return;
+  }
+
   AUDIO_STUDIO.busy = true;
   if (btn) btn.disabled = true;
   if (status) status.textContent = 'Queueing…';
@@ -1379,7 +1475,11 @@ async function audioStudioGenerate(opts) {
     const r = await fetch('/queue/add', { method: 'POST', body: fd });
     if (!r.ok) {
       const txt = await r.text();
-      throw new Error('HTTP ' + r.status + ' ' + txt);
+      if (r.status === 400 && txt.indexOf('vocal_separator_missing') >= 0) {
+        A2V_SEPARATOR.ready = false;
+        audioStudioRefreshSeparator();
+      }
+      throw new Error(audioStudioSubmitError(r.status, txt));
     }
     if (status) {
       status.textContent = draft
@@ -4451,4 +4551,7 @@ Object.assign(globalThis, {
   openLipSyncEntry, audioStudioRenderLoraNote,
   audioStudioPromptCheck, audioStudioPromptApplyFix, audioStudioMouthCheck,
   audioStudioSplitIntoClips, audioStudioSplitCancel,
+  // Vocal separation: the checkbox's onchange and the generated Install /
+  // Try again buttons resolve through the global scope.
+  audioStudioRenderSeparator, audioStudioInstallSeparator, audioStudioRefreshSeparator,
 });

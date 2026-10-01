@@ -2847,6 +2847,57 @@ function _redactLocalPaths(text) {
     .replace(/\/Users\/[^\s)]+/g, '(see Logs)')
     .replace(/\s{2,}/g, ' ').trim();
 }
+// 4.17.3: reopen a failed job's own recipe in its form (the Now card's
+// "Open in Lip-sync to split"). By job id from the last /status, so it is the
+// refused job's song and picture, not whatever the form holds by now.
+function openFailedJobInForm(jobId) {
+  const hist = (globalThis.LAST_STATUS && globalThis.LAST_STATUS.history) || [];
+  const job = hist.find(j => j && String(j.id) === String(jobId));
+  if (!job || !job.params) return false;
+  loadParams({ params: job.params });
+  return true;
+}
+// 4.17.3 (fleet): the failed Now card's action row, as a pure function so a
+// test can run it. A REFUSAL is the panel saying no on purpose, and for the
+// hardware tier it says no to the same job every time — but the card offered
+// "Retry", which re-queued the identical job: one 16 GB Mac pressed it ten
+// times in ten minutes on a Lip-sync clip past its length cap, refused each
+// time. Retry is now withheld for hardware-tier refusals (the hint says what
+// to change), and the Lip-sync length refusal offers the one action that
+// renders the song on that Mac: Split into clips.
+function nowCardFailureActions(last, info) {
+  const action = info && info.action;
+  const smaller = info && info.smaller;
+  const splitSec = info && info.splitSec;
+  const refusedTier = !!(last && last.refused_reason === 'hardware_tier');
+  const dismiss = `<button type="button" class="now-card-dismiss" data-action="dismiss" ` +
+    `title="Dismiss this failure" aria-label="Dismiss this failure">` +
+    `<svg class="ph" aria-hidden="true"><use href="#ph-x-bold"/></svg></button>`;
+  if (action === 'split' && splitSec) {
+    return `<button type="button" class="now-card-retry" data-action="split" data-sec="${Number(splitSec)}" ` +
+      `title="Reopen this clip in Lip-sync, where Split into ${Number(splitSec)} s clips renders the whole song">` +
+      `<svg class="ph" aria-hidden="true"><use href="#ph-arrow-clockwise"/></svg>` +
+      `<span>Open in Lip-sync to split</span></button>` + dismiss;
+  }
+  if (refusedTier && action !== 'models') return dismiss;
+  return (action === 'models'
+            ? `<button type="button" class="now-card-retry" onclick="openModelsModal()" ` +
+              `title="A retry can't fix a missing file — finish the download instead">` +
+              `<svg class="ph" aria-hidden="true"><use href="#ph-download-simple"/></svg>` +
+              `<span>Open Models</span></button>`
+          : smaller
+            ? `<button type="button" class="now-card-retry" data-action="retry-smaller" ` +
+              `title="Try again smaller — one quality rung down, a smaller canvas and about half the length">` +
+              `<svg class="ph" aria-hidden="true"><use href="#ph-arrow-clockwise"/></svg>` +
+              `<span>Retry smaller</span></button>` +
+              `<button type="button" class="now-card-retry" data-action="retry" ` +
+              `title="Re-submit this job with the same params, unchanged">` +
+              `<span>Retry as is</span></button>`
+            : `<button type="button" class="now-card-retry" data-action="retry" ` +
+              `title="Re-submit this job with the same params">` +
+              `<svg class="ph" aria-hidden="true"><use href="#ph-arrow-clockwise"/></svg>` +
+              `<span>Retry</span></button>`) + dismiss;
+}
 function friendlyJobError(raw, engine) {
   raw = raw || 'unknown error';
   if (/music engine isn't installed|YuE2 needs about|YuE2 weights.*repair/i.test(raw)) {
@@ -2941,6 +2992,23 @@ function friendlyJobError(raw, engine) {
   // The RuntimeError text itself is deliberately unchanged upstream: it is what
   // the log carries and what a bug report quotes. This translates it, it does
   // not replace it.
+  // 4.17.3 (fleet): a damaged SMALL file beside intact weights — an empty or
+  // cut-off config / tokenizer / index — surfaced as engine text that named
+  // nothing ("Expecting value: line 1 column 1 (char 0)", "Received 1
+  // parameters not in model", "Invalid json header length", "No usable
+  // tokenizer beside the text encoder"). One fresh install failed five renders
+  // in a row on these before a re-download fixed it. Retry repeats the same
+  // failure; Repair re-downloads only the broken files, so that is the action.
+  if (/invalid json header length|expecting value: line 1 column 1 \(char 0\)|parameters not in model|no usable tokenizer beside the text encoder/i.test(raw)) {
+    return {
+      friendly: 'A model file on this Mac is damaged.',
+      hint: 'Usually an interrupted download. Press Repair in the red bar at the '
+          + 'top of the panel: it re-downloads only the broken files. Retrying as '
+          + 'is fails the same way.',
+      details: _redactLocalPaths(raw) || raw,
+      action: 'models',
+    };
+  }
   if (/model is\s+incomplete\. Missing/i.test(raw)) {
     const m = /Missing \d+ file\(s\) in [^:]+: ([^.]+)\./.exec(raw);
     return {
@@ -2966,6 +3034,22 @@ function friendlyJobError(raw, engine) {
   // one of two things verbatim, so match those instead of a bare
   // substring: "(the Q8 model)" when the pack isn't downloaded, or
   // "… hardware tier —" when the Mac can't run it at all.
+  // 4.17.3: the Lip-sync length cap on a Compact Mac (a2v_length_refusal
+  // server-side). It fell through to the generic "Job failed." with a Retry
+  // that is refused again, every time. Name it and offer Split instead.
+  const a2vCap = /Audio → Video is limited to (\d+) s per clip/i.exec(raw);
+  if (a2vCap) {
+    const sec = parseInt(a2vCap[1], 10);
+    return {
+      friendly: 'Too long for one Lip-sync clip on this Mac.',
+      hint: 'This Mac renders Lip-sync up to ' + sec + ' s per clip. Open it in '
+          + 'Lip-sync and use Split into ' + sec + ' s clips: it renders the whole '
+          + 'song as a sequence, each part starting where the last one’s mouth '
+          + 'closed. Or shorten Duration.',
+      action: 'split',
+      splitSec: sec,
+    };
+  }
   if (/\(the q8 model\)|hardware tier\s*—/i.test(raw)) {
     return { friendly: 'This mode needs the Q8 model.', hint: raw };
   }
@@ -3548,7 +3632,7 @@ async function poll() {
       // killed by the OS for using too much RAM and we never get an
       // event back. Tell the user how to recover instead of leaving them
       // with the engine wording.
-      const { friendly, hint, smaller, details, action, docsAnchor } = friendlyJobError(last.error || 'unknown error',
+      const { friendly, hint, smaller, details, action, docsAnchor, splitSec } = friendlyJobError(last.error || 'unknown error',
         last.params && last.params.engine);
       nowCard.querySelector('.ttl').innerHTML =
         `<span style="color: var(--danger, #f85149)"><svg class="ph" aria-hidden="true" style="margin-right:4px;vertical-align:-2px"><use href="#ph-warning-fill"/></svg>${escapeHtml(friendly)}</span>`;
@@ -3585,27 +3669,7 @@ async function poll() {
         // canvas is what actually frees memory, a quality step alone keeps
         // the stored width/height) and "Retry as is" for the user who wants
         // to try unchanged (a closed Chrome tab, a swap install).
-        actionsEl.innerHTML =
-          (action === 'models'
-            ? `<button type="button" class="now-card-retry" onclick="openModelsModal()" ` +
-              `title="A retry can't fix a missing file — finish the download instead">` +
-              `<svg class="ph" aria-hidden="true"><use href="#ph-download-simple"/></svg>` +
-              `<span>Open Models</span></button>`
-          : smaller
-            ? `<button type="button" class="now-card-retry" data-action="retry-smaller" ` +
-              `title="Try again smaller — one quality rung down, a smaller canvas and about half the length">` +
-              `<svg class="ph" aria-hidden="true"><use href="#ph-arrow-clockwise"/></svg>` +
-              `<span>Retry smaller</span></button>` +
-              `<button type="button" class="now-card-retry" data-action="retry" ` +
-              `title="Re-submit this job with the same params, unchanged">` +
-              `<span>Retry as is</span></button>`
-            : `<button type="button" class="now-card-retry" data-action="retry" ` +
-              `title="Re-submit this job with the same params">` +
-              `<svg class="ph" aria-hidden="true"><use href="#ph-arrow-clockwise"/></svg>` +
-              `<span>Retry</span></button>`) +
-          `<button type="button" class="now-card-dismiss" data-action="dismiss" ` +
-          `title="Dismiss this failure" aria-label="Dismiss this failure">` +
-          `<svg class="ph" aria-hidden="true"><use href="#ph-x-bold"/></svg></button>`;
+        actionsEl.innerHTML = nowCardFailureActions(last, { action, smaller, splitSec });
       }
     } else if (last && last.status === 'stopped' && !s.queue.length
                && last.id !== window._dismissedFailureId) {
@@ -8028,6 +8092,7 @@ function draftAutosaveInstall() {
 // Inline handlers in the markup and the other files resolve these through
 // the global scope; everything NOT listed here is private to this module.
 Object.assign(globalThis, {
+  openFailedJobInForm,
   notifyJobsDone, notifyOneJob, playDoneChime,
   h3FinishSetTier, h3FinishActive, setEngine, _syncEnginePromptTools,
   ltxFinishSetTier, ltxFinishActive, _syncFinishAffordance,

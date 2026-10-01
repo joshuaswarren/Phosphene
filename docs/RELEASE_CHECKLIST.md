@@ -298,17 +298,24 @@ git fetch origin
 # 1. stage dev's tree, then remove what public main does not carry
 git read-tree --empty
 git read-tree <DEV-SHA>
-git rm --cached -q $(cat scripts/public_exclude.txt | grep -v '^#' | grep -v '^$')
-                                          # scripts/public_exclude.txt is the ONE
-                                          # list of what must never ship (docs/STATE.md
-                                          # plus anything else added there) — it is
-                                          # also what public_leak_check.py verifies
-                                          # in step 3, so the two can't drift apart.
-                                          # If a release needs a ONE-OFF removal on
-                                          # top of that (a dev-only scratch test file
-                                          # not meant to become permanently excluded),
-                                          # `git rm --cached -q` it separately here —
-                                          # diff first, never guess that list.
+# scripts/public_exclude.txt is the ONE list of what must never ship
+# (docs/STATE.md, the leak-check's own pattern list, plus anything else
+# added there) — it is also what public_leak_check.py verifies in step 3,
+# so the two can't drift apart. A while-read loop, not a command
+# substitution splatted into `git rm --cached`: under zsh, unquoted
+# command substitution does NOT word-split on the newline between paths
+# (bash does), so `git rm --cached -q $(cat ...)` silently hands the
+# WHOLE multi-line list to git as one bad pathspec and removes nothing —
+# bitten once already building v4.17.2's snapshot, caught only because
+# the leak-check then reported the paths still present.
+while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    case "$p" in \#*) continue ;; esac
+    git rm --cached -q -- "$p"
+done < scripts/public_exclude.txt
+# If a release needs a ONE-OFF removal on top of that (a dev-only scratch
+# test file not meant to become permanently excluded), `git rm --cached -q`
+# it separately here — diff first, never guess that list.
 TREE=$(git write-tree)
 
 # 2. one snapshot commit, parented on public main

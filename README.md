@@ -19,7 +19,7 @@
 
 </p>
 
-> **Current release: v4.17.2.** **Housekeeping: internal notes and example paths removed from the public repo.** No behavior change — this release cleans development notes and machine-specific example paths out of the public tree. 4.17.1: the clip toolbar now fits the player at a laptop-sized window instead of wrapping over the clip name. 4.17.0 was the big one: estimates for your Mac, faces kept in portrait and phone photos, Undo on Stop/Clear/Hide, Lip-sync as a Video mode, and an Editor with Sync to song, Match colour, slip and roll edits, Replace and versioned renders. Press Update in Pinokio, then restart. Full notes on the [releases page](https://github.com/mrbizarro/Phosphene/releases).
+> **Current release: v4.17.3.** **Lip-sync that follows the voice, and errors that say what to do.** Lip-sync now separates the singing voice from the music for everyone (Update installs it), and a character LoRA no longer stops the mouth moving. Time estimates for your Mac are fixed where they mixed in much bigger Macs, and refreshed from the newest renders. A seed pasted from another app no longer fails the render, a damaged model file is caught and offered a one-click Repair, and a crash or a refusal says what happened and what to do instead of offering a Retry that cannot work. 4.17.0 was the big one: estimates for your Mac, faces kept in portrait and phone photos, Undo on Stop/Clear/Hide, Lip-sync as a Video mode, and an Editor with Sync to song, Match colour, slip and roll edits, Replace and versioned renders. Press Update in Pinokio, then restart. Full notes on the [releases page](https://github.com/mrbizarro/Phosphene/releases).
 
 ## Overview
 

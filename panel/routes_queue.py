@@ -742,6 +742,11 @@ def post_run(h, path, qs, ctype) -> None:
     refusal = P.extend_face_fix_refusal(job["params"])
     if refusal:
         h._json({"error": refusal, "code": "pack_missing"}, 400); return
+    # "Listen to the voice only" on an install that cannot separate a voice:
+    # refused NOW with an install offer, never rendered on the full mix.
+    refusal = P.a2v_stem_refusal(job["params"])
+    if refusal:
+        h._json({"error": refusal, "code": "vocal_separator_missing"}, 400); return
     with P.QUEUE_COND:
         P.STATE["queue"].append(job)
         P.QUEUE_COND.notify_all()

@@ -62,7 +62,7 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) poll
 // click that landed mid-rewrite could be lost. A single delegated
 // listener on document survives every rewrite + costs nothing.
 document.addEventListener('click', (e) => {
-  const btn = e.target.closest('[data-action="retry"], [data-action="retry-smaller"], [data-action="dismiss"], [data-action="stop-early"], [data-action="resume"]');
+  const btn = e.target.closest('[data-action="retry"], [data-action="retry-smaller"], [data-action="dismiss"], [data-action="stop-early"], [data-action="resume"], [data-action="split"]');
   if (!btn) return;
   e.stopPropagation();
   e.preventDefault();
@@ -74,7 +74,13 @@ document.addEventListener('click', (e) => {
   const actions = btn.closest('.now-card-actions');
   const id = actions ? actions.dataset.jobId : '';
   if (!id) return;
-  if (btn.dataset.action === 'retry') {
+  if (btn.dataset.action === 'split') {
+    // 4.17.3: a Lip-sync clip refused for its length on a Compact Mac. Reopen
+    // THAT job (its song, start, picture, settings) in the Lip-sync form —
+    // never whatever the form holds now — where the length note offers
+    // "Split into N s clips" against the job's own audio.
+    if (typeof openFailedJobInForm === 'function') openFailedJobInForm(id);
+  } else if (btn.dataset.action === 'retry') {
     if (typeof retryJob === 'function') retryJob(id);
   } else if (btn.dataset.action === 'retry-smaller') {
     // SYS-07 / VC-08: "Retry smaller" for the GPU-watchdog / OOM failure

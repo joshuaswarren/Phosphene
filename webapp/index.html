@@ -4033,12 +4033,16 @@ The last line"></textarea>
                  hedged, constant motion; a separated vocal doubled how much
                  a measured clip's mouth moved. The manual form never
                  exposed a control for it. Default ON: a song is the common
-                 case this helps, and it degrades to the full mix (with a
-                 log note) rather than failing when demucs isn't installed. -->
+                 case this helps. Install and Update put the separator in
+                 place; if it is missing the render is refused with an
+                 install offer, never quietly run on the full mix. -->
             <label class="mf-cell" style="margin-top:8px;display:flex;align-items:center;gap:8px;cursor:pointer;">
-              <input type="checkbox" id="audioStudioStemAuto" checked style="width:auto;margin:0;">
-              <span>Listen to the voice only <span class="hint" style="font-weight:normal">(separates the singer from the band before the model listens — the finished clip still plays the full mix; adds ~1-2 min once per song, falls back to the full mix if unavailable)</span></span>
+              <input type="checkbox" id="audioStudioStemAuto" checked style="width:auto;margin:0;" onchange="audioStudioRenderSeparator()">
+              <span>Listen to the voice only <span class="hint" style="font-weight:normal">(separates the singer from the band before the model listens — the finished clip still plays the full mix; about 20 s once per song)</span></span>
             </label>
+            <!-- Never a silent fallback: when vocal separation is missing the
+                 form says so here and offers the install (/a2v/separator). -->
+            <div class="music-pack-note" id="audioStudioStemStatus" role="status" style="margin-top:6px;display:none"></div>
             <div class="mf-cell" style="margin-top:8px">
               <span class="mf-label">Duration</span>
               <div class="range-strip">

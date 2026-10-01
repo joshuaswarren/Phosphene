@@ -735,7 +735,10 @@ class TestEventSchemas(AnalyticsTestCase):
                           # v4.9: the stale-vendored-engine gate (a 2.5 render
                           # on an engine predating the Gemma 4 tower is
                           # refused with the two-Update-clicks remedy).
-                          "stale_engine"])
+                          "stale_engine",
+                          # 4.17.x: Lip-sync "Listen to the voice only" on an
+                          # install without vocal separation (install prompt).
+                          "vocal_separator"])
         self.assertEqual(len(set(P._ANALYTICS_REFUSAL_SLUGS)),
                          len(P._ANALYTICS_REFUSAL_SLUGS))
         # `refused` is a real member of the closed error taxonomy, and its
@@ -1150,7 +1153,7 @@ class TestUsageReport(AnalyticsTestCase):
         ])
         r = P._usage_local_report()
         self.assertEqual(r["source"], "local")
-        self.assertEqual(r["tiles"]["renders_7d"], 3)
+        self.assertEqual(r["tiles"]["renders_in_range"], 3)
         self.assertAlmostEqual(r["tiles"]["h3_share_pct"], 33.3, places=1)
         self.assertAlmostEqual(r["tiles"]["error_rate_pct"], 33.3, places=1)
         self.assertEqual(r["top_errors"], [{"signature": "OOM during decode", "count": 1}])
@@ -1161,7 +1164,7 @@ class TestUsageReport(AnalyticsTestCase):
     def test_refusals_are_outside_every_render_number(self):
         """The whole point, expressed as arithmetic. Two completed, one
         failed, three refused: the error rate is 1-in-3, not 1-in-6, and
-        `renders_7d` is 3, not 6. Getting this wrong is what made the
+        `renders_in_range` is 3, not 6. Getting this wrong is what made the
         published failure rate wrong in the first place."""
         now = time.time()
         self.seed([
@@ -1179,12 +1182,12 @@ class TestUsageReport(AnalyticsTestCase):
              "props": {"engine": "h3", "refusal": "h3_ram"}},
         ])
         r = P._usage_local_report()
-        self.assertEqual(r["tiles"]["renders_7d"], 3)
+        self.assertEqual(r["tiles"]["renders_in_range"], 3)
         self.assertAlmostEqual(r["tiles"]["error_rate_pct"], 33.3, places=1)
         # Not in the engine mix either — no engine ran.
         self.assertAlmostEqual(r["tiles"]["h3_share_pct"], 33.3, places=1)
         # Counted, loudly, in their own place.
-        self.assertEqual(r["tiles"]["refusals_7d"], 3)
+        self.assertEqual(r["tiles"]["refusals_in_range"], 3)
         self.assertEqual(r["top_refusals"], [
             {"refusal": "ingredients_generation", "count": 2},
             {"refusal": "h3_ram", "count": 1}])
@@ -1197,12 +1200,12 @@ class TestUsageReport(AnalyticsTestCase):
         self.seed([{"event": "render_completed", "ts": old, "at": "x",
                     "props": {"engine": "ltx"}}])
         r = P._usage_local_report()
-        self.assertEqual(r["tiles"]["renders_7d"], 0)
+        self.assertEqual(r["tiles"]["renders_in_range"], 0)
 
     def test_empty_log_is_a_valid_report(self):
         r = P._usage_local_report()
         self.assertTrue(r["ok"])
-        self.assertEqual(r["tiles"]["renders_7d"], 0)
+        self.assertEqual(r["tiles"]["renders_in_range"], 0)
         self.assertIsNone(r["tiles"]["h3_share_pct"])
         self.assertEqual(r["top_errors"], [])
 

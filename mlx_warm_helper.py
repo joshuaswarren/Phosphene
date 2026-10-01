@@ -337,6 +337,131 @@ def _install_a2v_modality_patch() -> bool:
     return True
 
 
+# =============================================================================
+# A2V CHARACTER LORA PER STAGE — keep the face without muting the mouth
+# =============================================================================
+#
+# A character (face) LoRA damps audio-driven mouth motion on a2v. Measured on
+# the 4.17 power ballad (bizarrotrn_v2, same still/seed/stem/prompt, only the
+# LoRA strength changed — review-2026-09-29-ux/lipsync_quality.txt): at 1.0
+# the mouth opens about half as wide and moves about a third as much as with
+# no LoRA; the owner's verdict on the LoRA take was "the lip sync doesn't
+# work". Without the LoRA the singer belts, but the face drifts off-model.
+#
+# The two-stage Q8 pipeline splits the work in a way that lets us have both:
+# stage 1 (dev + CFG, half resolution, 20 steps) decides the MOTION — jaw,
+# head, timing against the audio; stage 2 (3 refine steps at full resolution,
+# distilled LoRA fused) decides the fine detail, which is where a likeness
+# lives. Scaling the character adapters per stage leaves stage 1 free to sing
+# and lets stage 2 put the face back.
+#
+# Works because the native loader attaches character LoRAs UNFUSED
+# (ltx_core_mlx.loader.runtime_loras): every adapter is a module with a
+# float `lora_scale` read at call time, so rescaling is a Python assignment —
+# no weight reload, no re-quantization. The distilled LoRA is fused into the
+# base weight under the adapters at the stage transition and is untouched.
+# The scales are restored when the render ends, because the pipeline (and its
+# adapters) is cached for the next job.
+
+
+def _a2v_lora_stage_scales(raw) -> tuple[float, float] | None:
+    """`lora_stage_scales` off the job spec -> (stage1, stage2) multipliers,
+    or None for "leave the LoRAs alone". Anything malformed is None: a bad
+    value must never become a LoRA silently switched off."""
+    if raw is None or raw == "":
+        return None
+    try:
+        s1, s2 = (float(x) for x in raw)
+    except (TypeError, ValueError):
+        return None
+    if not all(0.0 <= s <= 2.0 for s in (s1, s2)):
+        return None
+    if s1 == 1.0 and s2 == 1.0:
+        return None
+    return s1, s2
+
+
+def _runtime_lora_adapters(dit) -> list:
+    """Every unfused character-LoRA adapter in a built DiT (empty when the
+    engine fused the LoRA into the weights, which this schedule cannot
+    rescale — the caller logs that instead of pretending)."""
+    try:
+        from ltx_core_mlx.loader.runtime_loras import (          # noqa: PLC0415
+            LoRALinear, LoRAQuantizedLinear,
+        )
+    except Exception:                                            # noqa: BLE001
+        return []
+    if dit is None:
+        return []
+    return [m for _, m in dit.named_modules()
+            if isinstance(m, (LoRALinear, LoRAQuantizedLinear))]
+
+
+@contextmanager
+def _a2v_lora_stage_schedule(pipe, scales):
+    """Scale the character LoRA adapters by scales[0] for stage 1 and
+    scales[1] for stage 2 of an A2VidPipelineTwoStage render, then restore.
+
+    Hooks the two seams the vendored pipeline calls in order on every render:
+    `_denoise_stage1` (the DiT is loaded, adapters attached, motion not yet
+    sampled) and `_fuse_distilled_lora` (stage 1 done, stage 2 about to
+    start). Instance attributes, so the class — and the modality patch that
+    lives on it — is untouched, and deleting them restores it exactly."""
+    if not scales:
+        yield
+        return
+    import weakref                                               # noqa: PLC0415
+    s1, s2 = scales
+    # WEAK references (4.17.3 review): each adapter wraps its base linear
+    # layer, so a strong reference here held the whole DiT alive until the
+    # render returned — past the point where the low-memory path drops the
+    # DiT before the VAE decode. On a 48-64 GB Mac that is ~20 GB of Q8
+    # weights still resident during decode. An adapter the pipeline has
+    # freed simply has nothing left to restore.
+    saved: dict[int, tuple] = {}
+
+    def _apply(mult: float, stage: str) -> None:
+        mods = _runtime_lora_adapters(getattr(pipe, "dit", None))
+        for m in mods:
+            ent = saved.get(id(m))
+            if ent is None or ent[0]() is not m:
+                ent = saved[id(m)] = (weakref.ref(m), float(m.lora_scale))
+            m.lora_scale = ent[1] * mult
+        n_mods = len(mods)
+        del mods
+        emit({"event": "log",
+              "line": (f"[a2v] character LoRA x{mult:.2f} for {stage} "
+                       f"({n_mods} adapters)") if n_mods else
+                      (f"[a2v] character LoRA per-stage schedule skipped for "
+                       f"{stage}: the LoRA is fused, not attached at runtime")})
+
+    orig_s1 = pipe._denoise_stage1
+    orig_fuse = pipe._fuse_distilled_lora
+
+    def _stage1(*a, **k):
+        _apply(s1, "stage 1 (motion)")
+        return orig_s1(*a, **k)
+
+    def _fuse(dit, *a, **k):
+        _apply(s2, "stage 2 (detail)")
+        return orig_fuse(dit, *a, **k)
+
+    pipe._denoise_stage1 = _stage1
+    pipe._fuse_distilled_lora = _fuse
+    try:
+        yield
+    finally:
+        for name in ("_denoise_stage1", "_fuse_distilled_lora"):
+            try:
+                delattr(pipe, name)
+            except AttributeError:
+                pass
+        for ref, base in saved.values():
+            m = ref()
+            if m is not None:
+                m.lora_scale = base
+
+
 def _apply_vae_streaming_decision(num_frames: int) -> None:
     """Set/unset os.environ['LTX_VAE_STREAMING'] for the upcoming decode.
     No-op if the user pinned a value at helper start time. Threshold reads
@@ -404,6 +529,48 @@ def _retake_latent_window(start_sec: float, end_sec: float, fps: float,
 
 _real_stdout = sys.stdout
 _emit_lock = threading.Lock()
+
+
+# 4.17.3 (fleet): mx.random.seed() accepts an unsigned 64-bit int and nothing
+# else. A negative seed other than -1, or one of 2**64 and up, failed the
+# render inside the engine with "seed(): incompatible function arguments" —
+# and text that is not a number died on int() first. The panel now
+# normalizes every seed at make_job (normalize_seed); this is the same rule
+# on the helper's side, for jobs saved by an older panel and for direct API
+# callers. Kept in step with mlx_ltx_panel.normalize_seed — a test pins
+# that the two agree. -1 = random; anything out of range maps
+# deterministically to |n| mod 2**63 so a pinned seed stays repeatable.
+_SEED_LIMIT = 2 ** 63
+
+
+def _coerce_seed(raw) -> int:
+    if raw is None or isinstance(raw, bool):
+        return -1
+    if isinstance(raw, float):
+        if raw != raw or raw in (float("inf"), float("-inf")) or not raw.is_integer():
+            return -1
+        n = int(raw)
+    elif isinstance(raw, int):
+        n = raw
+    else:
+        s = str(raw).strip().replace("_", "").replace(",", "").replace(" ", "")
+        if s.lower() in ("", "-1", "random", "none", "null"):
+            return -1
+        try:
+            n = int(s)
+        except ValueError:
+            try:
+                import decimal as _dec
+                d = _dec.Decimal(s)
+            except (ArithmeticError, ValueError):
+                return -1
+            if not d.is_finite() or d != d.to_integral_value():
+                return -1
+            n = int(d)
+    if n == -1:
+        return -1
+    n = abs(n)
+    return n % _SEED_LIMIT if n >= _SEED_LIMIT else n
 
 
 def emit(event: dict) -> None:
@@ -3240,8 +3407,8 @@ for line in sys.__stdin__:
             emit({"event": "error", "id": job_id, "error": f"unsupported mode: {mode}"})
             continue
         needs_image = mode != "t2v"
-        seed = int(p.get("seed", -1))
-        if seed == -1:
+        seed = _coerce_seed(p.get("seed", -1))
+        if seed < 0:
             seed = random.randint(0, 2**31 - 1)
 
         _is_busy = True
@@ -3506,8 +3673,8 @@ for line in sys.__stdin__:
     if action == "extend":
         job_id = msg.get("id", "?")
         p = msg.get("params", {}) or {}
-        seed = int(p.get("seed", -1))
-        if seed == -1:
+        seed = _coerce_seed(p.get("seed", -1))
+        if seed < 0:
             seed = random.randint(0, 2**31 - 1)
         _is_busy = True
         try:
@@ -3627,8 +3794,8 @@ for line in sys.__stdin__:
         # — never a helper crash.
         job_id = msg.get("id", "?")
         p = msg.get("params", {}) or {}
-        seed = int(p.get("seed", -1))
-        if seed == -1:
+        seed = _coerce_seed(p.get("seed", -1))
+        if seed < 0:
             seed = random.randint(0, 2**31 - 1)
         _is_busy = True
         try:
@@ -3741,8 +3908,8 @@ for line in sys.__stdin__:
         job_id = msg.get("id", "?")
         p = msg.get("params", {}) or {}
         model_dir = p.get("model_dir") or MODEL_ID  # fallback if user forgot
-        seed = int(p.get("seed", -1))
-        if seed == -1:
+        seed = _coerce_seed(p.get("seed", -1))
+        if seed < 0:
             seed = random.randint(0, 2**31 - 1)
         _is_busy = True
         try:
@@ -3935,8 +4102,8 @@ for line in sys.__stdin__:
         job_id = msg.get("id", "?")
         p = msg.get("params", {}) or {}
         model_dir = p.get("model_dir") or MODEL_ID
-        seed = int(p.get("seed", -1))
-        if seed == -1:
+        seed = _coerce_seed(p.get("seed", -1))
+        if seed < 0:
             seed = random.randint(0, 2**31 - 1)
         _is_busy = True
         try:
@@ -4055,8 +4222,8 @@ for line in sys.__stdin__:
         job_id = msg.get("id", "?")
         p = msg.get("params", {}) or {}
         model_dir = p.get("model_dir") or MODEL_ID
-        seed = int(p.get("seed", -1))
-        if seed == -1:
+        seed = _coerce_seed(p.get("seed", -1))
+        if seed < 0:
             seed = random.randint(0, 2**31 - 1)
         _is_busy = True
         try:
@@ -4176,7 +4343,10 @@ for line in sys.__stdin__:
                     emit({"event": "log", "line": "Avoid terms active via native CFG negative prompt."})
                 _thread_live_preview(p, kwargs)          # VA-27
                 kwargs = _filter_unsupported_kwargs(pipe.generate_and_save, kwargs)
-                out_path = pipe.generate_and_save(**kwargs)
+                _stage_scales = (_a2v_lora_stage_scales(p.get("lora_stage_scales"))
+                                 if loras else None)
+                with _a2v_lora_stage_schedule(pipe, _stage_scales):
+                    out_path = pipe.generate_and_save(**kwargs)
             elapsed = round(time.time() - t0, 2)
             _last_activity = time.time()
             emit({
@@ -4199,8 +4369,8 @@ for line in sys.__stdin__:
         job_id = msg.get("id", "?")
         p = msg.get("params", {}) or {}
         model_dir = p.get("model_dir") or MODEL_ID
-        seed = int(p.get("seed", -1))
-        if seed == -1:
+        seed = _coerce_seed(p.get("seed", -1))
+        if seed < 0:
             seed = random.randint(0, 2**31 - 1)
         _is_busy = True
         try:
@@ -4304,8 +4474,8 @@ for line in sys.__stdin__:
         job_id = msg.get("id", "?")
         p = msg.get("params", {}) or {}
         model_dir = p.get("model_dir") or MODEL_ID
-        seed = int(p.get("seed", -1))
-        if seed == -1:
+        seed = _coerce_seed(p.get("seed", -1))
+        if seed < 0:
             seed = random.randint(0, 2**31 - 1)
         _is_busy = True
         try:
@@ -4417,8 +4587,8 @@ for line in sys.__stdin__:
         job_id = msg.get("id", "?")
         p = msg.get("params", {}) or {}
         model_dir = p.get("model_dir") or MODEL_ID
-        seed = int(p.get("seed", -1))
-        if seed == -1:
+        seed = _coerce_seed(p.get("seed", -1))
+        if seed < 0:
             seed = random.randint(0, 2**31 - 1)
         _is_busy = True
         try:
@@ -4608,7 +4778,9 @@ for line in sys.__stdin__:
         language = (p.get("language") or "").strip()
         section = (p.get("section") or "").strip().strip("[]")
         lines_in = (p.get("lines") or "").strip()
-        seed = int(p.get("seed", 10))
+        seed = _coerce_seed(p.get("seed", 10))
+        if seed < 0:
+            seed = 10
         # A section rewrite can stand on the lines alone ("make this better"),
         # so the concept is only mandatory when there is nothing else to go on.
         if not concept and not (section and lines_in):
@@ -4712,7 +4884,9 @@ for line in sys.__stdin__:
         description = (p.get("description") or "").strip()
         instrumental = bool(p.get("instrumental"))
         seconds = int(p.get("seconds") or 150)
-        seed = int(p.get("seed", 10))
+        seed = _coerce_seed(p.get("seed", 10))
+        if seed < 0:
+            seed = 10
         if not description:
             emit({"event": "error", "id": job_id, "error": "empty description"})
             continue
@@ -4820,7 +4994,9 @@ for line in sys.__stdin__:
         mode = (p.get("mode") or "t2v").lower()
         if mode not in ("t2v", "i2v"):
             mode = "t2v"
-        seed = int(p.get("seed", 10))
+        seed = _coerce_seed(p.get("seed", 10))
+        if seed < 0:
+            seed = 10
         preserve_tokens = p.get("preserve_tokens") or []
         if not isinstance(preserve_tokens, list):
             preserve_tokens = []

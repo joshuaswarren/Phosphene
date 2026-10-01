@@ -432,6 +432,63 @@ HIDDEN_FILE = STATE_DIR / "panel_hidden.json"
 STATS_DATA_FILE = STATE_DIR / "stats-data.jsonl"
 STATS_HTML_FILE = ROOT / "panel_assets" / "stats.html"
 STATS_FETCHER = ROOT / "scripts" / "fetch_repo_stats.py"
+
+# Dashboard v2 (2026-09-30): one range control (7d/30d/90d/all) drives every
+# panel on /stats. Server-side filtering of the JSONL archive lives here so
+# the payload the browser downloads matches what it asked for, and so a
+# range's own cache entry is invalidated (not served stale) the moment the
+# archive file changes underneath it — see _stats_data_for_range.
+STATS_RANGE_DAYS = {"7d": 7, "30d": 30, "90d": 90, "all": None}
+STATS_RANGE_DEFAULT = "30d"
+_STATS_DATA_RANGE_CACHE: dict[str, tuple[float, bytes]] = {}
+_STATS_DATA_RANGE_LOCK = threading.Lock()
+
+
+def _stats_data_for_range(range_key: str) -> bytes:
+    """JSONL bytes for one range, cached per (range, archive mtime).
+
+    Keying the cache on the file's own mtime — not a TTL — is what keeps
+    this correct after /stats/refresh: the fetcher rewrites STATS_DATA_FILE
+    in place, which bumps mtime, which makes every range's cache entry miss
+    on the very next read. No separate invalidation call needed.
+
+    A range narrower than "all" asks for 2x the window (e.g. 60 days of
+    rows for "30d") so the dashboard can compute "vs prior period" deltas
+    from one response instead of a second round trip."""
+    key = range_key if range_key in STATS_RANGE_DAYS else STATS_RANGE_DEFAULT
+    days = STATS_RANGE_DAYS[key]
+    try:
+        mtime = STATS_DATA_FILE.stat().st_mtime
+    except OSError:
+        return b""
+    with _STATS_DATA_RANGE_LOCK:
+        cached = _STATS_DATA_RANGE_CACHE.get(key)
+        if cached and cached[0] == mtime:
+            return cached[1]
+    try:
+        raw = STATS_DATA_FILE.read_bytes()
+    except FileNotFoundError:
+        return b""
+    if days is None:
+        body = raw
+    else:
+        cutoff = time.strftime("%Y-%m-%d",
+                                time.gmtime(time.time() - days * 2 * 86400))
+        kept: list[bytes] = []
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                row = json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if str(row.get("date") or "") >= cutoff:
+                kept.append(stripped)
+        body = (b"\n".join(kept) + b"\n") if kept else b""
+    with _STATS_DATA_RANGE_LOCK:
+        _STATS_DATA_RANGE_CACHE[key] = (mtime, body)
+    return body
 HELPER_IDLE_TIMEOUT = int(os.environ.get("LTX_HELPER_IDLE_TIMEOUT", "1800"))
 HELPER_LOW_MEMORY = os.environ.get("LTX_HELPER_LOW_MEMORY", "true")
 # Low-RAM block streaming (v4.9.9): on Macs with 24 GB or less the helper
@@ -6563,6 +6620,63 @@ _INTEGRITY_LOCK = threading.Lock()
 _INTEGRITY_CACHE: dict = {"ts": 0.0, "data": None}
 
 
+# ---- JSON sidecar verification (4.17.3, fleet) --------------------------------
+# The header scan above only ever looked at .safetensors. A fresh 4.17.1 install
+# in the fleet booted with weights_check "ok" and then failed five renders in a
+# row with messages that named nothing — "Expecting value: line 1 column 1
+# (char 0)" (an empty JSON file), "Received 1 parameters not in model" (the
+# library could not read embedded_config.json, silently fell back to default
+# transformer settings, and the checkpoint then refused to load into them),
+# "No usable tokenizer beside the text encoder", "Invalid json header length".
+# All four are a damaged or partially-downloaded SMALL file next to intact
+# weights, and none of them reached the integrity banner, so Repair was never
+# offered. Every JSON file a pack ships is now parsed here too and lands in the
+# same bad[] the banner, the boot warning and /models/repair already consume.
+# Parsing is cached by (size, mtime) so the 30 MB tokenizer.json is read once,
+# not on every /status refresh.
+_JSON_VERIFY_CACHE: dict = {}
+
+
+def _json_files_for_repo(repo_def: dict, base: Path) -> list[str]:
+    """The JSON files this repo owns in `base`: the ones `files` declares, plus
+    every top-level *.json when the repo downloads `*.json` (its own include
+    pattern — so a shared folder never attributes another pack's file to it)."""
+    names = [f for f in (repo_def.get("files") or []) if str(f).endswith(".json")]
+    if "*.json" in (repo_def.get("download_include") or []):
+        try:
+            names += sorted(p.name for p in Path(base).glob("*.json")
+                            if p.is_file() and not p.name.startswith("._"))
+        except OSError:
+            pass
+    seen: set = set()
+    return [n for n in names if not (n in seen or seen.add(n))]
+
+
+def _verify_json_file(path: Path) -> tuple[bool, str]:
+    """(ok, reason) for one JSON file: present, non-empty, parseable."""
+    try:
+        st = path.stat()
+    except OSError:
+        return True, "absent"   # presence is repo_status_list's job, not ours
+    key = str(path)
+    hit = _JSON_VERIFY_CACHE.get(key)
+    if hit and hit[0] == (st.st_size, st.st_mtime_ns):
+        return hit[1]
+    if st.st_size == 0:
+        res = (False, "damaged: the file is empty (interrupted download)")
+    else:
+        try:
+            with open(path, "rb") as fh:
+                json.loads(fh.read().decode("utf-8"))
+            res = (True, "ok")
+        except (UnicodeDecodeError, ValueError) as e:
+            res = (False, f"damaged: not valid JSON ({str(e)[:80]})")
+        except OSError as e:
+            res = (False, f"unreadable ({e})")
+    _JSON_VERIFY_CACHE[key] = ((st.st_size, st.st_mtime_ns), res)
+    return res
+
+
 def _model_integrity(force: bool = False) -> dict:
     """Header-only integrity scan of installed model weights. Cached ~120 s so
     the frequently-polled /status doesn't re-read headers every tick.
@@ -6591,6 +6705,17 @@ def _model_integrity(force: bool = False) -> dict:
             if not fpath.exists():
                 continue  # presence already vetted by repo_status_list; don't false-flag
             ok, reason = _verify_safetensors(fpath)
+            result["checked"] += 1
+            if not ok:
+                result["ok"] = False
+                result["bad"].append({"repo": r["key"], "file": fname, "reason": reason})
+        # The small JSON files beside the weights (transformer config,
+        # tokenizer, split/quantize manifests) — see _verify_json_file.
+        flagged = {b["file"] for b in result["bad"] if b["repo"] == r["key"]}
+        for fname in _json_files_for_repo(defs.get(r["key"], {}), base):
+            if fname in flagged:
+                continue
+            ok, reason = _verify_json_file(base / fname)
             result["checked"] += 1
             if not ok:
                 result["ok"] = False
@@ -8332,6 +8457,23 @@ def min_ram_gb_for(capability: str) -> int | None:
     return min(floors) if floors else None
 
 
+def _ram_tier_for_gb(gb: float) -> str:
+    """Which of the four RAM tiers (base/standard/high/pro) `gb` falls in,
+    by the SAME thresholds `_detect_tier()` uses for this Mac's own boot RAM
+    — but callable for any RAM value, not just SYSTEM_RAM_GB. Used to keep
+    fleet-timings lookups (fleet_estimate_range, below) from silently
+    mixing a Mac's own class with a materially different one (4.17: a 64 GB
+    M4 Max was shown "~30-40 min" for LTX High*720p 10s because the only
+    fleet renders for that chip+tier were all on a 128 GB Mac — a `pro`-tier
+    sample handed to a `standard`-tier owner as "Macs like yours")."""
+    if gb <= 0:
+        return "standard"   # safe default, matches _detect_tier's own
+    if gb < TIER_MIN_RAM_GB["standard"]: return "base"
+    if gb < TIER_MIN_RAM_GB["high"]:     return "standard"
+    if gb < TIER_MIN_RAM_GB["pro"]:      return "high"
+    return "pro"
+
+
 def _detect_tier() -> str:
     """Pick a tier based on `hw.memsize`. Cached at module load — RAM is
     fixed at boot. LTX_TIER_OVERRIDE env var lets advanced users force a
@@ -8339,13 +8481,7 @@ def _detect_tier() -> str:
     override = os.environ.get("LTX_TIER_OVERRIDE", "").strip().lower()
     if override in CAPABILITIES:
         return override
-    gb = SYSTEM_RAM_GB
-    if gb <= 0:
-        return "standard"   # safe default
-    if gb < TIER_MIN_RAM_GB["standard"]: return "base"
-    if gb < TIER_MIN_RAM_GB["high"]:     return "standard"
-    if gb < TIER_MIN_RAM_GB["pro"]:      return "high"
-    return "pro"
+    return _ram_tier_for_gb(SYSTEM_RAM_GB)
 
 
 SYSTEM_TIER = _detect_tier()
@@ -9463,6 +9599,88 @@ def _fleet_scale_ratio(engine: str, tier: str, target_frames: float,
         return None
 
 
+def _iter_fleet_cell_entries(engine: str, mode: str, tier: str, *,
+                             chip: str | None = None, speed: str = ""):
+    """Yield (frames, chip_family, ram_gb, cell) for every "cell"-level row
+    matching engine/mode/tier (and `chip`/`speed` when given) — the one
+    level of data/fleet_timings.json that still carries a real ram_gb per
+    row (scripts/fleet_timings_build.py's "chip" and "model" levels both
+    drop it in their own GROUP BY, on purpose, to precompute a coarser
+    pooled number — see their `_CHIP_COLS`/`_MODEL_COLS`). Reading "cell"
+    directly is what lets the RAM-tier-aware levels below exist without a
+    new PostHog pull."""
+    cell_cells = (FLEET_TIMINGS.get("levels") or {}).get("cell", {}).get("cells") or {}
+    prefix = f"{engine}|{mode}|{tier}|"
+    for k, v in cell_cells.items():
+        if not k.startswith(prefix):
+            continue
+        rest = k[len(prefix):].split("|")
+        if len(rest) != 4:                                        # noqa: PLR2004
+            continue
+        frames_s, k_chip, ram_s, k_speed = rest
+        if chip is not None and k_chip != chip:
+            continue
+        if (k_speed or "any") != (speed or "any"):
+            continue
+        try:
+            yield float(frames_s), k_chip, float(ram_s), v
+        except ValueError:
+            continue
+
+
+def _combine_fleet_cells(cells: list[dict]) -> dict:
+    """Combine several real fleet cells into one synthetic cell — used when
+    more than one RAM value (or chip) falls in the same bucket this Mac should
+    be compared against.
+
+    POOLED, not averaged (4.17.3 review). Averaging each cell's quartiles is
+    not a quartile of the pooled renders: two equally sized cohorts at 1-1.5
+    and 10-15 min averaged to a "~5-7 min" range that contains neither. Each
+    cell is taken as its own three quartile points, each carrying a third of
+    its sample count, and the quartiles are read off that pooled, n-weighted
+    set — so a 90-sample cell still dominates three 3-sample ones, and two
+    far-apart cohorts give an honest wide range instead of a narrow wrong
+    one. Every value returned is one a real cell carried."""
+    pts: list[tuple[float, float]] = []
+    total_n = 0
+    for c in cells:
+        n = max(0, int(c.get("n") or 0))
+        total_n += n
+        for field in ("p25_sec", "p50_sec", "p75_sec"):
+            pts.append((float(c[field]), n / 3.0))
+    if total_n <= 0:
+        return cells[0]
+    pts.sort(key=lambda t: t[0])
+    weight = sum(w for _, w in pts)
+
+    def _q(q: float) -> float:
+        acc = 0.0
+        for v, w in pts:
+            acc += w
+            if acc >= q * weight - 1e-9:
+                return v
+        return pts[-1][0]
+    return {"p25_sec": _q(0.25), "p50_sec": _q(0.5), "p75_sec": _q(0.75),
+            "n": total_n}
+
+
+def _fleet_chip_adjust_ratio(engine: str, from_chip: str, to_chip: str) -> float:
+    """How much to rescale a render time measured on `from_chip` to what
+    `to_chip` would show, using the SAME per-chip speed table
+    `_hw_speed_factor` reads (HW_SPEED_FACTOR_LTX / _H3). 1.0 when the chips
+    match or either is outside the table (an unknown chip already defaults
+    to the M4 Max factor there, so this stays a no-op rather than guessing
+    at a correction it has no basis for)."""
+    if from_chip == to_chip:
+        return 1.0
+    table = HW_SPEED_FACTOR_H3 if engine == "h3" else HW_SPEED_FACTOR_LTX
+    f_from = float(table.get(from_chip, 1.0))
+    f_to = float(table.get(to_chip, 1.0))
+    if f_from <= 0:
+        return 1.0
+    return f_to / f_from
+
+
 def fleet_estimate_range(engine: str, mode: str, tier: str, frames,
                          chip: str | None = None, ram: float | None = None,
                          speed: str = "") -> dict | None:
@@ -9471,10 +9689,31 @@ def fleet_estimate_range(engine: str, mode: str, tier: str, frames,
     fleet table has nothing at any level, in which case the caller prices
     from the cost model instead. Self-calibration is NOT applied here
     (callers that want it multiply p25/p50/p75 themselves) so this function
-    stays a pure table lookup, independently testable."""
+    stays a pure table lookup, independently testable.
+
+    RAM-TIER AWARE (4.17.1 fix). The bug: a 64 GB M4 Max's "High * 720p,
+    10s" chip read "~30-40 min" (a real Mac's own render of that exact
+    setting took 17.4 min). Root cause — the precomputed "chip" level pools
+    EVERY RAM class of a chip together (scripts/fleet_timings_build.py's
+    `_CHIP_COLS` drops ram_gb from its GROUP BY on purpose, to get a
+    coarser fallback), and for LTX High*720p the fleet's only M4 Max
+    samples at 10s happened to all be 128 GB installs — 13 renders that all
+    landed in the 1800-2400s bucket got shown to a 64 GB owner as "based on
+    13 renders on M4 Max Macs", i.e. "Macs like yours", when they were
+    2x the RAM and (per the bucket) roughly 2x the time. Two new levels
+    (`chip_ram_tier` / `chip_ram_tier_scaled`) try the SAME chip within
+    this Mac's own RAM TIER first — reconstructed from the "cell" level,
+    the one place ram_gb still exists per-row. And the old RAM-blind
+    "chip" level is no longer trusted blindly: it is skipped when the
+    "cell" rows backing it are ALL a different RAM tier than this Mac's
+    own (proven contamination) — falling instead to `ram_tier` (any chip,
+    same RAM tier, chip-speed-adjusted via `_fleet_chip_adjust_ratio`) and
+    only then to the fully pooled "model" level, unchanged, as the last
+    real-data rung before the cost model."""
     levels = FLEET_TIMINGS.get("levels") or {}
     chip = chip if chip is not None else _hw_chip_family()
     ram = ram if ram is not None else SYSTEM_RAM_GB
+    ram_tier = _ram_tier_for_gb(float(ram))
     try:
         frames_f = float(frames)
     except (TypeError, ValueError):
@@ -9519,12 +9758,68 @@ def fleet_estimate_range(engine: str, mode: str, tier: str, frames,
                     "basis": f"based on {hit['n']} renders on Macs like yours, "
                             f"scaled from a different length"}
 
+    # chip_ram_tier / chip_ram_tier_scaled: same chip, a DIFFERENT RAM value
+    # but the SAME RAM TIER as this Mac (e.g. two 48 GB and one 56 GB cell
+    # both count as "standard" for a 64 GB owner) — reconstructed from the
+    # "cell" rows, which is the only level that still has ram_gb per row.
+    same_chip_tier = [(f, r, v) for f, c, r, v in
+                      _iter_fleet_cell_entries(engine, mode, tier, chip=chip, speed=speed)
+                      if _ram_tier_for_gb(r) == ram_tier]
+    exact = [v for f, r, v in same_chip_tier if f == frames_f]
+    if exact:
+        combined = _combine_fleet_cells(exact)
+        return {**_minutes(combined), "source": "chip_ram_tier",
+                "basis": f"based on {combined['n']} renders on {chip} Macs "
+                        f"with similar memory"}
+    if same_chip_tier:
+        found_frames, _, hit = min(same_chip_tier, key=lambda t: abs(t[0] - frames_f))
+        ratio = _fleet_scale_ratio(engine, tier, frames_f, found_frames)
+        if ratio:
+            return {**_minutes(hit, scale=ratio), "source": "chip_ram_tier_scaled",
+                    "basis": f"based on {hit['n']} renders on {chip} Macs "
+                            f"with similar memory, scaled from a different length"}
+
+    # chip (RAM-blind, precomputed) — GATED. Trust it only when the "cell"
+    # rows actually backing this exact (chip, frames) number either don't
+    # exist to check (nothing to contradict it) or include this Mac's own
+    # RAM tier. When they exist and are EXCLUSIVELY a different tier, this
+    # is the contamination the docstring above describes — skip it rather
+    # than show a different-RAM Mac's time as "Macs like yours".
     chip_cells = (levels.get("chip") or {}).get("cells") or {}
     key = _fleet_key(engine, mode, tier, frames_f, chip=chip, speed=speed)
     hit = chip_cells.get(key)
     if hit:
-        return {**_minutes(hit), "source": "chip",
-                "basis": f"based on {hit['n']} renders on {chip} Macs"}
+        backing_tiers = {_ram_tier_for_gb(r) for f, _, r, _ in
+                         _iter_fleet_cell_entries(engine, mode, tier, chip=chip, speed=speed)
+                         if f == frames_f}
+        if not backing_tiers or ram_tier in backing_tiers:
+            return {**_minutes(hit), "source": "chip",
+                    "basis": f"based on {hit['n']} renders on {chip} Macs"}
+
+    # ram_tier / ram_tier_scaled: ANY chip, but the SAME RAM tier — the
+    # fleet's best remaining honest signal for THIS Mac's memory class, chip-
+    # adjusted by the panel's own per-chip speed table so a slower stand-in
+    # chip doesn't overstate a faster Mac's time (or vice versa).
+    any_chip_tier = [(f, c, v) for f, c, r, v in
+                     _iter_fleet_cell_entries(engine, mode, tier, speed=speed)
+                     if _ram_tier_for_gb(r) == ram_tier]
+    exact2 = [(c, v) for f, c, v in any_chip_tier if f == frames_f]
+    if exact2:
+        adjusted = [{**v, "p25_sec": v["p25_sec"] * _fleet_chip_adjust_ratio(engine, c, chip),
+                    "p50_sec": v["p50_sec"] * _fleet_chip_adjust_ratio(engine, c, chip),
+                    "p75_sec": v["p75_sec"] * _fleet_chip_adjust_ratio(engine, c, chip)}
+                   for c, v in exact2]
+        combined = _combine_fleet_cells(adjusted)
+        return {**_minutes(combined), "source": "ram_tier",
+                "basis": f"based on {combined['n']} renders on Macs with similar memory"}
+    if any_chip_tier:
+        found_frames, found_chip, hit = min(any_chip_tier, key=lambda t: abs(t[0] - frames_f))
+        ratio = _fleet_scale_ratio(engine, tier, frames_f, found_frames)
+        if ratio:
+            chip_ratio = _fleet_chip_adjust_ratio(engine, found_chip, chip)
+            return {**_minutes(hit, scale=ratio * chip_ratio), "source": "ram_tier_scaled",
+                    "basis": f"based on {hit['n']} renders on Macs with similar "
+                            f"memory, scaled from a different length"}
 
     model_cells = (levels.get("model") or {}).get("cells") or {}
     key = _fleet_key(engine, mode, tier, frames_f, speed=speed)
@@ -17135,6 +17430,9 @@ _ANALYTICS_REFUSAL_REASONS = (
     # A quality/mode that needs the Q8 pack, chosen on a Mac that hasn't
     # downloaded it — an install prompt, not a fault (review 2026-09-02).
     ("pack_missing", ("isn't downloaded on this mac yet",)),
+    # "Listen to the voice only" on an install whose vocal separator is
+    # missing — an install prompt, not a fault (lip-sync quality, 4.17.x).
+    ("vocal_separator", ("vocal separation is not installed",)),
 )
 
 _ANALYTICS_REFUSAL_SLUGS = tuple(s for s, _ in _ANALYTICS_REFUSAL_REASONS)
@@ -17546,33 +17844,50 @@ def _usage_rank(counter: dict, key_name: str, limit: int = 12) -> list[dict]:
     return [{key_name: k, "count": v} for k, v in rows[:limit]]
 
 
-def _usage_local_report() -> dict:
+def _usage_local_report(range_key: str = STATS_RANGE_DEFAULT) -> dict:
     """Aggregate the local mirror into the dashboard's payload shape.
 
     Deliberately the SAME shape the fleet path produces, so stats.html has
     exactly one renderer and the only difference the user sees is the
-    `source` label and the note above the tiles."""
+    `source` label and the note above the tiles.
+
+    Day buckets use UTC (time.gmtime), matching the fleet path's HogQL
+    `toDate(timestamp)` (ClickHouse dates are UTC by default) and the
+    GitHub-stats archive's UTC `date` field. This used to bucket by the
+    MACHINE's own local midnight — on Mr Bizarro's Mac that is UTC+2/+3, so
+    the same calendar day could show a different render count depending on
+    whether /stats/usage happened to be serving the local fallback or the
+    fleet view that day. A single-machine report has no meaningful "vs
+    prior period" delta at small counts (2 renders vs 3 reads as "+50%"),
+    so this path leaves deltas out rather than manufacture noise — the
+    fleet path is where deltas matter and where there's enough volume for
+    them to mean something."""
     recs = _usage_log_read()
     now = time.time()
-    d7, d14 = now - 7 * 86400, now - 14 * 86400
+    days = STATS_RANGE_DAYS.get(range_key, STATS_RANGE_DAYS[STATS_RANGE_DEFAULT])
+    range_cutoff = (now - days * 86400) if days else 0.0
+    # Every windowed figure below (boots, engines/H3 share, error rate,
+    # versions/chips/RAM, pack flips) follows the selected range, same as
+    # the fleet path. Only renders_by_day keeps its fixed 30-day chart.
+    d30 = now - 30 * 86400
 
     boots_by_day: dict[str, int] = {}
     engines: dict[str, int] = {}
     errors: dict[str, int] = {}
+    error_groups: dict[str, dict] = {}
     versions: dict[str, int] = {}
     chips: dict[str, int] = {}
     rams: dict[str, int] = {}
     flips: dict[tuple, int] = {}
     refusals: dict[str, int] = {}
-    renders_7d = ok_14d = fail_14d = 0
-    h3_14d = tot_14d = 0
-    refused_7d = 0
-    active_7d = False
+    renders_in_range = ok_in_range = fail_in_range = 0
+    h3_in_range = tot_in_range = 0
+    refused_in_range = 0
+    active_in_range = False
 
     total_renders = 0
     renders_by_day: dict[str, int] = {}
     first_boot_ts = None
-    d30 = now - 30 * 86400
 
     for rec in recs:
         try:
@@ -17581,13 +17896,13 @@ def _usage_local_report() -> dict:
             continue
         ev = str(rec.get("event") or "")
         props = rec.get("props") if isinstance(rec.get("props"), dict) else {}
-        if ts >= d7:
-            active_7d = True
+        if ts >= range_cutoff:
+            active_in_range = True
         if ev == "app_boot":
             if first_boot_ts is None or ts < first_boot_ts:
                 first_boot_ts = ts
-            if ts >= d14:
-                day = time.strftime("%Y-%m-%d", time.localtime(ts))
+            if ts >= range_cutoff:
+                day = time.strftime("%Y-%m-%d", time.gmtime(ts))
                 boots_by_day[day] = boots_by_day.get(day, 0) + 1
                 versions[str(props.get("version") or "unknown")] = \
                     versions.get(str(props.get("version") or "unknown"), 0) + 1
@@ -17599,23 +17914,32 @@ def _usage_local_report() -> dict:
             if ev == "render_completed":
                 total_renders += 1
                 if ts >= d30:
-                    day = time.strftime("%Y-%m-%d", time.localtime(ts))
+                    day = time.strftime("%Y-%m-%d", time.gmtime(ts))
                     renders_by_day[day] = renders_by_day.get(day, 0) + 1
-            if ts >= d7:
-                renders_7d += 1
-            if ts >= d14:
-                tot_14d += 1
+            if ts >= range_cutoff:
+                renders_in_range += 1
+            if ts >= range_cutoff:
+                tot_in_range += 1
                 eng = str(props.get("engine") or "unknown")
                 engines[eng] = engines.get(eng, 0) + 1
                 if eng == "h3":
-                    h3_14d += 1
+                    h3_in_range += 1
                 if ev == "render_completed":
-                    ok_14d += 1
+                    ok_in_range += 1
                 else:
-                    fail_14d += 1
-            if ev == "render_failed" and ts >= d7:
+                    fail_in_range += 1
+            if ev == "render_failed" and ts >= range_cutoff:
                 sig = str(props.get("error_signature") or "unknown error")
                 errors[sig] = errors.get(sig, 0) + 1
+                cls = str(props.get("error_class") or "other")
+                g = error_groups.setdefault(cls, {
+                    "count": 0, "first_seen": ts, "last_seen": ts,
+                    "sigs": {},
+                })
+                g["count"] += 1
+                g["first_seen"] = min(g["first_seen"], ts)
+                g["last_seen"] = max(g["last_seen"], ts)
+                g["sigs"][sig] = g["sigs"].get(sig, 0) + 1
         elif ev == "render_refused":
             # DELIBERATELY OUTSIDE every render number above. A refusal did
             # not render, did not fail and cost no GPU time, so it belongs
@@ -17623,11 +17947,11 @@ def _usage_local_report() -> dict:
             # rate — counting it in either is the bug this branch exists to
             # prevent. It gets its own tile because "how often do we send
             # someone into a wall" is a real question, just a different one.
-            if ts >= d7:
-                refused_7d += 1
+            if ts >= range_cutoff:
+                refused_in_range += 1
                 slug = str(props.get("refusal") or "unknown")
                 refusals[slug] = refusals.get(slug, 0) + 1
-        elif ev == "pack_state_change" and ts >= d7:
+        elif ev == "pack_state_change" and ts >= range_cutoff:
             k = (str(props.get("pack") or "?"),
                  bool(props.get("from")), bool(props.get("to")))
             flips[k] = flips.get(k, 0) + 1
@@ -17637,25 +17961,47 @@ def _usage_local_report() -> dict:
     h3_lost = sum(r["count"] for r in flip_rows
                   if r["pack"] == "h3" and r["from"] and not r["to"])
 
+    error_group_rows = []
+    for cls, g in error_groups.items():
+        top_sig = max(g["sigs"].items(), key=lambda kv: kv[1])[0] if g["sigs"] else "unknown error"
+        error_group_rows.append({
+            "error_class": cls,
+            "count": g["count"],
+            "installs": 1,  # local mirror is always this one machine
+            # ISO 8601 with a Z suffix — same shape PostHog's timestamp
+            # column returns, so the dashboard's one JS date parser handles
+            # both sources identically.
+            "first_seen": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(g["first_seen"])),
+            "last_seen": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(g["last_seen"])),
+            "top_message": top_sig,
+            "signatures": len(g["sigs"]),
+        })
+    error_group_rows.sort(key=lambda r: (-r["installs"], -r["count"]))
+
     return {
         "ok": True,
         "source": "local",
         "generated_at": iso_now(),
         "cached": False,
+        "range": range_key,
         "note": ("this machine only - add a PostHog query key in Settings "
                  "for fleet data"),
         "tiles": {
-            "weekly_active_installs": 1 if active_7d else 0,
+            "weekly_active_installs": 1 if active_in_range else 0,
+            # The stats-v2 tile reads active_in_range (the fleet path's
+            # name); without it the local fallback showed "—" (4.17.3 review).
+            "active_in_range": 1 if active_in_range else 0,
             "total_renders": total_renders,
             "total_installs": 1 if first_boot_ts else 0,
-            "renders_7d": renders_7d,
-            "h3_share_pct": round(100.0 * h3_14d / tot_14d, 1) if tot_14d else None,
-            "error_rate_pct": (round(100.0 * fail_14d / (ok_14d + fail_14d), 1)
-                               if (ok_14d + fail_14d) else None),
-            "refusals_7d": refused_7d,
+            "renders_in_range": renders_in_range,
+            "h3_share_pct": round(100.0 * h3_in_range / tot_in_range, 1) if tot_in_range else None,
+            "error_rate_pct": (round(100.0 * fail_in_range / (ok_in_range + fail_in_range), 1)
+                               if (ok_in_range + fail_in_range) else None),
+            "refusals_in_range": refused_in_range,
         },
+        "deltas": {},  # single machine, small counts — see docstring
         "growth": _usage_growth_block(
-            [(time.strftime("%Y-%m-%d", time.localtime(first_boot_ts)), 1)] if first_boot_ts else [],
+            [(time.strftime("%Y-%m-%d", time.gmtime(first_boot_ts)), 1)] if first_boot_ts else [],
             [(d, renders_by_day[d]) for d in sorted(renders_by_day)],
             []),
         "boots_by_day": [{"date": d, "count": boots_by_day[d]}
@@ -17663,6 +18009,7 @@ def _usage_local_report() -> dict:
         "engines": _usage_rank(engines, "engine", 8),
         "top_errors": [{"signature": k, "count": v} for k, v in
                        sorted(errors.items(), key=lambda kv: (-kv[1], kv[0]))[:5]],
+        "error_groups": error_group_rows,
         "top_refusals": [{"refusal": k, "count": v} for k, v in
                          sorted(refusals.items(),
                                 key=lambda kv: (-kv[1], kv[0]))[:5]],
@@ -17674,97 +18021,182 @@ def _usage_local_report() -> dict:
     }
 
 
-# HogQL fragments for the fleet view. Kept as a table (not inline strings)
-# so the whole surface the personal API key touches is auditable in one
-# place: eleven read-only aggregate SELECTs over `events`, nothing else.
-# `properties['x']` bracket form throughout — `properties.from` would
-# collide with the SQL keyword in the pack_state_change query.
-_USAGE_FLEET_QUERIES = {
-    "wau": "SELECT count(DISTINCT distinct_id) FROM events "
-           "WHERE event = 'app_boot' AND timestamp > now() - INTERVAL 7 DAY",
-    "dau": "SELECT count(DISTINCT distinct_id) FROM events "
-           "WHERE event = 'app_boot' AND timestamp > now() - INTERVAL 1 DAY",
-    "boots_by_day":
-        "SELECT toDate(timestamp) AS d, count() AS c FROM events "
-        "WHERE event = 'app_boot' AND timestamp > now() - INTERVAL 14 DAY "
-        "GROUP BY d ORDER BY d",
-    "engines":
-        "SELECT properties['engine'] AS e, count() AS c FROM events "
-        "WHERE event IN ('render_completed', 'render_failed') "
-        "AND timestamp > now() - INTERVAL 14 DAY GROUP BY e ORDER BY c DESC",
-    "outcomes":
-        "SELECT event, count() AS c FROM events "
-        "WHERE event IN ('render_completed', 'render_failed') "
-        "AND timestamp > now() - INTERVAL 14 DAY GROUP BY event",
-    # By INSTALLS first, then by events. Ordered by events alone the tile was
-    # owned by one 4.9.3 install with a broken model dir retrying 438 times in
-    # a week (160 + 121 + 72 events of three signatures, one distinct_id each)
-    # while the errors many people hit sat below the fold (2026-09-08).
-    "top_errors":
-        "SELECT properties['error_signature'] AS sig, count() AS c, "
-        "count(DISTINCT distinct_id) AS people FROM events "
-        "WHERE event = 'render_failed' AND timestamp > now() - INTERVAL 7 DAY "
-        "GROUP BY sig ORDER BY people DESC, c DESC LIMIT 8",
-    # Failure rate per version, so a release that fails more than the one before
-    # it is visible the day it ships, and a storm from one install reads as one.
-    "failures_by_version":
-        "SELECT properties['version'] AS v, countIf(event = 'render_failed') AS failed, "
-        "countIf(event = 'render_completed') AS ok, count(DISTINCT distinct_id) AS people "
-        "FROM events "
-        "WHERE event IN ('render_failed', 'render_completed') "
-        "AND timestamp > now() - INTERVAL 7 DAY GROUP BY v ORDER BY failed DESC LIMIT 12",
-    # Refusals are a SEPARATE event, which is why none of the queries above
-    # needed an `error_class != 'refused'` clause bolted on. That was the
-    # deciding argument for a new event name over a new class: an exclusion
-    # has to be remembered by every query anyone writes later, here and in
-    # PostHog; a separate event is right by default and cannot be forgotten.
-    "refusals":
-        "SELECT properties['refusal'] AS r, count() AS c, "
-        "count(DISTINCT distinct_id) AS people FROM events "
-        "WHERE event = 'render_refused' AND timestamp > now() - INTERVAL 7 DAY "
-        "GROUP BY r ORDER BY c DESC LIMIT 8",
-    "versions":
-        "SELECT properties['version'] AS v, count(DISTINCT distinct_id) AS c "
-        "FROM events WHERE event = 'app_boot' "
-        "AND timestamp > now() - INTERVAL 14 DAY GROUP BY v ORDER BY c DESC LIMIT 12",
-    "chips":
-        "SELECT properties['chip_family'] AS chip, count(DISTINCT distinct_id) AS c "
-        "FROM events WHERE event = 'app_boot' "
-        "AND timestamp > now() - INTERVAL 14 DAY GROUP BY chip ORDER BY c DESC LIMIT 12",
-    "ram":
-        "SELECT properties['ram_gb'] AS ram, count(DISTINCT distinct_id) AS c "
-        "FROM events WHERE event = 'app_boot' "
-        "AND timestamp > now() - INTERVAL 14 DAY GROUP BY ram ORDER BY c DESC LIMIT 12",
-    "pack_flips":
-        "SELECT properties['pack'] AS pack, properties['from'] AS was, "
-        "properties['to'] AS now_, count() AS c FROM events "
-        "WHERE event = 'pack_state_change' AND timestamp > now() - INTERVAL 7 DAY "
-        "GROUP BY pack, was, now_ ORDER BY c DESC",
-    # ---- Growth (2026-09-06). All-time, no window: the numbers the owner
-    # asks for first ("how many renders have we done") and the curves that
-    # say whether the app is growing. An install is a distinct_id, and it is
-    # NEW on the day of its first boot — app_installed fires once per
-    # install but only since it existed, so first-boot is the honest date.
-    "total_renders":
-        "SELECT count() FROM events WHERE event = 'render_completed'",
-    "total_installs":
-        "SELECT count(DISTINCT distinct_id) FROM events WHERE event = 'app_boot'",
-    "installs_by_day":
-        "SELECT d, count() AS c FROM (SELECT distinct_id, toDate(min(timestamp)) AS d "
-        "FROM events WHERE event = 'app_boot' GROUP BY distinct_id) "
-        "GROUP BY d ORDER BY d",
-    "renders_by_day":
-        "SELECT toDate(timestamp) AS d, count() AS c FROM events "
-        "WHERE event = 'render_completed' AND timestamp > now() - INTERVAL 30 DAY "
-        "GROUP BY d ORDER BY d",
-    # Complete weeks only: the running week would read as a collapse
-    # ("552 → 106") on a Sunday morning.
-    "active_by_week":
-        "SELECT toStartOfWeek(timestamp) AS w, count(DISTINCT distinct_id) AS c "
-        "FROM events WHERE event = 'app_boot' AND timestamp > now() - INTERVAL 12 WEEK "
-        "AND toStartOfWeek(timestamp) < toStartOfWeek(now()) "
-        "GROUP BY w ORDER BY w",
-}
+# HogQL fragments for the fleet view. Built by a function, not a static
+# dict, because the range control (stats-v2, 2026-09-30) means the "recent
+# activity" queries below no longer scope to a hardcoded 7/14/30-day window
+# — they scope to whichever range the dashboard has selected. And every one
+# carries the owner-exclusion rule: `_analytics_is_test_rig`'s SYS-41 note
+# documented "a fleet query excludes these rows with WHERE NOT test_rig"
+# while not one of these queries actually did — an agent review worktree or
+# a release-gate run with PHOSPHENE_TEST_RIG=1 was silently counted as a
+# real user. Every query is built through _fleet_where[_raw] so a new one
+# can't repeat either omission.
+_TEST_RIG_EXCLUDE = "ifNull(properties['test_rig'], 'false') != 'true'"
+
+
+def _fleet_window_sql(range_key: str, *, prior: bool = False) -> str:
+    """The events-table window fragment for one dashboard range — empty
+    for 'all' (omit the clause: no window, no meaningful "prior" either).
+    `prior=True` asks for the equal-length window immediately before the
+    current one, for "vs prior period" deltas."""
+    days = STATS_RANGE_DAYS.get(range_key, STATS_RANGE_DAYS[STATS_RANGE_DEFAULT])
+    if not days:
+        return ""
+    if prior:
+        return (f"timestamp > now() - INTERVAL {int(days) * 2} DAY "
+                f"AND timestamp <= now() - INTERVAL {int(days)} DAY")
+    return f"timestamp > now() - INTERVAL {int(days)} DAY"
+
+
+def _fleet_where_raw(event_clause: str, window_sql: str = "") -> str:
+    """WHERE body from a literal window fragment (or none) plus the
+    owner-exclusion rule. For the handful of queries whose window is a
+    fixed concept (wau's 7 days, dau's 1 day) rather than the dashboard's
+    selected range."""
+    parts = [event_clause]
+    if window_sql:
+        parts.append(window_sql)
+    parts.append(_TEST_RIG_EXCLUDE)
+    return " AND ".join(parts)
+
+
+def _fleet_where(event_clause: str, range_key: str, *, prior: bool = False) -> str:
+    """WHERE body scoped to the dashboard's selected range, plus the
+    owner-exclusion rule. The one entry point every range-aware fleet
+    query goes through."""
+    return _fleet_where_raw(event_clause, _fleet_window_sql(range_key, prior=prior))
+
+
+def _fleet_queries(range_key: str) -> dict[str, str]:
+    """HogQL fragments for the fleet view, rebuilt per dashboard range.
+
+    `*_prior` entries mirror a range-scoped query over the immediately
+    preceding equal-length window, for "vs prior period" deltas; absent
+    (empty window) when range_key is 'all'. `error_groups` groups
+    render_failed by the closed error_class taxonomy — count, distinct
+    installs affected, first/last seen, and the most frequent message in
+    that class — for the collapsible Errors section."""
+    ev_render = "event IN ('render_completed', 'render_failed')"
+    return {
+        "wau": "SELECT count(DISTINCT distinct_id) FROM events WHERE "
+               + _fleet_where_raw("event = 'app_boot'",
+                                  "timestamp > now() - INTERVAL 7 DAY"),
+        "dau": "SELECT count(DISTINCT distinct_id) FROM events WHERE "
+               + _fleet_where_raw("event = 'app_boot'",
+                                  "timestamp > now() - INTERVAL 1 DAY"),
+        "active_in_range": "SELECT count(DISTINCT distinct_id) FROM events WHERE "
+                            + _fleet_where("event = 'app_boot'", range_key),
+        "active_in_range_prior": "SELECT count(DISTINCT distinct_id) FROM events WHERE "
+                                  + _fleet_where("event = 'app_boot'", range_key, prior=True),
+        "boots_by_day":
+            "SELECT toDate(timestamp) AS d, count() AS c FROM events WHERE "
+            + _fleet_where("event = 'app_boot'", range_key)
+            + " GROUP BY d ORDER BY d",
+        "engines":
+            "SELECT properties['engine'] AS e, count() AS c FROM events WHERE "
+            + _fleet_where(ev_render, range_key) + " GROUP BY e ORDER BY c DESC",
+        "outcomes":
+            "SELECT event, count() AS c FROM events WHERE "
+            + _fleet_where(ev_render, range_key) + " GROUP BY event",
+        "outcomes_prior":
+            "SELECT event, count() AS c FROM events WHERE "
+            + _fleet_where(ev_render, range_key, prior=True) + " GROUP BY event",
+        # By INSTALLS first, then by events. Ordered by events alone the tile
+        # was owned by one 4.9.3 install with a broken model dir retrying 438
+        # times in a week (160 + 121 + 72 events of three signatures, one
+        # distinct_id each) while the errors many people hit sat below the
+        # fold (2026-09-08).
+        "top_errors":
+            "SELECT properties['error_signature'] AS sig, count() AS c, "
+            "count(DISTINCT distinct_id) AS people FROM events WHERE "
+            + _fleet_where("event = 'render_failed'", range_key)
+            + " GROUP BY sig ORDER BY people DESC, c DESC LIMIT 8",
+        # Grouped by the closed error_class taxonomy (19 values — see
+        # docs/ANALYTICS.md) instead of by free-text signature: a class is
+        # what the Errors section's redesign groups by, so the LIMIT only
+        # needs to exceed the taxonomy size. sig_cnt is a per-(class,sig)
+        # window count so argMax can pick the most-frequent message inside
+        # each class without a second query.
+        "error_groups":
+            "SELECT class, count() AS total, count(DISTINCT distinct_id) AS installs, "
+            "min(timestamp) AS first_seen, max(timestamp) AS last_seen, "
+            "argMax(sig, sig_cnt) AS top_message FROM ("
+            "SELECT properties['error_class'] AS class, "
+            "properties['error_signature'] AS sig, distinct_id, timestamp, "
+            "count() OVER (PARTITION BY properties['error_class'], "
+            "properties['error_signature']) AS sig_cnt FROM events WHERE "
+            + _fleet_where("event = 'render_failed'", range_key)
+            + ") GROUP BY class ORDER BY installs DESC, total DESC LIMIT 25",
+        # Failure rate per version, so a release that fails more than the one
+        # before it is visible the day it ships, and a storm from one install
+        # reads as one.
+        "failures_by_version":
+            "SELECT properties['version'] AS v, countIf(event = 'render_failed') AS failed, "
+            "countIf(event = 'render_completed') AS ok, count(DISTINCT distinct_id) AS people "
+            "FROM events WHERE "
+            + _fleet_where("event IN ('render_failed', 'render_completed')", range_key)
+            + " GROUP BY v ORDER BY failed DESC LIMIT 12",
+        # Refusals are a SEPARATE event, which is why none of the queries
+        # above needed an `error_class != 'refused'` clause bolted on. That
+        # was the deciding argument for a new event name over a new class: an
+        # exclusion has to be remembered by every query anyone writes later,
+        # here and in PostHog; a separate event is right by default and
+        # cannot be forgotten.
+        "refusals":
+            "SELECT properties['refusal'] AS r, count() AS c, "
+            "count(DISTINCT distinct_id) AS people FROM events WHERE "
+            + _fleet_where("event = 'render_refused'", range_key)
+            + " GROUP BY r ORDER BY c DESC LIMIT 8",
+        "versions":
+            "SELECT properties['version'] AS v, count(DISTINCT distinct_id) AS c "
+            "FROM events WHERE " + _fleet_where("event = 'app_boot'", range_key)
+            + " GROUP BY v ORDER BY c DESC LIMIT 12",
+        "chips":
+            "SELECT properties['chip_family'] AS chip, count(DISTINCT distinct_id) AS c "
+            "FROM events WHERE " + _fleet_where("event = 'app_boot'", range_key)
+            + " GROUP BY chip ORDER BY c DESC LIMIT 12",
+        "ram":
+            "SELECT properties['ram_gb'] AS ram, count(DISTINCT distinct_id) AS c "
+            "FROM events WHERE " + _fleet_where("event = 'app_boot'", range_key)
+            + " GROUP BY ram ORDER BY c DESC LIMIT 12",
+        "pack_flips":
+            "SELECT properties['pack'] AS pack, properties['from'] AS was, "
+            "properties['to'] AS now_, count() AS c FROM events WHERE "
+            + _fleet_where("event = 'pack_state_change'", range_key)
+            + " GROUP BY pack, was, now_ ORDER BY c DESC",
+        # ---- Growth (2026-09-06). All-time, no window: the numbers the
+        # owner asks for first ("how many renders have we done") and the
+        # curves that say whether the app is growing — deliberately NOT tied
+        # to the dashboard's range control. An install is a distinct_id, and
+        # it is NEW on the day of its first boot — app_installed fires once
+        # per install but only since it existed, so first-boot is the honest
+        # date.
+        "total_renders":
+            "SELECT count() FROM events WHERE "
+            + _fleet_where_raw("event = 'render_completed'"),
+        "total_installs":
+            "SELECT count(DISTINCT distinct_id) FROM events WHERE "
+            + _fleet_where_raw("event = 'app_boot'"),
+        "installs_by_day":
+            "SELECT d, count() AS c FROM (SELECT distinct_id, toDate(min(timestamp)) AS d "
+            "FROM events WHERE " + _fleet_where_raw("event = 'app_boot'")
+            + " GROUP BY distinct_id) GROUP BY d ORDER BY d",
+        "renders_by_day":
+            "SELECT toDate(timestamp) AS d, count() AS c FROM events WHERE "
+            + _fleet_where("event = 'render_completed'", range_key)
+            + " GROUP BY d ORDER BY d",
+        # Complete weeks only: the running week would read as a collapse
+        # ("552 → 106") on a Sunday morning. Fixed 12-week context window,
+        # independent of the dashboard's range control on purpose — this is
+        # an evergreen "is the app growing" curve, not a range-scoped tile.
+        "active_by_week":
+            "SELECT toStartOfWeek(timestamp) AS w, count(DISTINCT distinct_id) AS c "
+            "FROM events WHERE "
+            + _fleet_where_raw("event = 'app_boot'",
+                               "timestamp > now() - INTERVAL 12 WEEK "
+                               "AND toStartOfWeek(timestamp) < toStartOfWeek(now())")
+            + " GROUP BY w ORDER BY w",
+    }
 
 
 def _usage_growth_block(installs_by_day: list, renders_by_day: list,
@@ -17807,7 +18239,21 @@ def _usage_fleet_query_one(hogql: str, key: str) -> list:
     return rows if isinstance(rows, list) else []
 
 
-def _usage_fleet_report() -> dict | None:
+def _pct_delta(cur, prev) -> float | None:
+    """Percent change of cur vs prev, or None when it wouldn't mean
+    anything (missing data, or no prior-period baseline to compare to)."""
+    if cur is None or prev is None:
+        return None
+    try:
+        cur, prev = float(cur), float(prev)
+    except (TypeError, ValueError):
+        return None
+    if prev == 0:
+        return None
+    return round(100.0 * (cur - prev) / prev, 1)
+
+
+def _usage_fleet_report(range_key: str = STATS_RANGE_DEFAULT) -> dict | None:
     """Build the fleet payload, or None when no query key is configured.
 
     Every sub-query is independent: one failing (rate limit, schema drift,
@@ -17817,15 +18263,16 @@ def _usage_fleet_report() -> dict | None:
     key = _analytics_query_key()
     if not key:
         return None
+    queries = _fleet_queries(range_key)
     res: dict[str, list] = {}
     failures = 0
-    for name, hogql in _USAGE_FLEET_QUERIES.items():
+    for name, hogql in queries.items():
         try:
             res[name] = _usage_fleet_query_one(hogql, key)
         except Exception:
             res[name] = []
             failures += 1
-    if failures == len(_USAGE_FLEET_QUERIES):
+    if failures == len(queries):
         return None
 
     def _scalar(name):
@@ -17835,8 +18282,11 @@ def _usage_fleet_report() -> dict | None:
         except (IndexError, TypeError):
             return None
 
-    outcomes = {str(r[0]): int(r[1]) for r in (res.get("outcomes") or [])
+    def _outcomes(name):
+        rows = {str(r[0]): int(r[1]) for r in (res.get(name) or [])
                 if isinstance(r, (list, tuple)) and len(r) >= 2}
+        return rows.get("render_completed", 0), rows.get("render_failed", 0)
+
     # `people` rides along because a refusal's whole question is "how many
     # DIFFERENT people did we send into this wall" — 65 events from 16
     # people is a product bug; 65 from one person is a bookmark.
@@ -17844,8 +18294,8 @@ def _usage_fleet_report() -> dict | None:
                  "people": int(r[2]) if len(r) >= 3 else 0}
                 for r in (res.get("refusals") or [])
                 if isinstance(r, (list, tuple)) and len(r) >= 2]
-    ok_n = outcomes.get("render_completed", 0)
-    fail_n = outcomes.get("render_failed", 0)
+    ok_n, fail_n = _outcomes("outcomes")
+    ok_prior, fail_prior = _outcomes("outcomes_prior")
     engines = [{"engine": str(r[0] or "unknown"), "count": int(r[1])}
                for r in (res.get("engines") or [])
                if isinstance(r, (list, tuple)) and len(r) >= 2]
@@ -17865,11 +18315,32 @@ def _usage_fleet_report() -> dict | None:
     h3_lost = sum(r["count"] for r in flip_rows
                   if r["pack"] == "h3" and r["from"] and not r["to"])
 
+    active_n = _scalar("active_in_range")
+    active_prior_n = _scalar("active_in_range_prior")
+    error_rate_n = (round(100.0 * fail_n / (ok_n + fail_n), 1)
+                    if (ok_n + fail_n) else None)
+    error_rate_prior = (round(100.0 * fail_prior / (ok_prior + fail_prior), 1)
+                        if (ok_prior + fail_prior) else None)
+
+    error_groups = []
+    for r in (res.get("error_groups") or []):
+        if not (isinstance(r, (list, tuple)) and len(r) >= 6):
+            continue
+        error_groups.append({
+            "error_class": str(r[0] or "other"),
+            "count": int(r[1] or 0),
+            "installs": int(r[2] or 0),
+            "first_seen": str(r[3] or ""),
+            "last_seen": str(r[4] or ""),
+            "top_message": str(r[5] or "unknown error"),
+        })
+
     return {
         "ok": True,
         "source": "fleet",
         "generated_at": iso_now(),
         "cached": False,
+        "range": range_key,
         "note": "",
         "partial": failures > 0,
         "tiles": {
@@ -17877,13 +18348,31 @@ def _usage_fleet_report() -> dict | None:
             "daily_active_installs": _scalar("dau"),
             "total_renders": _scalar("total_renders"),
             "total_installs": _scalar("total_installs"),
-            "renders_7d": ok_n + fail_n,
+            "active_in_range": active_n,
+            "renders_in_range": ok_n + fail_n,
             "h3_share_pct": round(100.0 * h3 / tot, 1) if tot else None,
-            "error_rate_pct": (round(100.0 * fail_n / (ok_n + fail_n), 1)
-                               if (ok_n + fail_n) else None),
-            # Not in renders_7d and not in error_rate_pct — see the local
-            # aggregator's render_refused branch for why.
-            "refusals_7d": sum(r["count"] for r in refusals),
+            "error_rate_pct": error_rate_n,
+            # Not in renders_in_range and not in error_rate_pct — see the
+            # local aggregator's render_refused branch for why.
+            "refusals_in_range": sum(r["count"] for r in refusals),
+        },
+        # None (not zeroed) for range_key == "all". _fleet_window_sql
+        # returns an EMPTY clause for both the current and prior "all"
+        # queries (there is no window to bound them by), which means
+        # ok_prior/fail_prior/active_prior_n above are the SAME all-time
+        # totals as the current ones — _pct_delta(x, x) computes a real
+        # 0.0, not "no baseline". Gate on range_key explicitly rather than
+        # trust the arithmetic: "all time" has no prior period, full stop.
+        "deltas": {} if range_key == "all" else {
+            "renders_in_range_pct": _pct_delta(ok_n + fail_n, ok_prior + fail_prior),
+            "active_in_range_pct": _pct_delta(active_n, active_prior_n),
+            "error_rate_pp": (round(error_rate_n - error_rate_prior, 1)
+                              if error_rate_n is not None and error_rate_prior is not None
+                              else None),
+            # Raw failure-count trend for the Errors section header — a
+            # separate question from the RATE above (fewer installs total
+            # can raise the rate while the raw count falls).
+            "errors_count_pct": _pct_delta(fail_n, fail_prior),
         },
         "growth": _usage_growth_block(
             [(r[0], r[1]) for r in (res.get("installs_by_day") or [])
@@ -17900,6 +18389,7 @@ def _usage_fleet_report() -> dict | None:
                         "people": int(r[2]) if len(r) > 2 and r[2] is not None else None}
                        for r in (res.get("top_errors") or [])
                        if isinstance(r, (list, tuple)) and len(r) >= 2],
+        "error_groups": error_groups,
         "failures_by_version": [{"version": str(r[0] or "unknown"), "failed": int(r[1] or 0),
                                  "ok": int(r[2] or 0), "people": int(r[3] or 0),
                                  "count": int(r[1] or 0),
@@ -17932,12 +18422,15 @@ def _usage_attach_local(report: dict) -> dict:
     "how much have I used it", and neither can be mistaken for the other.
     """
     try:
-        local = _usage_local_report()
+        # Fixed 7-day window regardless of the dashboard's selected range —
+        # this block is an evergreen "how much have I used it" reference
+        # (same idea as the fleet tiles' wau), not the range-scoped view.
+        local = _usage_local_report("7d")
     except Exception:
         return report
     report["machine"] = {
         "total_renders": (local.get("tiles") or {}).get("total_renders"),
-        "renders_7d": (local.get("tiles") or {}).get("renders_7d"),
+        "renders_7d": (local.get("tiles") or {}).get("renders_in_range"),
         "error_rate_pct": (local.get("tiles") or {}).get("error_rate_pct"),
         "first_day": (((local.get("growth") or {}).get("installs_by_day") or [{}])[0]
                       or {}).get("date"),
@@ -17945,29 +18438,38 @@ def _usage_attach_local(report: dict) -> dict:
     return report
 
 
-def _usage_report(force: bool = False) -> dict:
+def _usage_report(force: bool = False, range_key: str = STATS_RANGE_DEFAULT) -> dict:
     """What GET /stats/usage returns. Fleet when a query key is configured
     and the 6 h cache is stale; otherwise the cache; otherwise local.
 
     Either way the payload carries `machine` (this Mac) AND says whether the
     fleet half is available — `fleet_blocked` is "no_key" or "query_failed",
     so the dashboard can show the fleet tile as unknown with a remedy instead
-    of quietly substituting a local number under a fleet label."""
+    of quietly substituting a local number under a fleet label.
+
+    Cached PER RANGE (stats-v2, 2026-09-30): USAGE_FLEET_CACHE on disk holds
+    one entry per range key, each with its own `_fetched_at`, so switching
+    the dashboard's range control doesn't serve 7-day numbers under a
+    30-day label or force a fresh PostHog round trip on every click — only
+    the FIRST time a given range goes stale within the 6 h TTL."""
+    range_key = range_key if range_key in STATS_RANGE_DAYS else STATS_RANGE_DEFAULT
     with _USAGE_FLEET_LOCK:
         if _analytics_query_key():
             if not force:
                 try:
-                    cached = json.loads(USAGE_FLEET_CACHE.read_text(encoding="utf-8"))
-                    if (time.time() - float(cached.get("_fetched_at") or 0)
+                    all_cached = json.loads(USAGE_FLEET_CACHE.read_text(encoding="utf-8"))
+                    cached = all_cached.get(range_key) if isinstance(all_cached, dict) else None
+                    if (cached and time.time() - float(cached.get("_fetched_at") or 0)
                             < USAGE_FLEET_TTL_SEC):
+                        cached = dict(cached)
                         cached["cached"] = True
                         cached["fleet_blocked"] = ""
                         return _usage_attach_local(cached)
-                except (OSError, ValueError, json.JSONDecodeError):
+                except (OSError, ValueError, json.JSONDecodeError, AttributeError):
                     pass
             fleet = None
             try:
-                fleet = _usage_fleet_report()
+                fleet = _usage_fleet_report(range_key)
             except Exception:
                 fleet = None
             if fleet:
@@ -17975,17 +18477,24 @@ def _usage_report(force: bool = False) -> dict:
                 fleet["fleet_blocked"] = ""
                 try:
                     _ensure_state_dir()
+                    try:
+                        all_cached = json.loads(USAGE_FLEET_CACHE.read_text(encoding="utf-8"))
+                        if not isinstance(all_cached, dict):
+                            all_cached = {}
+                    except (OSError, ValueError, json.JSONDecodeError):
+                        all_cached = {}
+                    all_cached[range_key] = fleet
                     atomic_write_text(USAGE_FLEET_CACHE,
-                                      json.dumps(fleet, indent=2))
+                                      json.dumps(all_cached, indent=2))
                 except Exception:
                     pass
                 return _usage_attach_local(fleet)
-            local = _usage_local_report()
+            local = _usage_local_report(range_key)
             local["fleet_blocked"] = "query_failed"
             local["warning"] = ("PostHog query failed - showing this machine "
                                 "only. Check the personal API key in Settings.")
             return _usage_attach_local(local)
-    local = _usage_local_report()
+    local = _usage_local_report(range_key)
     local["fleet_blocked"] = "no_key"
     return _usage_attach_local(local)
 
@@ -20208,6 +20717,30 @@ class WarmHelper:
                 )
             return self._dispatch_run_event(ev)
 
+    # 4.17.3 (fleet): "helper pipe closed without an event; returncode=None"
+    # — 23 failed renders over 30 days on 15 installs, three of them on
+    # 4.17.2 right after a GPU-watchdog crash. The helper's stdout reaches
+    # EOF the instant the kernel tears the process down, a moment BEFORE
+    # the exit status can be reaped, so a bare poll() lost that race and
+    # returned None: the user got a message naming nothing, and the Now
+    # card offered no remedy, for what was really a SIGABRT (watchdog) or
+    # SIGKILL (out of memory) that the branch below knows how to explain.
+    # Wait briefly for the real exit status instead of sampling it once.
+    REAP_WAIT_SEC = 5.0
+
+    def _reap_returncode(self, proc) -> int | None:
+        if proc is None:
+            return None
+        rc = proc.poll()
+        if rc is not None:
+            return rc
+        try:
+            return proc.wait(timeout=self.REAP_WAIT_SEC)
+        except subprocess.TimeoutExpired:
+            return None
+        except Exception:                                  # noqa: BLE001
+            return proc.poll()
+
     def _dispatch_run_event(self, ev: dict | None) -> dict:
         if ev is None:
             # Pipe closed without an event. peanut review correction: don't
@@ -20216,7 +20749,7 @@ class WarmHelper:
             # native-level abort. Inspect proc.returncode to actually name
             # the signal so users have a real datapoint to share.
             proc = self.proc
-            rc = proc.poll() if proc else None
+            rc = self._reap_returncode(proc)
             if rc is not None and rc < 0:
                 sig_num = -rc
                 try:
@@ -21776,11 +22309,8 @@ def sb_lipsync_retake_plan(shots: list, scores: dict, attempts: dict,
         used = int(attempts.get(n) or 0)
         if used >= limit:
             continue
-        try:
-            base = int(s.get("seed"))
-        except (TypeError, ValueError):
-            base = 0
-        out.append((n, base + 211 * (used + 1)))
+        base = max(0, normalize_seed(s.get("seed")))
+        out.append((n, normalize_seed(base + 211 * (used + 1))))
     return out
 
 
@@ -22429,6 +22959,60 @@ def take_estimate_minutes(engine: str, quality: str, seconds) -> float | None:
 TAKE_LIGHT_DRIFT_RETAKES = 1
 
 
+# 4.17.3 (fleet): MLX's mx.random.seed() takes an unsigned 64-bit int and
+# nothing else — a negative number (other than our own -1 = random) or one of
+# 2**64 and up dies inside the engine with "seed(): incompatible function
+# arguments. The following argument types are supported: ...", which names
+# nothing the user typed. The Seed box is free text, so a 20-digit seed pasted
+# from another tool, or "-5", reached it untouched (22 failed renders across
+# 4.6.0 -> 4.17.2, every one retried with the same seed). Text that isn't a
+# number at all ("abc") died one step earlier with "invalid literal for
+# int()". Every seed now passes through here at the panel boundary, and the
+# helper re-applies the same rule (_coerce_seed) for jobs saved before this.
+#
+# The ceiling is 2**63, not 2**64, on purpose: windows, extends, retakes and
+# image batches add small offsets (seed + k, + 101, + 211 * attempt) and
+# must never be pushed over the engine's limit by our own arithmetic.
+SEED_LIMIT = 2 ** 63
+
+
+def normalize_seed(raw: object) -> int:
+    """-1 (random) or a seed in [0, SEED_LIMIT) that every engine accepts.
+
+    Empty, -1, "random" or text that is not a whole number -> -1 (random,
+    the panel's own default). An out-of-range number maps DETERMINISTICALLY
+    (|n| mod SEED_LIMIT), so a pinned seed stays repeatable — the same typed
+    value always renders the same clip, and the sidecar's seed_used records
+    the number that was actually used."""
+    if raw is None or isinstance(raw, bool):
+        return -1
+    if isinstance(raw, float):
+        if raw != raw or raw in (float("inf"), float("-inf")) or not raw.is_integer():
+            return -1
+        n = int(raw)
+    elif isinstance(raw, int):
+        n = raw
+    else:
+        s = str(raw).strip().replace("_", "").replace(",", "").replace(" ", "")
+        if s.lower() in ("", "-1", "random", "none", "null"):
+            return -1
+        try:
+            n = int(s)
+        except ValueError:
+            try:
+                import decimal as _dec
+                d = _dec.Decimal(s)
+            except (ArithmeticError, ValueError):
+                return -1
+            if not d.is_finite() or d != d.to_integral_value():
+                return -1
+            n = int(d)
+    if n == -1:
+        return -1
+    n = abs(n)
+    return n % SEED_LIMIT if n >= SEED_LIMIT else n
+
+
 def _take_retry_seed(original: object, offset: int) -> str:
     """The seed a take retry (light-drift or lip-sync) should submit.
 
@@ -22440,13 +23024,10 @@ def _take_retry_seed(original: object, offset: int) -> str:
     valid int), so the deterministic branch ran unconditionally and every
     random take's retakes landed on the exact same seed, every time, on
     every install (VA-16)."""
-    raw = str(original if original is not None else "-1").strip()
-    if raw in ("", "-1"):
+    base = normalize_seed(original)
+    if base < 0:
         return "-1"
-    try:
-        return str(int(raw) + int(offset))
-    except (TypeError, ValueError):
-        return "-1"
+    return str(normalize_seed(base + int(offset)))
 
 
 def take_estimate_minutes_worst(engine: str, quality: str, seconds) -> float | None:
@@ -28772,38 +29353,83 @@ def a2v_length_refusal(frames: int, cap: int) -> str:
 #
 # `audio_stem` names a stem the caller already has (the music-video route
 # passes one for the whole film). `audio_stem_auto` asks the panel to make one
-# with demucs, and is allowed to fail: a missing optional tool becomes a NOTE,
-# never a refused render.
+# with the VOCAL SEPARATOR (demucs, run through scripts/a2v_separate.py in the
+# engine venv). It is part of every install and every Update
+# (scripts/pinokio/a2v_stems_deps.sh); the panel can also install it itself.
+#
+# NEVER A SILENT FALLBACK. Until 4.17 a missing or broken separator turned
+# into one line in the job log and a render conditioned on the FULL MIX -
+# which is the render "Listen to the voice only" exists to prevent, and which
+# on a real ballad barely opened the mouth for twelve seconds. Nothing
+# installed the separator (the script was run-it-yourself), and the one a user
+# could install died at the very end: demucs 4.0.1's CLI saves through
+# torchaudio, which since 2.9 needs torchcodec. So every user asking for the
+# voice got the mix, told only in a log line. Now: missing = the queue says
+# so and offers the install; failed = the job fails with the cause. A user
+# who wants the mix unticks the box.
 A2V_STEM_DIR = "a2v_stems"
 A2V_STEM_TIMEOUT_S = 900
+A2V_SEPARATOR_MODEL = "htdemucs"
+# The torch.hub checkpoint htdemucs loads (demucs/remote/files.txt). Kept
+# here so the panel can say "ready" without importing torch.
+A2V_SEPARATOR_WEIGHTS = "955717e8-8726e21a.th"
+A2V_SEPARATOR_RUNNER = ROOT / "scripts" / "a2v_separate.py"
+A2V_SEPARATOR_INSTALLER = "scripts/pinokio/a2v_stems_deps.sh"
 A2V_STEM_MISSING_NOTE = (
-    "Voice-only is on but demucs is not installed, so this clip was "
-    "conditioned on the full mix instead. Run scripts/pinokio/"
-    "a2v_stems_deps.sh once (from a Terminal, inside this install's "
-    "engine venv) to add vocal separation, then try again."
-)
+    "Vocal separation is not installed, so \u201cListen to the voice only\u201d "
+    "cannot run. Install it from the Lip-sync form (about 90 MB, once), or "
+    "untick \u201cListen to the voice only\u201d to render against the full mix.")
 
 
-def _resolve_demucs() -> Path | None:
-    """The demucs executable this panel may use, or None.
+def a2v_separator_torch_home() -> Path:
+    """Where the separator's weights live: with the rest of Phosphene's
+    weights, not in a per-user torch cache a clean-up can empty."""
+    return MODELS_DIR / "demucs"
 
-    ONLY TOOLS AN INSTALL SCRIPT CAN PROVIDE. The engine venv's own bin comes
-    first - that is where `scripts/pinokio/a2v_stems_deps.sh` puts it - then
-    the ordinary resolver (env override, PATH, Pinokio's tool folders,
-    Homebrew). Some other project's virtualenv on this Mac is not a dependency
-    of Phosphene and must never become one by accident, which is why nothing
-    here reaches outside those.
 
-    `_resolve_tool` returns a LAST-RESORT path that need not exist, so the
-    result is checked before it is believed: a separator that is not there has
-    to read as "not installed" at plan time, never as a command that dies
-    twenty minutes into a render.
-    """
-    beside = HELPER_PYTHON.parent / "demucs"
-    if beside.is_file():
-        return beside
-    cand = _resolve_tool("demucs", "PHOSPHENE_DEMUCS")
-    return cand if cand.is_file() else None
+def _a2v_separator_site_packages() -> list[Path]:
+    venv = HELPER_PYTHON.parent.parent
+    return sorted(venv.glob("lib/python3*/site-packages"))
+
+
+def a2v_separator_status() -> dict:
+    """Is "Listen to the voice only" able to run on this install?
+
+    File checks only - no torch import, so /status can afford it. `ready`
+    needs the demucs package AND torch in the engine venv; the weights are
+    fetched by the installer, and fetched on first use if they are not."""
+    sites = _a2v_separator_site_packages()
+    package = any((s / "demucs" / "apply.py").is_file() for s in sites)
+    torch = any((s / "torch" / "__init__.py").is_file() for s in sites)
+    weights = (a2v_separator_torch_home() / "hub" / "checkpoints"
+               / A2V_SEPARATOR_WEIGHTS).is_file()
+    ready = package and torch and A2V_SEPARATOR_RUNNER.is_file()
+    with A2V_SEPARATOR_INSTALL_LOCK:
+        install = {k: v for k, v in A2V_SEPARATOR_INSTALL.items() if k != "log"}
+        install["log"] = list(A2V_SEPARATOR_INSTALL.get("log") or [])[-6:]
+    return {"ready": ready, "package": package, "torch": torch,
+            "weights": weights, "model": A2V_SEPARATOR_MODEL,
+            "install": install}
+
+
+def _a2v_separator_command() -> list[str] | None:
+    """The command prefix that separates a song, or None when this install
+    cannot. Only what OUR installer provides counts: the engine venv's own
+    interpreter running our own runner. Some other project's demucs on this
+    Mac is not a dependency of Phosphene."""
+    if not a2v_separator_status()["ready"]:
+        return None
+    return [str(HELPER_PYTHON), str(A2V_SEPARATOR_RUNNER),
+            "--ffmpeg", str(FFMPEG), "--model", A2V_SEPARATOR_MODEL]
+
+
+def _a2v_separator_env() -> dict:
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("PYTORCH_ENABLE_MPS_FALLBACK", "PYTORCH_MPS_FAST_MATH",
+                        "PYTHONPATH", "PYTHONHOME")}
+    env["TORCH_HOME"] = str(a2v_separator_torch_home())
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
 
 
 def _a2v_stem_cache_path(audio_src: str) -> Path:
@@ -28820,22 +29446,18 @@ def _a2v_stem_cache_path(audio_src: str) -> Path:
     return STATE_DIR / A2V_STEM_DIR / digest / "vocals.wav"
 
 
-def _a2v_separate_vocals(audio_src: str, demucs: Path) -> Path:
-    """Separate the vocal out of `audio_src` with demucs. Cached; raises on
-    failure so the caller can turn it into a note.
+def _a2v_separate_vocals(audio_src: str, separator: list[str]) -> Path:
+    """Separate the vocal out of `audio_src`. Cached; raises on failure.
 
-    TRACKED, because Stop has to reach it. Separation is minutes of CPU at the
-    front of a render, and a bare `subprocess.run` is invisible to
-    `stop_current_job`: pressing Stop killed the helper and left demucs
-    grinding on, with the queue held by a job the user had already cancelled,
-    until it finished or the 900 s timeout fired (Codex review, 2026-09-22).
-    `run_tracked_subprocess` registers the child's process group under the key
-    Stop already kills, refuses to start after Stop, and raises `JobCancelled`
-    when Stop ended it — which is NOT a separation failure and must not be
-    turned into one. It also states the text-mode trio itself, including
-    `errors="replace"`: a strict UTF-8 decode of another program's output
-    would end the render with a codec error no user could act on, and demucs
-    prints a progress bar (the fleet has 42 of those from ffmpeg alone).
+    TRACKED, because Stop has to reach it. Separation is up to a minute of CPU
+    at the front of a render, and a bare `subprocess.run` is invisible to
+    `stop_current_job`: pressing Stop killed the helper and left the separator
+    grinding on, with the queue held by a job the user had already cancelled
+    (Codex review, 2026-09-22). `run_tracked_subprocess` registers the child's
+    process group under the key Stop already kills, refuses to start after
+    Stop, and raises `JobCancelled` when Stop ended it - which is NOT a
+    separation failure. It also states the text-mode trio itself, including
+    `errors="replace"`.
     """
     cached = _a2v_stem_cache_path(audio_src)
     if cached.is_file() and cached.stat().st_size > 0:
@@ -28843,55 +29465,175 @@ def _a2v_separate_vocals(audio_src: str, demucs: Path) -> Path:
     work = cached.parent / "work"
     work.mkdir(parents=True, exist_ok=True)
     try:
+        out = work / "vocals.wav"
         proc = run_tracked_subprocess(
-            [str(demucs), "--two-stems=vocals", "-o", str(work), str(audio_src)],
+            [*separator, "--in", str(audio_src), "--out", str(out)],
             pgid_key="mux_pgid", label="the vocal separation",
-            job=_thread_job(), timeout=A2V_STEM_TIMEOUT_S)
+            job=_thread_job(), timeout=A2V_STEM_TIMEOUT_S,
+            env=_a2v_separator_env())
         if proc.returncode != 0:
-            tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:]
-            raise RuntimeError(f"demucs failed: {tail[0] if tail else 'no output'}")
-        found = sorted(work.rglob("vocals.*"))
-        if not found:
-            raise RuntimeError("demucs wrote no vocals stem")
+            lines = (proc.stderr or proc.stdout or "").strip().splitlines()
+            reason = next((l for l in reversed(lines) if l.strip()
+                           and not l.startswith((" ", "Traceback"))), "no output")
+            raise RuntimeError(reason[:300])
+        if not out.is_file() or out.stat().st_size <= 44:
+            raise RuntimeError("the separator wrote no vocal")
         cached.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(found[0]), str(cached))
+        shutil.move(str(out), str(cached))
     finally:
-        # Including on Stop: a killed separation leaves half a model's output
-        # behind, and the next attempt must not find it.
+        # Including on Stop: a killed separation leaves half a file behind,
+        # and the next attempt must not find it.
         shutil.rmtree(work, ignore_errors=True)
     return cached
+
+
+def a2v_wants_stem(params: dict) -> bool:
+    return str(params.get("audio_stem_auto") or "").strip().lower() \
+        in ("1", "true", "on", "yes")
+
+
+def a2v_stem_refusal(params: dict) -> str | None:
+    """Queue-time check: the message when this a2v job asks for the voice
+    alone and this install cannot separate one. None = fine to queue."""
+    if str(params.get("mode") or "") != "a2v":
+        return None
+    if str(params.get("audio_stem") or "").strip() or not a2v_wants_stem(params):
+        return None
+    return None if _a2v_separator_command() else A2V_STEM_MISSING_NOTE
 
 
 def a2v_conditioning_audio(params: dict, audio_src: str) -> tuple[str, str]:
     """(the waveform the model listens to, a note for the user).
 
-    The note is empty when there is nothing to say. An explicit `audio_stem`
-    that is not a file RAISES - it is a typo in something the caller wrote,
-    and silently rendering the full mix would hide it. `audio_stem_auto` never
-    raises: the optional tool is optional.
-    """
+    An explicit `audio_stem` that is not a file RAISES - it is a typo in
+    something the caller wrote. `audio_stem_auto` with no separator, or a
+    separation that fails, RAISES too: the user asked for the voice, and a
+    render of the full mix is the thing they were avoiding (see above).
+    The note is only ever informational."""
     stem = str(params.get("audio_stem") or "").strip()
     if stem:
         if not Path(stem).is_file():
             raise RuntimeError(f"vocal stem not found: {stem}")
         return stem, ""
-    want_auto = str(params.get("audio_stem_auto") or "").strip().lower() \
-        in ("1", "true", "on", "yes")
-    if not want_auto:
+    if not a2v_wants_stem(params):
         return audio_src, ""
-    demucs = _resolve_demucs()
-    if demucs is None:
-        return audio_src, A2V_STEM_MISSING_NOTE
+    separator = _a2v_separator_command()
+    if separator is None:
+        raise RenderRefused("vocal_separator", A2V_STEM_MISSING_NOTE)
     try:
-        return str(_a2v_separate_vocals(audio_src, demucs)), ""
+        return (str(_a2v_separate_vocals(audio_src, separator)),
+                "the model listens to the separated vocal")
     except JobCancelled:
-        # The user stopped the job. That is not a tool that failed, and
-        # degrading to the full mix here would start a twenty-minute render
-        # of a clip nobody asked for any more.
         raise
     except Exception as exc:                                     # noqa: BLE001
-        return audio_src, (f"Could not separate the vocal ({exc}), so this "
-                           f"clip was conditioned on the full mix.")
+        raise RuntimeError(
+            f"Could not separate the vocal ({exc}). Nothing was rendered. "
+            f"Try again, reinstall vocal separation from the Lip-sync form, "
+            f"or untick \u201cListen to the voice only\u201d to render "
+            f"against the full mix.") from exc
+
+
+# --- In-panel install of the vocal separator --------------------------------
+# The same script install.js and every Update run, started from the Lip-sync
+# form - where the user notices it is missing - instead of from a sidebar.
+A2V_SEPARATOR_INSTALL_LOCK = threading.Lock()
+A2V_SEPARATOR_INSTALL: dict = {"state": "idle", "active": False}
+
+
+def a2v_separator_install_start() -> tuple[int, dict]:
+    with A2V_SEPARATOR_INSTALL_LOCK:
+        if A2V_SEPARATOR_INSTALL.get("active"):
+            return 409, {"error": "Vocal separation is already installing.",
+                         "install": True}
+    if a2v_separator_status()["ready"] and a2v_separator_status()["weights"]:
+        return 200, {"ok": True, "nothing_to_do": True}
+    with A2V_SEPARATOR_INSTALL_LOCK:
+        A2V_SEPARATOR_INSTALL.clear()
+        A2V_SEPARATOR_INSTALL.update({
+            "state": "running", "active": True, "started_ts": time.time(),
+            "finished_ts": None, "error": None,
+            "log": collections.deque(maxlen=60)})
+    threading.Thread(target=_a2v_separator_install_thread, daemon=True,
+                     name="a2v-separator-install").start()
+    push("[a2v] installing vocal separation (the same step Install and Update run)")
+    return 202, {"ok": True, "started": True}
+
+
+def _a2v_separator_install_thread() -> None:
+    env = _music_install_env()          # Pinokio's uv on PATH, venv deactivated
+    env["PHOSPHENE_SEPARATOR_HOME"] = str(a2v_separator_torch_home())
+    cmd = ["bash", A2V_SEPARATOR_INSTALLER, str(HELPER_PYTHON.parent.parent.parent)]
+    tail: list[str] = []
+    error = None
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(ROOT), env=env,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                errors="replace", start_new_session=True)
+        for raw in proc.stdout:
+            for line in raw.replace("\r", "\n").splitlines():
+                line = line.rstrip()
+                if not line:
+                    continue
+                tail = (tail + [line])[-8:]
+                with A2V_SEPARATOR_INSTALL_LOCK:
+                    A2V_SEPARATOR_INSTALL["log"].append(line[:300])
+        rc = proc.wait(timeout=1800)
+        if rc != 0:
+            reason = next((l for l in reversed(tail)
+                           if not l.startswith(("+", "Traceback"))), "")
+            error = f"the install stopped (exit {rc})" + (f": {reason}" if reason else "")
+    except Exception as exc:                                     # noqa: BLE001
+        error = f"the install could not run: {exc}"
+    st = a2v_separator_status()
+    if error is None and not st["ready"]:
+        error = "the install finished but the separator is still not importable"
+    with A2V_SEPARATOR_INSTALL_LOCK:
+        A2V_SEPARATOR_INSTALL.update(active=False, finished_ts=time.time(),
+                                     state="failed" if error else "done",
+                                     error=error)
+    push("[a2v] vocal separation " + (f"install failed: {error}" if error
+                                      else "installed - Listen to the voice only is ready"))
+
+
+# --- A2V CHARACTER LORA: KEEP THE FACE, FREE THE MOUTH -----------------------
+# A character LoRA at full strength through both a2v stages mutes the singer.
+# Measured on the 4.17 power ballad (same still, seed, vocal stem, prompt and
+# audio slice; only the LoRA changed - PM hub lipsync_quality.txt): with
+# bizarrotrn_v2 at 1.0 the mouth opened about half as wide on sung frames
+# (voiced aperture 0.082 vs 0.158 without it) and did not follow the voice
+# (zero-lag correlation 0.07 vs 0.47). The owner's verdict on the LoRA take:
+# "the lip sync doesn't work". Without the LoRA it belts - and the face
+# drifts off the character.
+#
+# The Q8 lane is two stages: stage 1 decides the MOTION (jaw, head, timing
+# against the audio), stage 2 refines the DETAIL at full resolution, which is
+# where a likeness lives. So on that lane the LoRA sits out stage 1 and comes
+# back for stage 2 (mlx_warm_helper._a2v_lora_stage_schedule): the singing of
+# the no-LoRA render, with the face pulled back toward the character
+# (A2V_LORA_STAGES_DEFAULT). The Q4 distilled lane has no such seam, so there
+# the LoRA applies as asked and the form says so.
+#
+# `a2v_lora_stages` on the job overrides: "full" (the old behaviour), or an
+# explicit "s1,s2" pair of multipliers (0..2).
+A2V_LORA_STAGES_DEFAULT = (0.0, 1.0)
+
+
+def a2v_lora_stage_scales(p: dict, *, q8: bool = True) -> tuple[float, float] | None:
+    """(stage-1, stage-2) multipliers for the LoRAs on an a2v render, or None
+    for "as asked, in both stages"."""
+    raw = str(p.get("a2v_lora_stages") or "").strip().lower()
+    if not q8 or raw == "full":
+        return None
+    if not raw:
+        return A2V_LORA_STAGES_DEFAULT
+    try:
+        s1, s2 = (float(x) for x in raw.split(","))
+    except ValueError:
+        return A2V_LORA_STAGES_DEFAULT
+    if not all(0.0 <= v <= 2.0 for v in (s1, s2)):
+        return A2V_LORA_STAGES_DEFAULT
+    return None if (s1, s2) == (1.0, 1.0) else (s1, s2)
 
 
 def a2v_mux_original_audio(video: Path, audio_src: str, *,
@@ -29212,10 +29954,7 @@ def make_job(form: dict[str, list[str]] | dict[str, str], *,
             n = max(1, min(8, int(f("n", "1") or 1)))
         except (TypeError, ValueError):
             n = 4
-        try:
-            seed = int(f("seed", "-1") or -1)
-        except (TypeError, ValueError):
-            seed = -1
+        seed = normalize_seed(f("seed", "-1"))
         engine_override = (f("engine_override", "auto") or "auto").lower()
         # HiDream is hidden from the dropdown (v3.0.3) but a saved pick or a
         # Load Params of an old sidecar still names it; on the ~all installs
@@ -29773,7 +30512,7 @@ def make_job(form: dict[str, list[str]] | dict[str, str], *,
             "height": max(32, int(f("height", str(default_h)) or default_h)),
             "frames": max(1, int(f("frames", _frames_default) or _frames_default)),
             "steps": max(1, int(f("steps", "8") or 8)),
-            "seed": f("seed", "-1") or "-1",
+            "seed": str(normalize_seed(f("seed", "-1"))),
             # Empty unless LTX_DEFAULT_IMAGE names a file that exists — see
             # default_reference_image() for why this used to be a phantom.
             "image": f("image", default_reference_image()),
@@ -29791,6 +30530,9 @@ def make_job(form: dict[str, list[str]] | dict[str, str], *,
             # the make_job allowlist trap this file warns about throughout.
             "audio_stem": f("audio_stem", ""),
             "audio_stem_auto": f("audio_stem_auto", ""),
+            # A2V character-LoRA stage policy (see a2v_lora_stage_scales()).
+            # SAME allowlist trap: leave it out and the choice no-ops.
+            "a2v_lora_stages": f("a2v_lora_stages", ""),
             # A2V multi-anchor images (fd2356d, mlx_warm_helper._a2v_anchor_images):
             # JSON list of {path, frame_idx, strength}. The manual UI only ever
             # sends frame_idx 0 (the "Continue the song" flow — see
@@ -30599,10 +31341,7 @@ def run_image_job_inner(job: dict) -> None:
         n = max(1, min(8, int(p.get("n") or 1)))
     except (TypeError, ValueError):
         n = 4
-    try:
-        seed = int(p.get("seed", -1))
-    except (TypeError, ValueError):
-        seed = -1
+    seed = normalize_seed(p.get("seed", -1))
     base_seed = seed if seed >= 0 else None
 
     # Validate refs against UPLOADS / OUTPUT — same path-traversal guard
@@ -32631,10 +33370,7 @@ def run_h3_job_inner(job: dict) -> None:
     # Seed: the panel keeps "-1" = random. H3's runner has no random mode, so
     # resolve it here and record what we used (matches the LTX seed_used
     # contract the ⓘ modal + Load Params already read).
-    try:
-        seed = int(str(p.get("seed", "-1") or "-1").strip())
-    except (TypeError, ValueError):
-        seed = -1
+    seed = normalize_seed(p.get("seed", "-1"))
     if seed < 0:
         seed = random.randint(0, 2**31 - 1)
     p["seed_used"] = seed
@@ -33648,11 +34384,8 @@ def _run_windows_chain(job: dict, p: dict, plan: dict, first: Path,
                 *enc, "-movflags", "+faststart", str(tail)], f"Windows: tail {k - 1}")
             ctx_frames = end - start + 1
             out = work / f"{raw_out.stem}_w{k}{raw_out.suffix}"
-            seed = p.get("seed_used") if p.get("seed_used") is not None else p.get("seed")
-            try:
-                seed = int(seed)
-            except (TypeError, ValueError):
-                seed = -1
+            seed = normalize_seed(p.get("seed_used") if p.get("seed_used") is not None
+                                  else p.get("seed"))
             spec = {
                 "action": "extend",
                 "id": job["id"],
@@ -35937,6 +36670,14 @@ def run_job_inner(job: dict) -> None:
         # same selection silently vanished when this Mac (or a missing High
         # add-on) put the render on the Q4 distilled lane (LTX-03).
         a2v_params["loras"] = a2v_loras
+        # Keep the face, free the mouth: the LoRA sits out the motion stage
+        # on the Q8 lane (see A2V_LORA_STAGES_DEFAULT).
+        _stage_scales = (a2v_lora_stage_scales(p, q8=uses_q8)
+                         if a2v_loras else None)
+        if _stage_scales:
+            a2v_params["lora_stage_scales"] = list(_stage_scales)
+            push(f"[a2v] LoRAs x{_stage_scales[0]:g} while the performance is "
+                 f"shaped, x{_stage_scales[1]:g} for the face detail")
         # Multi-anchor images (fd2356d, mlx_warm_helper._a2v_anchor_images).
         # The product surface is "Continue the song" (frame_idx 0 only — see
         # continue_song_anchor()); a general multi-anchor list stays reachable
@@ -36057,6 +36798,9 @@ def run_job_inner(job: dict) -> None:
             # record of which lane default a clip was rendered at.
             "audio_conditioning_scale_used":
                 a2v_params["audio_conditioning_scale"],
+            # (stage-1, stage-2) LoRA multipliers the helper ran, or None =
+            # the LoRAs as asked in both stages (or no LoRAs at all).
+            "lora_stage_scales_used": a2v_params.get("lora_stage_scales"),
             "started": job.get("started_at"),
             "elapsed_sec": round(time.time() - job["started_ts"], 2)
             if job.get("started_ts") else None,
@@ -40647,10 +41391,7 @@ class Handler(BaseHTTPRequestHandler):
                                     "error": f"character {cid!r} is not "
                                              f"installed"}, 400)
                         return
-                    try:
-                        seed = int(f("seed", "-1") or -1)
-                    except ValueError:
-                        seed = -1
+                    seed = normalize_seed(f("seed", "-1"))
                     shots = [s for s in (board.get("shots") or [])
                              if isinstance(s, dict)]
                     n = max([int(s.get("n") or 0) for s in shots] or [0]) + 1

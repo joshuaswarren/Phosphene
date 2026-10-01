@@ -176,40 +176,36 @@ class ConditioningAudioIsNotAlwaysTheSoundtrack(unittest.TestCase):
                 {"audio_stem": str(self.root / "nope.wav")}, str(self.song))
         self.assertIn("nope.wav", str(cm.exception))
 
-    def test_auto_without_demucs_degrades_with_a_visible_note(self):
-        with mock.patch.object(P, "_resolve_demucs", return_value=None):
-            got, note = P.a2v_conditioning_audio(
-                {"audio_stem_auto": "on"}, str(self.song))
-        self.assertEqual(got, str(self.song))
-        # VA-21: the note used to claim a Pinokio sidebar entry that does not
-        # exist (a2v_stems_deps.sh has no pinokio.js menu item). Reworded to
-        # name the real path — running the script directly.
-        self.assertIn("a2v_stems_deps.sh", note)
+    def test_auto_without_a_separator_is_refused_not_rendered_on_the_mix(self):
+        # 4.17.x: this used to DEGRADE to the full mix with a log note, which
+        # is the render "Listen to the voice only" exists to prevent.
+        with mock.patch.object(P, "_a2v_separator_command", return_value=None):
+            with self.assertRaises(P.RenderRefused) as cm:
+                P.a2v_conditioning_audio({"audio_stem_auto": "on"}, str(self.song))
+        self.assertEqual(cm.exception.reason, "vocal_separator")
+        self.assertIn("Install it from the Lip-sync form", str(cm.exception))
 
-    def test_auto_that_fails_mid_separation_never_fails_the_job(self):
-        with mock.patch.object(P, "_resolve_demucs",
-                               return_value=Path("/bin/true")), \
+    def test_auto_that_fails_mid_separation_fails_the_job(self):
+        with mock.patch.object(P, "_a2v_separator_command", return_value=["sep"]), \
              mock.patch.object(P, "_a2v_separate_vocals",
-                               side_effect=RuntimeError("demucs failed: boom")):
-            got, note = P.a2v_conditioning_audio(
-                {"audio_stem_auto": "1"}, str(self.song))
-        self.assertEqual(got, str(self.song))
-        self.assertIn("full mix", note)
+                               side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError) as cm:
+                P.a2v_conditioning_audio({"audio_stem_auto": "1"}, str(self.song))
+        self.assertIn("boom", str(cm.exception))
+        self.assertIn("full mix", str(cm.exception))
 
     def test_auto_that_works_hands_back_the_stem(self):
-        with mock.patch.object(P, "_resolve_demucs",
-                               return_value=Path("/bin/true")), \
+        with mock.patch.object(P, "_a2v_separator_command", return_value=["sep"]), \
              mock.patch.object(P, "_a2v_separate_vocals",
                                return_value=self.stem):
             got, note = P.a2v_conditioning_audio(
                 {"audio_stem_auto": "true"}, str(self.song))
         self.assertEqual(got, str(self.stem))
-        self.assertEqual(note, "")
 
     def test_auto_is_off_unless_it_is_asked_for(self):
         for raw in ("", "0", "off", "no", None):
             with self.subTest(raw=raw):
-                with mock.patch.object(P, "_resolve_demucs") as res:
+                with mock.patch.object(P, "_a2v_separator_command") as res:
                     got, note = P.a2v_conditioning_audio(
                         {"audio_stem_auto": raw}, str(self.song))
                 res.assert_not_called()
@@ -240,20 +236,20 @@ class StopCanEndASeparation(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.song = self.root / "song.wav"
         self.song.write_bytes(b"RIFF....WAVE")
-        # A stand-in separator: writes what demucs writes, exits 0.
-        self.demucs = self.root / "demucs"
+        # A stand-in separator with the runner's CLI: --in SRC --out DST.
+        self.demucs = self.root / "separator"
         self.demucs.write_text(
             "#!/bin/sh\n"
             'out=""\n'
-            'while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done\n'
-            'mkdir -p "$out/htdemucs/song" && printf RIFF > "$out/htdemucs/song/vocals.wav"\n'
+            'while [ $# -gt 0 ]; do [ "$1" = "--out" ] && out="$2"; shift; done\n'
+            'head -c 100 /dev/zero > "$out"\n'
             "exit 0\n")
         self.demucs.chmod(0o755)
         self.job = {"id": "job-stem-1", "cancel_requested": False}
 
     def _separate(self):
         with mock.patch.object(P, "_thread_job", return_value=self.job):
-            return P._a2v_separate_vocals(str(self.song), self.demucs)
+            return P._a2v_separate_vocals(str(self.song), [str(self.demucs)])
 
     def test_a_real_separation_still_produces_the_stem(self):
         # The gate is a real exit code from a real child, not a mock.
@@ -282,22 +278,21 @@ class StopCanEndASeparation(unittest.TestCase):
         self.job["cancel_requested"] = True
         with mock.patch.object(P, "_thread_job", return_value=self.job):
             with self.assertRaises(P.JobCancelled):
-                P._a2v_separate_vocals(str(self.song), self.demucs)
+                P._a2v_separate_vocals(str(self.song), [str(self.demucs)])
 
-    def test_a_separation_that_fails_is_still_only_a_note(self):
+    def test_a_separation_that_fails_fails_the_job(self):
         self.demucs.write_text("#!/bin/sh\necho 'no such model' >&2\nexit 1\n")
         self.demucs.chmod(0o755)
         with mock.patch.object(P, "_thread_job", return_value=self.job), \
-             mock.patch.object(P, "_resolve_demucs", return_value=self.demucs):
-            got, note = P.a2v_conditioning_audio(
-                {"audio_stem_auto": "on"}, str(self.song))
-        self.assertEqual(got, str(self.song))
-        self.assertIn("full mix", note)
+             mock.patch.object(P, "_a2v_separator_command", return_value=[str(self.demucs)]):
+            with self.assertRaises(RuntimeError) as cm:
+                P.a2v_conditioning_audio({"audio_stem_auto": "on"}, str(self.song))
+        self.assertIn("no such model", str(cm.exception))
 
     def test_stop_during_the_separation_is_never_downgraded_to_a_note(self):
         # A cancelled job must not quietly become a full-mix render that the
         # user then waits twenty minutes for.
-        with mock.patch.object(P, "_resolve_demucs", return_value=self.demucs), \
+        with mock.patch.object(P, "_a2v_separator_command", return_value=[str(self.demucs)]), \
              mock.patch.object(P, "_a2v_separate_vocals",
                                side_effect=P.JobCancelled("Stopped during it.")):
             with self.assertRaises(P.JobCancelled):
@@ -322,24 +317,17 @@ class StopCanEndASeparation(unittest.TestCase):
 
 class OnlyToolsTheInstallScriptsProvide(unittest.TestCase):
 
-    def test_a_resolved_demucs_is_a_file_that_exists_or_nothing(self):
-        # `_resolve_tool` ends on a LAST-RESORT path that need not exist. A
-        # separator that is not there has to read as "not installed" now, not
-        # as a command that dies twenty minutes into a render.
-        got = P._resolve_demucs()
-        self.assertTrue(got is None or got.is_file())
+    def test_the_separator_is_our_runner_in_the_engine_venv_or_nothing(self):
+        got = P._a2v_separator_command()
+        if got is not None:
+            self.assertEqual(got[:2], [str(P.HELPER_PYTHON), str(P.A2V_SEPARATOR_RUNNER)])
 
     def test_no_foreign_virtualenv_is_a_dependency(self):
         # Some other project's venv on this Mac is not a dependency of
         # Phosphene, and an install script cannot provide one.
         self.assertNotIn("voice-lab", PANEL_SRC)
-        # The resolver looks at exactly two places: the engine venv's own bin
-        # (what the installer script fills) and the ordinary tool resolver
-        # (env override, PATH, Pinokio's folders, Homebrew). Anything else
-        # would be a path this project cannot install into.
-        body = PANEL_SRC.split("def _resolve_demucs")[1].split("\ndef ")[0]
-        self.assertIn('HELPER_PYTHON.parent / "demucs"', body)
-        self.assertIn('_resolve_tool("demucs", "PHOSPHENE_DEMUCS")', body)
+        body = PANEL_SRC.split("def _a2v_separator_command")[1].split("\ndef ")[0]
+        self.assertIn("HELPER_PYTHON", body)
         self.assertNotIn("/Users/", body)
 
     def test_the_installer_script_exists_and_parses(self):
@@ -349,8 +337,9 @@ class OnlyToolsTheInstallScriptsProvide(unittest.TestCase):
         self.assertEqual(
             subprocess.run(["bash", "-n", str(script)]).returncode, 0)
 
-    def test_the_note_points_at_the_installer(self):
-        self.assertIn("a2v_stems_deps.sh", P.A2V_STEM_MISSING_NOTE)
+    def test_the_note_offers_the_install_and_the_way_out(self):
+        self.assertIn("Install it from the Lip-sync form", P.A2V_STEM_MISSING_NOTE)
+        self.assertIn("full mix", P.A2V_STEM_MISSING_NOTE)
 
 
 class TheStemNeverReachesTheAudience(unittest.TestCase):

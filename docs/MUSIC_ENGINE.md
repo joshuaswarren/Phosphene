@@ -870,9 +870,11 @@ Two fields, both optional: `audio_stem` names a stem you already have, and
 **the original song is muxed back over the finished clip** — the video stream
 is copied, not re-encoded — so nothing the audience hears changes. The
 separation is cached by path + size + mtime, so a twelve-shot film separates
-once. demucs is an OPTIONAL extra (`scripts/pinokio/a2v_stems_deps.sh`, into
-the engine venv); without it the auto option degrades to the full mix with a
-note naming the installer, and never fails a queued job. `POST
+once. demucs is installed into the engine venv by install.js and by every
+Update (`scripts/pinokio/a2v_stems_deps.sh`, torch pinned to what is on disk)
+and run through `scripts/a2v_separate.py`; if it is missing the auto option is
+REFUSED at /queue/add with an install offer (the Lip-sync form's own Install
+button), never quietly rendered on the full mix (4.17.x). `POST
 /music/video/plan` takes `vocal_stem` and rides it onto every singing shot.
 
 **3. The prompt must not say that nothing moves.** LTX reads a stillness word

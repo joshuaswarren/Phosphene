@@ -237,6 +237,15 @@ echo 'Installing/refreshing the mflux image-engine pack (Ideogram 4 + Qwen-Edit)
 # Idempotent — skips when its marker is present.
 "$PY" "$ROOT/patch_mflux_fbcache.py"
 
+# ---- 7b. Vocal separation for Lip-sync ("Listen to the voice only") ---------
+# After step 7 on purpose: demucs is installed with torch PINNED to the copy
+# the mflux pack just settled, so it can never move the image engine's torch.
+# Existing installs get it here — the Lip-sync form's voice-only box has been
+# ON by default since 4.15 and nothing installed the separator before 4.17.x.
+# BEST-EFFORT and idempotent: ready installs print "ready" in about a second.
+bash "$ROOT/scripts/pinokio/a2v_stems_deps.sh" "$ROOT/ltx-2-mlx" \
+  || echo 'WARN: vocal separation did not install - video is unaffected; the Lip-sync form offers Install.'
+
 # ---- 8. Weight self-heal ----------------------------------------------------
 # Every fetch here is BEST-EFFORT. An Update must not be brickable, and each of
 # these has a one-click retry in the panel (Models page / Repair).

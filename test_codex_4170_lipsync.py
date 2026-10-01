@@ -453,7 +453,9 @@ def _a2v_roundtrip(params: dict, checked_before: bool, via_continue: bool = Fals
         fns.append("continueSongFromClip")
     js = r416.A2V_DOM + (
         "el('audioStudioStemAuto'); els.audioStudioStemAuto.checked = %s;\n"
-        "function requestAnimationFrame(f) { f(); }\n" % json.dumps(checked_before)
+        "function requestAnimationFrame(f) { f(); }\n"
+        # characters.js module state audioStudioGenerate reads (vocal separation)
+        "const A2V_SEPARATOR = { ready: null };\n" % json.dumps(checked_before)
     ) + "\n".join(extract_function(n, src) for n in fns) + """
 const sidecar = %s;
 (async () => {

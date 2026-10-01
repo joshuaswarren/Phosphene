@@ -593,6 +593,20 @@ module.exports = {
       }
     },
 
+    // ---- Vocal separation for Lip-sync (~15 MB + 80 MB weights) -----------
+    // "Listen to the voice only" is ON by default in the Lip-sync form, and
+    // until 4.17 nothing installed what it needs, so every render asked for
+    // the voice and got the full mix. demucs goes into the engine venv with
+    // torch pinned to the copy the image pack above just installed; the
+    // htdemucs weights land in mlx_models/demucs. BEST-EFFORT: a hiccup must
+    // not fail the video install — the Lip-sync form offers the same step.
+    {
+      method: "shell.run",
+      params: {
+        message: "bash scripts/pinokio/a2v_stems_deps.sh ./ltx-2-mlx || echo 'WARN: vocal separation did not install - video works; the Lip-sync form offers Install.'"
+      }
+    },
+
     // ---- Colorize IC-LoRA (~0.3 GB, un-gated community weights) -----------
     // Powers the Colorize restore mode (B&W clip → color). UN-GATED, so no
     // HF token is needed — but BEST-EFFORT regardless: a network hiccup (or a
