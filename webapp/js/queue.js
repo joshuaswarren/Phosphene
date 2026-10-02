@@ -783,6 +783,15 @@ function setEngine(engine, opts) {
     if (typeof snapFramesTo8kPlus1 === 'function') {
       try { snapFramesTo8kPlus1(); } catch (e) {}
     }
+    // ...and give LTX its own step count back. H3 writes its tuned count (9)
+    // or a pinned Steps pill (12/16/20) into the SHARED #steps field, and
+    // Load Params of an H3 or High clip restores one too; LTX's distilled
+    // lane runs exactly 8 and the server used to refuse anything else (fleet
+    // 4.17.4: "steps=9 is above the 8-step distilled schedule", 113 failed
+    // renders). make_job clamps it now as well — this keeps the form honest.
+    if (typeof applyQuality === 'function') {
+      try { applyQuality(); } catch (e) {}
+    }
     // Give the active quality preset its upscale back (H3 forced it off).
     if (typeof setUpscale === 'function' && typeof QUALITY_PRESETS === 'object') {
       const _qp = QUALITY_PRESETS[(document.getElementById('quality') || {}).value];
@@ -2829,6 +2838,81 @@ async function repairModel(key) {
   } catch (e) { alert('Repair failed: ' + e); }
 }
 
+// 4.17.4 (fleet: `venv_broken` on fresh installs, nearly all at first boot):
+// the render engine's Python packages are not in its venv, so no render can
+// start. /status.engine_env says so; this bar says what is happening and puts
+// the one-click repair (POST /engine/repair - re-installs only the engine's
+// packages, no downloads, no Stop) where the user is already looking. While
+// Pinokio's own Install is still writing the venv it says "installing" and
+// offers nothing: a second installer into the same venv would race it.
+let _engineEnvWasBroken = false;
+function engineEnvBannerHtml(st) {
+  if (!st || st.ok) return '';
+  const rep = st.repair || {};
+  const last = (rep.log || []).slice(-1)[0] || '';
+  if (st.installing || rep.active) {
+    return '<span style="font-weight:700">Installing the render engine\u2026</span>'
+      + '<span style="opacity:.92">' + escapeHtml(_redactLocalPaths(last) || 'Installing its Python packages')
+      + ' \u2014 renders can start when it finishes. Models are not touched.</span>';
+  }
+  const pinokio = '<span style="opacity:.85;flex-basis:100%">Or from Pinokio: Stop Phosphene, then '
+    + 'click \u201cRepair Phosphene engine (models kept)\u201d.</span>';
+  if (rep.state === 'failed') {
+    return '<span style="font-weight:700">The engine repair did not finish:</span>'
+      + '<span style="opacity:.92">' + escapeHtml(rep.error || 'unknown error') + '</span>'
+      + '<span style="margin-left:auto;display:flex;gap:8px">'
+      + '<button class="btn btn-primary" data-action="repair-engine">Try again</button></span>'
+      + pinokio;
+  }
+  return '<span style="font-weight:700">The render engine did not finish installing</span>'
+    + '<span style="opacity:.92">Its Python packages are missing from its environment, so '
+    + 'renders cannot start. Repair re-installs only those packages (a few minutes); '
+    + 'every model is kept.</span>'
+    + '<span style="margin-left:auto;display:flex;gap:8px">'
+    + '<button class="btn btn-primary" data-action="repair-engine">Repair engine</button></span>'
+    + pinokio;
+}
+function renderEngineEnvBanner(st) {
+  const html = engineEnvBannerHtml(st);
+  let el = document.getElementById('engineEnvBanner');
+  if (!html) {
+    if (el) el.remove();
+    if (_engineEnvWasBroken && st && st.ok && typeof phosToast === 'function') {
+      phosToast('The render engine is repaired \u2014 renders can run. Press Retry on a failed render.',
+                { kind: 'success', duration: 8000 });
+    }
+    _engineEnvWasBroken = false;
+    return;
+  }
+  _engineEnvWasBroken = true;
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'engineEnvBanner';
+    document.body.appendChild(el);
+  }
+  const busy = !!(st.installing || (st.repair || {}).active);
+  const above = document.getElementById('integrityBanner');
+  el.style.cssText = 'position:fixed;left:0;right:0;z-index:9998;'
+    + 'top:' + (above ? above.offsetHeight : 0) + 'px;'
+    + 'background:' + (busy ? '#6b4a00' : '#7a1f1f') + ';color:#fff;padding:10px 16px;'
+    + 'font-size:13px;line-height:1.4;display:flex;align-items:center;gap:12px;'
+    + 'flex-wrap:wrap;box-shadow:0 2px 10px rgba(0,0,0,.45)';
+  if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
+}
+async function engineRepairStart() {
+  try {
+    const r = await fetch('/engine/repair', { method: 'POST', body: new URLSearchParams({}) });
+    const res = await r.json().catch(() => ({}));
+    if (!r.ok && typeof phosToast === 'function') {
+      phosToast(res.error || ('Repair could not start: HTTP ' + r.status),
+                { kind: res.installing ? 'info' : 'danger', duration: 8000 });
+    }
+  } catch (e) {
+    if (typeof phosToast === 'function') phosToast('Repair could not start: ' + (e.message || e), { kind: 'danger' });
+  }
+  if (typeof poll === 'function') poll();
+}
+
 // Translate a cryptic engine error into actionable user guidance. Extracted
 // from the Now card 2026-08-11 so a storyboard shot's failure reads EXACTLY
 // like a manual one — one if/else, two callers, no way for the two to drift.
@@ -2879,6 +2963,22 @@ function nowCardFailureActions(last, info) {
       `<svg class="ph" aria-hidden="true"><use href="#ph-arrow-clockwise"/></svg>` +
       `<span>Open in Lip-sync to split</span></button>` + dismiss;
   }
+  // A file the job needs is gone (moved, renamed, deleted, never picked):
+  // the same job fails the same way, so reopen it in its form to re-pick.
+  if (action === 'reopen') {
+    return `<button type="button" class="now-card-retry" data-action="reopen" ` +
+      `title="Reopen this job in its form to pick the missing file again">` +
+      `<svg class="ph" aria-hidden="true"><use href="#ph-arrow-clockwise"/></svg>` +
+      `<span>Open in the form</span></button>` + dismiss;
+  }
+  // 4.17.4: the engine's packages are not installed - every render fails the
+  // same way until they are, so the card offers the repair, never a Retry.
+  if (action === 'repair_engine') {
+    return `<button type="button" class="now-card-retry" data-action="repair-engine" ` +
+      `title="Re-install only the render engine's Python packages (a few minutes, models kept)">` +
+      `<svg class="ph" aria-hidden="true"><use href="#ph-arrow-clockwise"/></svg>` +
+      `<span>Repair engine</span></button>` + dismiss;
+  }
   if (refusedTier && action !== 'models') return dismiss;
   return (action === 'models'
             ? `<button type="button" class="now-card-retry" onclick="openModelsModal()" ` +
@@ -2900,6 +3000,19 @@ function nowCardFailureActions(last, info) {
 }
 function friendlyJobError(raw, engine) {
   raw = raw || 'unknown error';
+  // 4.17.4 (fleet: venv_broken, 18 installs in 30 days): the engine venv has
+  // no engine packages - "Retry" fails the same way in one second, every time.
+  // One gave up after three. Point at the one-click repair instead.
+  if (/engine venv is not usable|venv has a Python but no packages|never finished installing into it/i.test(raw)) {
+    return {
+      friendly: 'The render engine did not finish installing.',
+      hint: 'Its Python packages are missing, so no render can start. Press Repair engine: '
+          + 'it re-installs only those packages (a few minutes) and keeps every model. '
+          + 'Retrying as is fails the same way.',
+      details: _redactLocalPaths(raw) || raw,
+      action: 'repair_engine',
+    };
+  }
   if (/music engine isn't installed|YuE2 needs about|YuE2 weights.*repair/i.test(raw)) {
     return { friendly: 'Stopped before generating — the music engine is not ready.',
       hint: 'Install or repair it from the Phosphene sidebar in Pinokio. Everything else in the panel is unaffected.' };
@@ -3007,6 +3120,21 @@ function friendlyJobError(raw, engine) {
           + 'is fails the same way.',
       details: _redactLocalPaths(raw) || raw,
       action: 'models',
+    };
+  }
+  // Next-release fix (fleet 4.17.x: 11 input_missing failures on 3 installs,
+  // each re-tried as is): a picture, audio, video or LoRA file the job points
+  // at is gone, or an image mode was sent without one. Retry re-queues the
+  // same path and fails the same way, so the card reopens the job instead.
+  // Model weights are NOT this branch (they say "model is incomplete" and
+  // go to Open Models above).
+  if (/no longer on disk|no longer exists|needs a reference image|needs at least 1 reference|\b(lora|audio|image|video|reference|picture)( file)? not found|\b(audio|image|video|reference|picture)( file)? does not exist/i.test(raw)
+      && !/model is\s+incomplete|\.safetensors\b.*mlx_models|mlx_models\/(?!loras)/i.test(raw)) {
+    return {
+      friendly: 'A file this render needs is missing.',
+      hint: (_redactLocalPaths(raw) || raw) + ' Pick it again in the form and press Generate '
+          + '\u2014 retrying as is fails the same way.',
+      action: 'reopen',
     };
   }
   if (/model is\s+incomplete\. Missing/i.test(raw)) {
@@ -3180,6 +3308,7 @@ async function poll() {
 
   // Corrupt/partial-weight banner (mosaic self-heal).
   try { renderIntegrityBanner(mergeIntegrity(s.model_integrity, s.deep_verify)); } catch (_) {}
+  try { renderEngineEnvBanner(s.engine_env); } catch (_) {}
   try { renderDeepVerifyStatus(s.deep_verify); } catch (_) {}
 
   // Memory
@@ -8092,7 +8221,7 @@ function draftAutosaveInstall() {
 // Inline handlers in the markup and the other files resolve these through
 // the global scope; everything NOT listed here is private to this module.
 Object.assign(globalThis, {
-  openFailedJobInForm,
+  openFailedJobInForm, engineRepairStart,
   notifyJobsDone, notifyOneJob, playDoneChime,
   h3FinishSetTier, h3FinishActive, setEngine, _syncEnginePromptTools,
   ltxFinishSetTier, ltxFinishActive, _syncFinishAffordance,

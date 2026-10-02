@@ -62,11 +62,17 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) poll
 // click that landed mid-rewrite could be lost. A single delegated
 // listener on document survives every rewrite + costs nothing.
 document.addEventListener('click', (e) => {
-  const btn = e.target.closest('[data-action="retry"], [data-action="retry-smaller"], [data-action="dismiss"], [data-action="stop-early"], [data-action="resume"], [data-action="split"]');
+  const btn = e.target.closest('[data-action="retry"], [data-action="retry-smaller"], [data-action="dismiss"], [data-action="stop-early"], [data-action="resume"], [data-action="split"], [data-action="reopen"], [data-action="repair-engine"]');
   if (!btn) return;
   e.stopPropagation();
   e.preventDefault();
   if (btn.dataset.action === 'resume') { if (typeof togglePause === 'function') togglePause(); return; }
+  // 4.17.4: the engine-env bar and a venv_broken failure card. Not tied to a
+  // job id - the bar has none - so it is handled before the id lookup.
+  if (btn.dataset.action === 'repair-engine') {
+    if (typeof engineRepairStart === 'function') engineRepairStart();
+    return;
+  }
   // A third delegated action in the same row, for the same reason the other
   // two are delegated: poll() rewrites this element every 1.5 s, and an inline
   // handler would be lost to that race mid-click.
@@ -74,7 +80,7 @@ document.addEventListener('click', (e) => {
   const actions = btn.closest('.now-card-actions');
   const id = actions ? actions.dataset.jobId : '';
   if (!id) return;
-  if (btn.dataset.action === 'split') {
+  if (btn.dataset.action === 'split' || btn.dataset.action === 'reopen') {
     // 4.17.3: a Lip-sync clip refused for its length on a Compact Mac. Reopen
     // THAT job (its song, start, picture, settings) in the Lip-sync form —
     // never whatever the form holds now — where the length note offers

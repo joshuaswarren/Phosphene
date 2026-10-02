@@ -292,10 +292,18 @@ def test_the_installer_never_moves_torch_and_never_uses_the_cli():
 
 
 def test_the_installer_refuses_a_checkout_without_a_venv(tmp_path):
+    # PHOSPHENE_SEPARATOR_HOME keeps the 4.17.4 outcome record out of the real
+    # mlx_models/demucs: a test must never leave a "failed" for a panel to report.
+    sep_home = tmp_path / "sep"
+    env = dict(os.environ, PHOSPHENE_SEPARATOR_HOME=str(sep_home))
     r = subprocess.run(["bash", str(ROOT / "scripts" / "pinokio" / "a2v_stems_deps.sh"),
-                        str(tmp_path)], capture_output=True, text=True, timeout=30)
+                        str(tmp_path)], capture_output=True, text=True, timeout=30,
+                       env=env)
     assert r.returncode != 0
     assert "no engine venv" in r.stderr
+    rec = json.loads((sep_home / "last_install.json").read_text())
+    assert rec["outcome"] == "failed" and rec["error_class"] == "no_venv"
+    assert rec["via"] == "install" and isinstance(rec["ts"], int)
 
 
 def test_separator_routes_are_registered_with_the_dispatch_signatures():

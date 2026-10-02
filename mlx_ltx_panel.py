@@ -223,10 +223,163 @@ def engine_env_fault() -> str:
 # stopped — the repair reinstalls into the venv this process holds open. The
 # running sidebar says the same (INST-05).
 ENGINE_ENV_REPAIR = (
-    "Fix it from the Pinokio sidebar: Stop Phosphene, then click \"Repair "
-    "Phosphene engine (models kept)\" — it rebuilds the venv and keeps every "
-    "model you have. Update works too. Renders cannot run until it is repaired."
+    "Press Repair engine in the bar at the top of the panel - it re-installs "
+    "only the engine's Python packages into the venv (a few minutes, every "
+    "model kept). Or from the Pinokio sidebar: Stop Phosphene, then click "
+    "\"Repair Phosphene engine (models kept)\". Renders cannot run until it "
+    "is repaired."
 )
+
+# --- One-click engine repair (4.17.4 fleet fix) -----------------------------
+# `venv_broken` on fresh installs: 18 installs in 30 days, nearly all at the
+# very first boot, and the only repair was the whole install.js from a
+# STOPPED panel. The engine step is scripts/pinokio/ltx_engine_env.sh now -
+# the one implementation install.js runs - and the panel runs that step
+# alone: no downloads, no venv rebuild, no Stop.
+#
+# The script holds a lock file in the venv (our pid) for its whole run. A
+# concurrent Install mid-way is the commonest reason a first boot sees no
+# packages, so while that lock is alive the panel says "still installing"
+# and never starts a second installer into the same venv.
+ENGINE_ENV_INSTALLER = "scripts/pinokio/ltx_engine_env.sh"
+ENGINE_ENV_LOCK_NAME = ".phosphene_engine_install.d"   # a directory; pid inside
+ENGINE_REPAIR_LOCK = threading.Lock()
+ENGINE_REPAIR: dict = {"state": "idle", "active": False}
+ENGINE_REPAIR_TIMEOUT_S = 1800
+
+
+def _kill_group_after(proc: subprocess.Popen, seconds: float) -> threading.Timer:
+    """End `proc`'s own process group after `seconds` (it was started with
+    start_new_session, so its pgid is its pid). `timer.fired` says it did."""
+    def _fire():
+        timer.fired = True
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            pass
+    timer = threading.Timer(seconds, _fire)
+    timer.fired = False
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+def _engine_install_running() -> bool:
+    """True while ltx_engine_env.sh (Install's engine step, or our own Repair)
+    holds its lock in the engine venv. The pid is only read to tell a live run
+    from a lock a killed run left behind - nothing is ever killed by it."""
+    lock = HELPER_PYTHON.parent.parent / ENGINE_ENV_LOCK_NAME / "pid"
+    try:
+        pid = int((lock.read_text(encoding="utf-8").splitlines() or ["0"])[0])
+    except (OSError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def engine_env_status() -> dict:
+    """/status.engine_env: can a render start, and if not, what is happening."""
+    fault = engine_env_fault()
+    with ENGINE_REPAIR_LOCK:
+        repair = {k: v for k, v in ENGINE_REPAIR.items() if k != "log"}
+        repair["log"] = list(ENGINE_REPAIR.get("log") or [])[-6:]
+    # NOT ready while an installer is still writing the venv, even once the
+    # package directory has appeared (Codex 4.17.4 #1): the --reinstall pass
+    # and the codec patch come after it.
+    installing = bool(repair.get("active")) or _engine_install_running()
+    return {"ok": not fault and not installing, "fault": fault,
+            "installing": installing, "repair": repair}
+
+
+def engine_env_busy() -> str:
+    """Non-empty while the engine venv is being (re)installed - a render
+    started now would import packages mid-replacement."""
+    with ENGINE_REPAIR_LOCK:
+        active = bool(ENGINE_REPAIR.get("active"))
+    if active or _engine_install_running():
+        return ("the render engine is being installed or repaired right now - "
+                "renders can start when it finishes (a few minutes)")
+    return ""
+
+
+def engine_env_repair_start() -> tuple[int, dict]:
+    with ENGINE_REPAIR_LOCK:
+        if ENGINE_REPAIR.get("active"):
+            return 409, {"error": "The engine repair is already running.", "repair": True}
+    if not engine_env_fault():
+        return 200, {"ok": True, "nothing_to_do": True}
+    if _engine_install_running():
+        return 409, {"error": "Pinokio is still installing the engine. This "
+                              "clears itself when that install finishes.",
+                     "installing": True}
+    with ENGINE_REPAIR_LOCK:
+        if ENGINE_REPAIR.get("active"):
+            return 409, {"error": "The engine repair is already running.", "repair": True}
+        ENGINE_REPAIR.clear()
+        ENGINE_REPAIR.update({"state": "running", "active": True,
+                              "started_ts": time.time(), "finished_ts": None,
+                              "error": None, "log": collections.deque(maxlen=60)})
+    threading.Thread(target=_engine_env_repair_thread, daemon=True,
+                     name="engine-env-repair").start()
+    push("[engine] repairing the engine environment (re-installing its Python "
+         "packages; models are not touched)")
+    return 202, {"ok": True, "started": True}
+
+
+def _engine_env_repair_thread() -> None:
+    env = _music_install_env()          # Pinokio's uv on PATH, venv deactivated
+    cmd = ["bash", str(ROOT / ENGINE_ENV_INSTALLER),
+           str(HELPER_PYTHON.parent.parent.parent)]
+    tail: list[str] = []
+    error = None
+    timer = None
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(ROOT), env=env,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                errors="replace", start_new_session=True)
+        # A stalled download keeps stdout open, so the deadline has to end
+        # the CHILD (its own process group, by its pid), not wait for EOF.
+        timer = _kill_group_after(proc, ENGINE_REPAIR_TIMEOUT_S)
+        for raw in proc.stdout:
+            for line in raw.replace("\r", "\n").splitlines():
+                line = line.rstrip()
+                if not line:
+                    continue
+                tail = (tail + [line])[-8:]
+                with ENGINE_REPAIR_LOCK:
+                    ENGINE_REPAIR["log"].append(line[:300])
+        rc = proc.wait(timeout=60)
+        if getattr(timer, "fired", False):
+            raise subprocess.TimeoutExpired(cmd, ENGINE_REPAIR_TIMEOUT_S)
+        if rc != 0:
+            reason = next((l for l in reversed(tail) if l.startswith("FATAL")), "")
+            error = (reason.replace("FATAL error: ", "") if reason
+                     else f"the install stopped (exit {rc})")
+    except subprocess.TimeoutExpired:
+        error = "the install took longer than 30 minutes"
+    except Exception as exc:                                     # noqa: BLE001
+        error = f"the install could not run: {exc}"
+    finally:
+        if timer is not None:
+            timer.cancel()
+    fault = engine_env_fault()
+    if error is None and fault:
+        error = f"the install finished but the engine is still not usable: {fault}"
+    with ENGINE_REPAIR_LOCK:
+        ENGINE_REPAIR.update(active=False, finished_ts=time.time(),
+                             state="failed" if error else "done", error=error)
+    push("[engine] " + (f"repair failed: {error}" if error
+                        else "engine environment repaired - renders can run"))
+    _analytics_install_step("engine_env", "failed" if fault else "ok",
+                            "venv_broken" if fault else "")
 
 if not HELPER_PYTHON.is_file():
     sys.stderr.write(
@@ -11010,6 +11163,58 @@ def ltx_quality_uses_hq(quality: str | None) -> bool:
     return bool(cell and cell.get("pipeline") == "hq")
 
 
+# The distilled (Q4) LTX lane runs a FIXED 9-point sigma table: exactly 8
+# steps. More cannot be served (the engine refuses to pad the table: "cannot
+# thin a 9-point schedule (8 steps) up to 16 steps"); fewer leaves the clip
+# part-denoised. Every other LTX mode below carries its own step fields
+# (stage1/stage2, extend_steps, retake_steps, ...) and never reads `steps`.
+LTX_DISTILLED_STEPS = 8
+_LTX_OWN_STEP_MODES = frozenset((
+    "extend", "retake", "keyframe", "a2v", "restore", "ingredients",
+    "control", "upscale"))
+
+
+def clamp_distilled_steps(params: dict) -> str | None:
+    """Put an LTX distilled-lane job on the 8 steps that lane can run.
+
+    4.17.4 fleet fix: the "above the 8-step distilled schedule" refusal — 113
+    failed renders in 30 days on every version since 4.9, one install at a
+    time, each retried in a loop (53 + 41 on one 4.15 install). The shared
+    hidden #steps field is written by Hailuo H3 (its tuned 9, or a 12/16/20
+    Steps pill), by Load Params of an H3 or High clip, and by Retry of a job
+    that already carried it — and switching back to LTX never put it back.
+    The panel then REFUSED a render whose only fault was a number the user
+    never typed and cannot see.
+
+    A step count is not a choice on this lane, so it is clamped, never
+    refused: the job is rewritten to 8 and one plain note rides it (Queue
+    row + Now card). Called from make_job (every new job) and again from
+    run_job_inner (jobs queued by an older panel, retries, API callers).
+    Returns the note when it changed something, else None.
+    """
+    if (params.get("engine") or "ltx").strip().lower() != "ltx":
+        return None
+    mode = (params.get("mode") or "t2v").strip().lower()
+    if mode in _LTX_OWN_STEP_MODES or ltx_quality_uses_hq(params.get("quality")):
+        return None
+    raw = params.get("steps")
+    try:
+        steps = int(float(raw)) if raw not in (None, "") else LTX_DISTILLED_STEPS
+    except (TypeError, ValueError):
+        steps = -1
+    if steps == LTX_DISTILLED_STEPS:
+        params["steps"] = LTX_DISTILLED_STEPS
+        return None
+    params["steps"] = LTX_DISTILLED_STEPS
+    note = (f"steps {raw} -> {LTX_DISTILLED_STEPS}: this quality always runs "
+            f"{LTX_DISTILLED_STEPS} steps (more steps only help on High)")
+    notes = list(params.get("generation_clamp_notes") or [])
+    if not any(str(n).startswith(f"steps {raw} -> ") for n in notes):
+        notes.append(note)
+    params["generation_clamp_notes"] = notes
+    return note
+
+
 def _ltx_lengths() -> dict[str, dict]:
     """The DURATION axis.
 
@@ -17001,6 +17206,9 @@ _ANALYTICS_EVENTS = (
     # at all, so "they tried and it was broken" and "they looked and left"
     # were the same shape in the data. These two close that.
     "install_step", "update_outcome",
+    # v4.17.4 — did the voice separator actually install, by which path, and
+    # if not, which closed reason. One event per install run.
+    "separator_install",
 )
 
 
@@ -20230,6 +20438,9 @@ class WarmHelper:
             if fault:
                 raise RuntimeError(f"engine venv is not usable: {fault}. "
                                    f"{ENGINE_ENV_REPAIR}")
+            busy = engine_env_busy()
+            if busy:
+                raise RuntimeError(f"Not started: {busy}. Press Retry then.")
             env = os.environ.copy()
             env["PATH"] = f"{FFMPEG_BIN}:{env.get('PATH', '')}"
             env["LTX_MODEL"] = base_model_dir()
@@ -29499,7 +29710,13 @@ def a2v_stem_refusal(params: dict) -> str | None:
         return None
     if str(params.get("audio_stem") or "").strip() or not a2v_wants_stem(params):
         return None
-    return None if _a2v_separator_command() else A2V_STEM_MISSING_NOTE
+    if _a2v_separator_command():
+        return None
+    # 4.17.4: an install running (or one the panel may start on its own) is
+    # not a reason to refuse - the job queues and waits for it.
+    if a2v_separator_auto_start("job"):
+        return None
+    return _a2v_separator_missing_note()
 
 
 def a2v_conditioning_audio(params: dict, audio_src: str) -> tuple[str, str]:
@@ -29517,9 +29734,22 @@ def a2v_conditioning_audio(params: dict, audio_src: str) -> tuple[str, str]:
         return stem, ""
     if not a2v_wants_stem(params):
         return audio_src, ""
+    # An install that is still RUNNING wins over file-based readiness (Codex
+    # 4.17.4 #4): demucs/apply.py lands before its dependencies and weights.
+    with A2V_SEPARATOR_INSTALL_LOCK:
+        _sep_installing = bool(A2V_SEPARATOR_INSTALL.get("active"))
+    if _sep_installing:
+        _a2v_separator_wait(_thread_job())
     separator = _a2v_separator_command()
+    if separator is None and a2v_separator_auto_start("job"):
+        # 4.17.4 fleet fix: an Update that left no separator used to refuse
+        # every queued voice-only job the instant the panel came up (and
+        # trip the queue breaker). Now the job waits for the install - the
+        # one the panel started at boot, or one it starts now - then runs.
+        _a2v_separator_wait(_thread_job())
+        separator = _a2v_separator_command()
     if separator is None:
-        raise RenderRefused("vocal_separator", A2V_STEM_MISSING_NOTE)
+        raise RenderRefused("vocal_separator", _a2v_separator_missing_note())
     try:
         return (str(_a2v_separate_vocals(audio_src, separator)),
                 "the model listens to the separated vocal")
@@ -29539,8 +29769,96 @@ def a2v_conditioning_audio(params: dict, audio_src: str) -> tuple[str, str]:
 A2V_SEPARATOR_INSTALL_LOCK = threading.Lock()
 A2V_SEPARATOR_INSTALL: dict = {"state": "idle", "active": False}
 
+# AUTOMATIC INSTALL (4.17.4 fleet fix). A 16 GB Mac pressed the panel's own
+# Update: a git pull plus a self-restart, which never runs post_update.sh, so
+# step 7b - the separator - never ran. Its queued Lip-sync jobs were refused
+# the second the new build came up (three refusals, queue paused), again after
+# a reboot, until something installed it by hand. Now the panel installs it
+# itself: at boot when it is missing, or when a voice-only job needs it.
+#
+# ONE automatic attempt per panel process, so an offline Mac is not retried in
+# a loop; the Lip-sync form's Install / Try again stays for every attempt
+# after that. OFF until __main__ turns it on (a2v_separator_boot): importing
+# the panel from a test or a gate must never pip-install into a real venv.
+# PHOSPHENE_SEPARATOR_AUTOINSTALL=0 keeps it off for a test rig.
+A2V_SEPARATOR_AUTO: dict = {"enabled": False, "attempted": False}
+A2V_SEPARATOR_TRIGGERS = ("boot", "job", "form")
+#: How long a voice-only job waits for an install before giving up. The
+#: install's own subprocess limit; a torch-less venv downloads torch too.
+A2V_SEPARATOR_WAIT_S = 1800
 
-def a2v_separator_install_start() -> tuple[int, dict]:
+
+def _a2v_separator_missing_note() -> str:
+    """The refusal text, with the last install's reason when there is one."""
+    with A2V_SEPARATOR_INSTALL_LOCK:
+        err = A2V_SEPARATOR_INSTALL.get("error") \
+            if A2V_SEPARATOR_INSTALL.get("state") == "failed" else None
+    if err:
+        return (f"Vocal separation did not install ({err}), so \u201cListen to "
+                f"the voice only\u201d cannot run. Press Try again in the "
+                f"Lip-sync form, or untick \u201cListen to the voice only\u201d "
+                f"to render against the full mix.")
+    return A2V_STEM_MISSING_NOTE
+
+
+def a2v_separator_auto_start(trigger: str) -> bool:
+    """True when a voice-only job may wait: an install is running, or this
+    call started the one automatic attempt this process gets. False = the
+    job has to be refused (auto off, already spent, or nothing to install)."""
+    with A2V_SEPARATOR_INSTALL_LOCK:
+        if A2V_SEPARATOR_INSTALL.get("active"):
+            return True
+        if not A2V_SEPARATOR_AUTO.get("enabled") or A2V_SEPARATOR_AUTO.get("attempted"):
+            return False
+    if a2v_separator_status()["ready"]:
+        return False
+    with A2V_SEPARATOR_AUTO_LOCK:
+        if A2V_SEPARATOR_AUTO.get("attempted"):
+            with A2V_SEPARATOR_INSTALL_LOCK:
+                return bool(A2V_SEPARATOR_INSTALL.get("active"))
+        A2V_SEPARATOR_AUTO["attempted"] = True
+    code, _ = a2v_separator_install_start(trigger)
+    return code in (202, 409)
+
+
+A2V_SEPARATOR_AUTO_LOCK = threading.Lock()
+
+
+def _a2v_separator_wait(job: dict | None) -> None:
+    """Hold a voice-only job until the separator install finishes.
+
+    The Now card says what it is waiting for (job["waiting_note"], read by
+    /status), with the installer's latest line. Stop ends the wait."""
+    t0 = time.time()
+    while True:
+        with A2V_SEPARATOR_INSTALL_LOCK:
+            active = bool(A2V_SEPARATOR_INSTALL.get("active"))
+            last = (list(A2V_SEPARATOR_INSTALL.get("log") or []) or ["starting"])[-1]
+        # The installer names its folders; the Now card is no place for a
+        # home-directory path (it often carries the user's real name).
+        last = last.replace(str(Path.home()), "~")
+        if not active:
+            break
+        if job is not None:
+            if job.get("cancel_requested"):
+                job.pop("waiting_note", None)
+                raise JobCancelled("Stopped while vocal separation was installing.")
+            job["waiting_note"] = (
+                "Installing vocal separation (once, about 95 MB) - this "
+                f"Lip-sync render starts when it is ready. {last}")[:240]
+        if time.time() - t0 > A2V_SEPARATOR_WAIT_S:
+            break
+        time.sleep(1.0)
+    if job is not None:
+        job.pop("waiting_note", None)
+    push("[a2v] vocal separation " + (
+        "is ready - continuing" if a2v_separator_status()["ready"]
+        else "is still not installed"))
+
+
+def a2v_separator_install_start(trigger: str = "form") -> tuple[int, dict]:
+    if trigger not in A2V_SEPARATOR_TRIGGERS:
+        trigger = "form"
     with A2V_SEPARATOR_INSTALL_LOCK:
         if A2V_SEPARATOR_INSTALL.get("active"):
             return 409, {"error": "Vocal separation is already installing.",
@@ -29548,28 +29866,36 @@ def a2v_separator_install_start() -> tuple[int, dict]:
     if a2v_separator_status()["ready"] and a2v_separator_status()["weights"]:
         return 200, {"ok": True, "nothing_to_do": True}
     with A2V_SEPARATOR_INSTALL_LOCK:
+        if A2V_SEPARATOR_INSTALL.get("active"):
+            return 409, {"error": "Vocal separation is already installing.",
+                         "install": True}
         A2V_SEPARATOR_INSTALL.clear()
         A2V_SEPARATOR_INSTALL.update({
             "state": "running", "active": True, "started_ts": time.time(),
-            "finished_ts": None, "error": None,
+            "finished_ts": None, "error": None, "trigger": trigger,
             "log": collections.deque(maxlen=60)})
-    threading.Thread(target=_a2v_separator_install_thread, daemon=True,
-                     name="a2v-separator-install").start()
-    push("[a2v] installing vocal separation (the same step Install and Update run)")
+    threading.Thread(target=_a2v_separator_install_thread, args=(trigger,),
+                     daemon=True, name="a2v-separator-install").start()
+    push("[a2v] installing vocal separation (the same step Install and Update run)"
+         + (" - it was missing at start-up" if trigger == "boot" else ""))
     return 202, {"ok": True, "started": True}
 
 
-def _a2v_separator_install_thread() -> None:
+def _a2v_separator_install_thread(trigger: str = "form") -> None:
     env = _music_install_env()          # Pinokio's uv on PATH, venv deactivated
     env["PHOSPHENE_SEPARATOR_HOME"] = str(a2v_separator_torch_home())
+    env["PHOSPHENE_SEPARATOR_VIA"] = f"panel_{trigger}"
     cmd = ["bash", A2V_SEPARATOR_INSTALLER, str(HELPER_PYTHON.parent.parent.parent)]
     tail: list[str] = []
     error = None
+    error_class = ""
+    timer = None
     try:
         proc = subprocess.Popen(cmd, cwd=str(ROOT), env=env,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, bufsize=1,
                                 errors="replace", start_new_session=True)
+        timer = _kill_group_after(proc, A2V_SEPARATOR_WAIT_S)
         for raw in proc.stdout:
             for line in raw.replace("\r", "\n").splitlines():
                 line = line.rstrip()
@@ -29578,22 +29904,106 @@ def _a2v_separator_install_thread() -> None:
                 tail = (tail + [line])[-8:]
                 with A2V_SEPARATOR_INSTALL_LOCK:
                     A2V_SEPARATOR_INSTALL["log"].append(line[:300])
-        rc = proc.wait(timeout=1800)
+        rc = proc.wait(timeout=60)
+        if getattr(timer, "fired", False):
+            raise subprocess.TimeoutExpired(cmd, A2V_SEPARATOR_WAIT_S)
         if rc != 0:
             reason = next((l for l in reversed(tail)
                            if not l.startswith(("+", "Traceback"))), "")
             error = f"the install stopped (exit {rc})" + (f": {reason}" if reason else "")
+            error_class = (_a2v_separator_record() or {}).get("error_class") or "other"
+    except subprocess.TimeoutExpired:
+        error, error_class = "the install took longer than 30 minutes", "timeout"
     except Exception as exc:                                     # noqa: BLE001
-        error = f"the install could not run: {exc}"
+        error, error_class = f"the install could not run: {exc}", "spawn_failed"
+    finally:
+        if timer is not None:
+            timer.cancel()
     st = a2v_separator_status()
     if error is None and not st["ready"]:
         error = "the install finished but the separator is still not importable"
+        error_class = "import_failed"
     with A2V_SEPARATOR_INSTALL_LOCK:
         A2V_SEPARATOR_INSTALL.update(active=False, finished_ts=time.time(),
                                      state="failed" if error else "done",
                                      error=error)
     push("[a2v] vocal separation " + (f"install failed: {error}" if error
                                       else "installed - Listen to the voice only is ready"))
+    _analytics_separator_install(
+        "failed" if error else "ok", f"panel_{trigger}", error_class,
+        ready=st["ready"], weights=st["weights"])
+    # This run wrote the outcome record itself; mark it reported so the next
+    # boot does not count it twice.
+    _rec = _a2v_separator_record()
+    if _rec and _rec.get("ts"):
+        _settings_set_internal(analytics_separator_reported_ts=int(_rec["ts"]))
+
+
+A2V_SEPARATOR_RECORD = "last_install.json"
+#: Closed vocabularies for the separator_install event (docs/ANALYTICS.md).
+_SEPARATOR_INSTALL_VIA = ("install", "update", "panel_boot", "panel_job", "panel_form")
+_SEPARATOR_INSTALL_ERRORS = ("no_venv", "pip_failed", "import_failed",
+                             "weights_failed", "timeout", "spawn_failed", "other")
+
+
+def _a2v_separator_record() -> dict | None:
+    """The outcome a2v_stems_deps.sh wrote on its last exit, or None."""
+    try:
+        rec = json.loads((a2v_separator_torch_home() / A2V_SEPARATOR_RECORD)
+                         .read_text(encoding="utf-8"))
+        return rec if isinstance(rec, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _analytics_separator_install(outcome: str, via: str, error_class: str = "",
+                                 *, ready: bool, weights: bool) -> None:
+    """One separator install, however it ran. Closed words only - never the
+    installer's own output (paths), never a host or a byte count."""
+    try:
+        if outcome not in ("ok", "failed") or via not in _SEPARATOR_INSTALL_VIA:
+            return
+        props = {"outcome": outcome, "via": via, "ready": bool(ready),
+                 "weights": bool(weights), "version": running_version(),
+                 "ram_gb": int(round(SYSTEM_RAM_GB))}
+        if outcome == "failed":
+            props["error_class"] = (error_class if error_class in
+                                    _SEPARATOR_INSTALL_ERRORS else "other")
+        _analytics_capture("separator_install", props)
+    except Exception:                                          # noqa: BLE001
+        pass
+
+
+def a2v_separator_boot() -> None:
+    """__main__ only, before the worker starts.
+
+    1. Report the install/Update outcome the installer recorded, once.
+    2. Turn the automatic install on (PHOSPHENE_SEPARATOR_AUTOINSTALL=0 off).
+    3. If the separator is missing on a working engine venv, install it now,
+       in the background - queued voice-only jobs wait for it."""
+    try:
+        rec = _a2v_separator_record()
+        seen = int(get_settings().get("analytics_separator_reported_ts") or 0)
+        if rec and int(rec.get("ts") or 0) > seen:
+            _settings_set_internal(analytics_separator_reported_ts=int(rec["ts"]))
+            st = a2v_separator_status()
+            _analytics_separator_install(
+                str(rec.get("outcome") or ""), str(rec.get("via") or ""),
+                str(rec.get("error_class") or ""),
+                ready=st["ready"], weights=st["weights"])
+    except Exception:                                          # noqa: BLE001
+        pass
+    if (os.environ.get("PHOSPHENE_SEPARATOR_AUTOINSTALL") or "1").strip() == "0":
+        return
+    A2V_SEPARATOR_AUTO["enabled"] = True
+    try:
+        if a2v_separator_status()["ready"] or engine_env_fault():
+            return
+    except Exception:                                          # noqa: BLE001
+        return
+    print("[boot] vocal separation is missing - installing it in the background "
+          "(Lip-sync \"Listen to the voice only\" waits for it)", flush=True)
+    a2v_separator_auto_start("boot")
 
 
 # --- A2V CHARACTER LORA: KEEP THE FACE, FREE THE MOUTH -----------------------
@@ -30784,6 +31194,11 @@ def make_job(form: dict[str, list[str]] | dict[str, str], *,
         if job["params"]["frames"] != _req_f:
             push(f"{_req_f} frames isn't on the 8k+1 grid — rendering "
                  f"{job['params']['frames']} frames.")
+        # A distilled-lane job runs exactly 8 steps; a stray count from the
+        # H3 surface, a Params restore or a Retry is clamped, never refused.
+        _steps_note = clamp_distilled_steps(job["params"])
+        if _steps_note:
+            push(f"[generation] {_steps_note}")
     # STG (Spatio-Temporal Guidance) — "detail guidance" slider. Only stamp
     # `stg_scale` onto params when the form actually sent a value, so each
     # dispatch keeps its OWN default when the user didn't touch the slider:
@@ -35283,33 +35698,17 @@ def run_job_inner(job: dict) -> None:
              "it from an old sidecar; running with acceleration off.")
         p["accel"] = "off"
 
-    # Guard: Q4 distilled hardcoded 9-sigma schedule needs the full walk to
-    # sigma=0. Truncating below 8 steps leaves the image partially denoised
-    # (sigma=0.725 at 6 steps, sigma=0.975 at 4 steps) — i.e. literal noise.
-    # Block before the user wastes 7+ minutes producing static.
-    # Modes that don't use the distilled `steps` field skip this check:
-    #   - extend / keyframe use stage1_steps + stage2_steps via two-stage path
-    #   - every HQ-pipeline quality uses two-stage HQ with its own schedule
-    #   - a2v uses A2VidPipelineTwoStage's stage1/stage2 walks
-    if mode not in ("extend", "retake", "keyframe", "a2v", "restore", "ingredients", "control", "upscale") and not ltx_quality_uses_hq(quality) and int(p.get("steps", 8)) < 8:
-        raise RuntimeError(
-            f"steps={p.get('steps')} is below the 8-step minimum for the Q4 distilled "
-            "schedule. Fewer steps truncates the sigma walk and leaves >70% noise in "
-            "the output (this is what you saw last run). Use steps=8 for standard "
-            "renders, or pick Quality=Quick for a faster smaller-resolution render at "
-            "the same 8 steps."
-        )
-    # ...and MORE than 8 is not a quality knob either: the distilled sigma table
-    # has 9 points, so the helper dies minutes in with "cannot thin a 9-point
-    # schedule (8 steps) up to 16 steps" (fleet, 4.11.1: i2v at 9 and 16 steps).
-    # Refuse here, at no cost, and say where more steps actually live.
-    if mode not in ("extend", "retake", "keyframe", "a2v", "restore", "ingredients", "control", "upscale") and not ltx_quality_uses_hq(quality) and int(p.get("steps", 8)) > 8:
-        raise RuntimeError(
-            f"steps={p.get('steps')} is above the 8-step distilled schedule: the Q4 "
-            "distilled model has a fixed 9-point sigma table and cannot take more "
-            "steps. Use steps=8 here, or pick Quality=High for the two-stage "
-            "pipeline, which is where more steps buy quality."
-        )
+    # The Q4 distilled lane runs a fixed 9-point sigma table — exactly 8
+    # steps. Fewer used to be refused (a truncated walk leaves the clip part
+    # noise) and more were refused too (the engine cannot pad the table). Both
+    # refusals failed renders over a number the user never typed: the shared
+    # #steps field carried H3's 9 / 12 / 16 / 20, or a Load Params / Retry of
+    # such a job (fleet 4.17.4: 113 failures in 30 days, retried in loops).
+    # make_job already clamps new jobs; this is the backstop for jobs queued
+    # by an older panel, retries and API callers. Clamp, note, render.
+    _steps_note = clamp_distilled_steps(p)
+    if _steps_note:
+        push(f"[generation] {_steps_note}")
 
     if p["stop_comfy"]:
         kill_comfy()
@@ -37778,6 +38177,27 @@ def _queue_extend_face_fix_after(job: dict) -> None:
                 x for x in (job.get("warning"), _ff_warn) if x)
 
 
+def _breaker_count(exc: BaseException) -> int:
+    """Count one failed job toward the queue circuit breaker; return the
+    streak of identical failures (0 = this one does not count).
+
+    A REFUSAL IS NOT A FAILURE (4.17.4 fleet fix): nothing was attempted, no
+    GPU time was spent, and the refusal names its own way out. Three
+    voice-only Lip-sync jobs refused for a missing separator paused a 16 GB
+    Mac's whole queue, jobs that could have rendered included. A refusal
+    neither extends nor breaks a streak of real failures."""
+    if isinstance(exc, RenderRefused):
+        return 0
+    sig = str(exc)[:80]
+    if not sig:
+        return 0
+    if sig == _CONSEC_FAIL["sig"]:
+        _CONSEC_FAIL["n"] += 1
+    else:
+        _CONSEC_FAIL.update(sig=sig, n=1)
+    return int(_CONSEC_FAIL["n"])
+
+
 def worker_loop() -> None:
     held_note = ""
     while True:
@@ -37869,12 +38289,10 @@ def worker_loop() -> None:
                 # message — a whole queue burning down on a problem no
                 # retry can fix). Three identical failures in a row with
                 # more work queued: pause, say why, leave the queue intact.
-                _sig = str(exc)[:80]
-                if _sig and _sig == _CONSEC_FAIL["sig"]:
-                    _CONSEC_FAIL["n"] += 1
-                else:
-                    _CONSEC_FAIL.update(sig=_sig, n=1)
-                if _CONSEC_FAIL["n"] >= 3 and STATE["queue"] and not STATE["paused"]:
+                # Refusals do not count (_breaker_count, 4.17.4).
+                _streak = _breaker_count(exc)
+                _sig = _CONSEC_FAIL["sig"]
+                if _streak >= 3 and STATE["queue"] and not STATE["paused"]:
                     STATE["paused"] = True
                     # SYS-32: this used to live ONLY in the push() log line
                     # below (Logs tab only) -- the UI showed just "queue N ·
@@ -42537,6 +42955,9 @@ if __name__ == "__main__":
     _sb_boot_reconcile()
     load_hidden()
     load_queue()
+    # Before the worker: a queued voice-only Lip-sync job must find the
+    # separator install already running, not refuse (4.17.4).
+    a2v_separator_boot()
     threading.Thread(target=worker_loop, daemon=True).start()
     if VERSION_CHECK_ENABLED:
         threading.Thread(target=version_check_loop, daemon=True).start()

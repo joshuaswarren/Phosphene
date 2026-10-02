@@ -91,6 +91,36 @@ class RefusedJobsDoNotOfferRetry(unittest.TestCase):
         self.assertIn('data-action="retry"', plain)
         self.assertIn('data-action="retry-smaller"', smaller)
 
+    def test_a_missing_input_file_reopens_the_job_instead_of_retrying(self):
+        # Fleet 4.17.x: 11 input_missing failures on 3 installs, each re-tried
+        # as is and failing the same way (the file is still gone).
+        lines = [
+            "The reference image is no longer on disk: /Users/someone/Desktop/a.png. "
+            "It was moved, renamed or deleted after it was picked.",
+            "Image mode on H3 needs a reference image \u2014 pick one, or switch to Text mode.",
+            "LoRA file not found: /Users/someone/pinokio/api/phosphene.git/mlx_models/loras/x.safetensors",
+            "audio file not found: /Users/someone/Music/take3.wav",
+        ]
+        calls = []
+        for i, raw in enumerate(lines):
+            job = {"id": f"m{i}", "status": "failed", "error": raw}
+            calls.append(f"(() => {{ const f = friendlyJobError({json.dumps(raw)}); "
+                         f"return [f, nowCardFailureActions({json.dumps(job)}, f)]; }})()")
+        model = "X can't run: the LTX-2.5 Q4 model is incomplete. Missing 2 file(s) in /m: a, b."
+        calls.append(f"friendlyJobError({json.dumps(model)})")
+        out = _node(calls)
+        for raw, (fr, html) in zip(lines, out[:-1]):
+            self.assertEqual(fr.get("action"), "reopen", raw)
+            self.assertIn('data-action="reopen"', html, raw)
+            self.assertNotIn('data-action="retry"', html, raw)
+            self.assertNotIn("/Users/", fr["hint"], raw)
+        self.assertEqual(out[-1].get("action"), "models")   # weights stay Open Models
+
+    def test_reopen_click_is_wired(self):
+        main = (ROOT / "webapp" / "js" / "main.js").read_text(encoding="utf-8")
+        self.assertIn('[data-action="reopen"]', main)
+        self.assertIn("btn.dataset.action === 'reopen'", main)
+
     def test_split_reopens_the_failed_job_not_the_current_form(self):
         # Codex 4.17.3: splitting "whatever the form holds now" would queue a
         # different song after the user moved on, or fail after a reload. The

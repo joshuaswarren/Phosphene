@@ -352,6 +352,30 @@ the same version means it didn't. The marker is cleared when it is read.
 | `from_version` | string | `"4.15.0"` | The version Update was pressed on |
 | `version` | string | `"4.15.0"` | The version now running |
 
+### `separator_install` (v4.17.4)
+
+Whether the Lip-sync voice separator (demucs, "Listen to the voice only")
+actually installed, by which path, and if not, why. On 4.17.3 a 16 GB Mac
+updated with the panel's own Update (a pull plus a restart, which never runs
+the post-update step that installs it): its queued voice-only jobs were
+refused at once and nothing in the data said the separator was missing. The
+installer now records its outcome next to the weights; the panel reports
+that record once at the next boot, and reports its own installs (at start-up,
+for a waiting job, or from the form's Install button) when they finish.
+
+| prop | type | example | why |
+|---|---|---|---|
+| `outcome` | string | `"failed"` | **Closed vocabulary**: `ok`, `failed` |
+| `via` | string | `"update"` | **Closed vocabulary**: `install` (install.js), `update` (the Pinokio Update), `panel_boot` (the panel found it missing at start-up), `panel_job` (a voice-only job needed it), `panel_form` (the Lip-sync form's Install / Try again) |
+| `error_class` | string | `"pip_failed"` | Only on `failed`. **Closed vocabulary**: `no_venv`, `pip_failed`, `import_failed`, `weights_failed` (the package works, the 80 MB model did not download - it downloads on first use), `timeout`, `spawn_failed`, `other` |
+| `ready` | bool | `true` | Whether a voice-only render can run now |
+| `weights` | bool | `false` | Whether the separator's model is on disk |
+| `version` | string | `"4.17.4"` | The build that reported it |
+| `ram_gb` | int | `16` | Same machine class as `install_step` |
+
+No installer output, no path, no host, no byte count: the class is read from
+a record the installer writes in closed words, never parsed out of pip's text.
+
 ### `broadcast_seen` (v4.9.7)
 
 One event when a developer broadcast (`BROADCAST.json`) is acknowledged. No text — which message is derivable from the date.

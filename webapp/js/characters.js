@@ -1423,12 +1423,16 @@ async function audioStudioGenerate(opts) {
     return;
   }
 
-  // "Listen to the voice only" on a Mac without the separator: say so and
-  // offer the install instead of queueing a render the server refuses.
+  // "Listen to the voice only" on a Mac without the separator. 4.17.4: while
+  // an install runs - or when the panel can start one - the job queues and
+  // waits for it (the server decides and answers 400 when it cannot). Only a
+  // FAILED install stops the submit here, with its Try again just above.
   const _stemBox = document.getElementById('audioStudioStemAuto');
-  if (_stemBox && _stemBox.checked && A2V_SEPARATOR.ready === false) {
+  const _sepWaits = !!(_stemBox && _stemBox.checked && A2V_SEPARATOR.ready === false);
+  const _sepInst = (_sepWaits && ((A2V_SEPARATOR.last || {}).install)) || {};
+  if (_sepWaits && !_sepInst.active && _sepInst.state === 'failed') {
     audioStudioRenderSeparator();
-    if (status) status.textContent = 'Install vocal separation first (just above), or untick \u201cListen to the voice only\u201d.';
+    if (status) status.textContent = 'Vocal separation did not install - press Try again just above, or untick \u201cListen to the voice only\u201d.';
     return;
   }
 
@@ -1482,10 +1486,12 @@ async function audioStudioGenerate(opts) {
       throw new Error(audioStudioSubmitError(r.status, txt));
     }
     if (status) {
-      status.textContent = draft
+      status.textContent = (draft
         ? 'Draft queued (~3s, same seed) — check the mouth, then Generate the full clip.'
-        : 'Submitted. Watch Now / Recent.';
+        : 'Submitted. Watch Now / Recent.')
+        + (_sepWaits ? ' It starts when vocal separation finishes installing.' : '');
     }
+    if (_sepWaits) audioStudioRefreshSeparator();
     if (typeof phosToast === 'function') {
       phosToast(draft
         ? 'Draft queued · ~3s at this seed — watch Now, then Generate for the full clip'

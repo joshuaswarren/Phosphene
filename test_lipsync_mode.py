@@ -473,11 +473,10 @@ class SegmentRetake(unittest.TestCase):
         self.assertIn('emit({"event": "error"', block)
 
     def test_retake_exempted_from_the_distilled_step_count_gate(self):
-        self.assertIn(
-            'if mode not in ("extend", "retake", "keyframe", "a2v", "restore", '
-            '"ingredients", "control", "upscale") and not ltx_quality_uses_hq(quality) '
-            'and int(p.get("steps", 8)) < 8:',
-            PANEL_SRC)
+        # 4.17.4: the gate became a clamp (clamp_distilled_steps); retake keeps
+        # its own retake_steps and must stay outside it.
+        self.assertIn('"retake"', PANEL_SRC.split("_LTX_OWN_STEP_MODES = frozenset((")[1].split("))")[0])
+        self.assertIn("_steps_note = clamp_distilled_steps(p)", PANEL_SRC)
 
     def test_ui_present(self):
         self.assertIn('id="retakeModal"', INDEX_HTML)

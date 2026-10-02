@@ -243,7 +243,7 @@ echo 'Installing/refreshing the mflux image-engine pack (Ideogram 4 + Qwen-Edit)
 # Existing installs get it here — the Lip-sync form's voice-only box has been
 # ON by default since 4.15 and nothing installed the separator before 4.17.x.
 # BEST-EFFORT and idempotent: ready installs print "ready" in about a second.
-bash "$ROOT/scripts/pinokio/a2v_stems_deps.sh" "$ROOT/ltx-2-mlx" \
+PHOSPHENE_SEPARATOR_VIA=update bash "$ROOT/scripts/pinokio/a2v_stems_deps.sh" "$ROOT/ltx-2-mlx" \
   || echo 'WARN: vocal separation did not install - video is unaffected; the Lip-sync form offers Install.'
 
 # ---- 8. Weight self-heal ----------------------------------------------------

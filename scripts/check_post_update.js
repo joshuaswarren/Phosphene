@@ -213,6 +213,9 @@ for (const [label, re] of mustRequire) {
 const PIN_PAIR = { mlx: "0.31.1", mflux: "0.18.0" }
 const pinSites = [
   ["scripts/post_update.sh", "mlx"], ["install.js", "mlx"],
+  // 4.17.4: install.js's engine step now lives here (one implementation the
+  // panel's "Repair engine" re-runs too), so the mlx pin is asserted here.
+  ["scripts/pinokio/ltx_engine_env.sh", "mlx"],
   ["scripts/post_update.sh", "mflux"], ["install.js", "mflux"],
   ["scripts/pinokio/mflux_pack.sh", "mflux"], ["install_qwen.js", "mflux"],
 ]

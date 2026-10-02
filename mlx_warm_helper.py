@@ -1988,6 +1988,30 @@ def _thin_table_caps(model_dir: str) -> tuple[int, int] | None:
         return None
 
 
+_DISTILLED_STEPS = 8
+
+
+def _distilled_steps(raw) -> int:
+    """The distilled one-pass lane runs its fixed 9-point table: 8 steps.
+
+    The panel clamps every job to 8 before it gets here (4.17.4 fleet fix:
+    "steps=9 is above the 8-step distilled schedule" failed 113 renders whose
+    stray count came from the H3 surface, a Params restore or a Retry). This
+    is the belt for a job written by an older panel or an API caller: a
+    padded or truncated table is never what anyone meant, so clamp and log
+    rather than die minutes in on "cannot thin a 9-point schedule".
+    """
+    try:
+        steps = int(float(raw))
+    except (TypeError, ValueError):
+        steps = _DISTILLED_STEPS
+    if steps != _DISTILLED_STEPS:
+        emit({"event": "log",
+              "line": f"steps={raw} on the distilled lane; using "
+                      f"{_DISTILLED_STEPS} (its fixed schedule)."})
+    return _DISTILLED_STEPS
+
+
 def _thin_cap(model_dir: str, key: str, want: int) -> int:
     """Clamp a step count to what THIS checkpoint's fixed table can serve.
 
@@ -3463,7 +3487,7 @@ for line in sys.__stdin__:
                 width=int(p["width"]),
                 num_frames=int(p["frames"]),
                 seed=seed,
-                num_steps=int(p.get("steps", 8)),
+                num_steps=_distilled_steps(p.get("steps", 8)),
                 frame_rate=float(p.get("frame_rate", 24.0)),
             )
             # Named schedule preset for the 2.5 distilled lane ("fast" = the

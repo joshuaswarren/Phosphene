@@ -1037,6 +1037,9 @@ class TestReceiverDirectives(AnalyticsTestCase):
         # step fired here is the one the worker owns.
         P._analytics_install_step("first_queue", "started")
         P._analytics_update_outcome("restart_pending", "failed", "4.15.0")
+        # v4.17.4: one separator install outcome, the closed words only.
+        P._analytics_separator_install("failed", "update", "pip_failed",
+                                       ready=False, weights=False)
         # A refusal: the panel declining on purpose. Fired here for the same
         # reason as the rest — its payload has to carry the receiver
         # directives too, and it is the newest way to get an event out.

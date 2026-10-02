@@ -336,8 +336,12 @@ def test_safety_4_a_queued_h3_job_restores_its_engine_and_h3_recipe():
 
 
 def test_safety_4_a_queued_ltx_job_restores_steps_and_export_method():
+    # 4.17.4: on a DISTILLED quality make_job now clamps steps to 8 (the lane
+    # cannot run anything else - clamp_distilled_steps), so a restorable,
+    # non-default count has to live on an HQ quality, where `steps` is kept.
     ltx = p.make_job({"mode": "t2v", "engine": "ltx", "prompt": "a fox", "steps": "12",
-                      "upscale": "fit_720p", "upscale_method": "pipersr", "quality": "standard"})["params"]
+                      "upscale": "fit_720p", "upscale_method": "pipersr", "quality": "high"})["params"]
+    assert ltx["steps"] == 12
     ltx["source"] = "characters"          # would have jumped to the Characters tab
     out = _load_recipe(ltx)
     assert ["setEngine", "ltx", {"persist": False}] in out["calls"]

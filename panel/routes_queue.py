@@ -126,7 +126,16 @@ def get_status(h, parsed) -> None:
         _cur_params = (payload["current"].get("params") or {})
         _mode = (_cur_params.get("mode") or "").lower()
         _engine = (_cur_params.get("engine") or "ltx").lower()
-        if _mode != "train" and _engine not in ("h3", "music"):
+        _waiting = payload["current"].get("waiting_note")
+        if _waiting:
+            # 4.17.4: a voice-only Lip-sync job holding for the separator
+            # install says so, instead of "Loading pipeline" at 0 %.
+            _started = payload["current"].get("started_ts") or 0
+            payload["current"]["progress"] = {
+                "phase": "waiting", "pct": 0, "phase_label": str(_waiting),
+                "elapsed_sec": max(0.0, P.time.time() - _started) if _started else 0,
+            }
+        elif _mode != "train" and _engine not in ("h3", "music"):
             payload["current"]["progress"] = P._compute_progress(
                 payload["current"], payload.get("log") or [],
             )
@@ -256,6 +265,9 @@ def get_status(h, parsed) -> None:
     payload["h3"] = P.h3_status()
     payload["music"] = P.music_status()
     payload["music_install"] = P.music_install_status()
+    # 4.17.4: can a render start at all (the engine venv), and the one-click
+    # repair's progress. File checks only - cheap enough for every poll.
+    payload["engine_env"] = P.engine_env_status()
     payload["train_profile"] = P.TRAIN_PROFILE
     payload["train_presets"] = P.TRAIN_PRESETS
     payload["train_style_presets"] = P.TRAIN_STYLE_PRESETS

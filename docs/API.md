@@ -903,7 +903,21 @@ Shut down a ComfyUI process if Phosphene started one.
 
 ### `GET /version/check`, `POST /version/pull`
 
-Self-update against the GitHub repo.
+Self-update against the GitHub repo. `/version/pull` is a `git pull` only: it
+does not run `scripts/post_update.sh`, so anything an Update installs (new
+packages, weights) is not installed by it. Since 4.17.4 the panel installs a
+missing Lip-sync voice separator itself at the next start (see
+`/a2v/separator`).
+
+### `POST /engine/repair`
+
+Re-runs only the engine-environment step (`scripts/pinokio/ltx_engine_env.sh`,
+the same step Install runs): re-installs the render engine's Python packages
+into its venv, in the background. No downloads, no venv rebuild, no Stop.
+Answers `202` (started), `200 {nothing_to_do}` (the engine is fine), or `409`
+(a repair is running, or `installing: true` - Pinokio's own Install is still
+writing the venv). Progress and outcome ride `GET /status` -> `engine_env`
+(`ok`, `fault`, `installing`, `repair.{state, active, log, error}`).
 
 ## Push alerts — the completion alert for a closed tab
 

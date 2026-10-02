@@ -306,6 +306,19 @@ def post_a2v_separator_install(h, path, qs, ctype) -> None:
     h._json(payload, code); return
 
 
+@post("/engine/repair")
+def post_engine_repair(h, path, qs, ctype) -> None:
+    # 4.17.4: "Repair engine" - the engine-env bar and a venv_broken failure
+    # card both press this. Re-runs ONLY scripts/pinokio/ltx_engine_env.sh
+    # (install.js's engine step) in the background; progress rides
+    # /status.engine_env. No downloads, no Stop needed.
+    _rb = h._read_form_body()
+    if _rb is None:
+        return
+    code, payload = P.engine_env_repair_start()
+    h._json(payload, code); return
+
+
 @post("/music/cover/install")
 def post_music_cover_install(h, path, qs, ctype) -> None:
     # The opt-in ~2.8 GB that lets YuE2 read a score off a real recording.
