@@ -38,6 +38,11 @@ class Q8OnlyInstall(unittest.TestCase):
         self.assertEqual(kind, "q8")
         self.assertEqual(pack, self.models / P.H3_DIT_Q8_DIRNAME)
 
+    def test_turbo_and_loras_follow_the_pack(self):
+        with mock.patch.object(P, "H3_MODELS", self.tmp):
+            self.assertEqual(P._h3_turbo_dir(), self.models / P.H3_TURBO_DIRNAME)
+            self.assertEqual(P._h3_loras_dir(), self.models / P.H3_LORAS_DIRNAME)
+
     def test_no_pack_and_no_master_is_still_missing(self):
         (self.models / P.H3_DIT_Q8_DIRNAME / ".built_ok").unlink()
         paths, _ = self._paths()

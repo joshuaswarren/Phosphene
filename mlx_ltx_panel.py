@@ -13121,9 +13121,7 @@ def h3_paths() -> dict:
     dit = compact_root = text_config = models_root = None
     for root in _h3_model_roots():
         cand_dit = root / "deepbeep-pruned-bf16" / H3_DIT_FILENAME
-        # The 41 GB bf16 master is not needed once the Q8 pack is built; a Mac that deleted it
-        # to get the disk back is still an installed H3.
-        if not cand_dit.is_file() and not (root / H3_DIT_Q8_DIRNAME / ".built_ok").is_file():
+        if not _h3_holds_dit(root):
             continue
         models_root = root
         dit = cand_dit
@@ -13589,6 +13587,13 @@ def h3_supports_lora() -> bool:
     return _h3_runner_has_flag("--lora")
 
 
+def _h3_holds_dit(root: Path) -> bool:
+    """This model root has a DiT: the bf16 master, or the Q8 pack built from it (the master is 41 GB and
+    can be deleted once the pack exists)."""
+    return (root / "deepbeep-pruned-bf16" / H3_DIT_FILENAME).is_file() \
+        or (root / H3_DIT_Q8_DIRNAME / ".built_ok").is_file()
+
+
 def _h3_turbo_dir() -> Path:
     """Where Turbo's adapter lives: alongside the other weight components.
 
@@ -13596,7 +13601,7 @@ def _h3_turbo_dir() -> Path:
     DiT, so Turbo lands next to `deepbeep-pruned-bf16` / `ddalcu-q8` rather
     than in a third place."""
     for root in _h3_model_roots():
-        if (root / "deepbeep-pruned-bf16" / H3_DIT_FILENAME).is_file():
+        if _h3_holds_dit(root):
             return root / H3_TURBO_DIRNAME
     return H3_MODELS / H3_TURBO_DIRNAME
 
@@ -14170,7 +14175,7 @@ def _h3_loras_dir() -> Path:
     DiT — the identical rule `_h3_turbo_dir()` uses, so Turbo's adapter and a
     CivitAI adapter end up as siblings instead of in two different places."""
     for root in _h3_model_roots():
-        if (root / "deepbeep-pruned-bf16" / H3_DIT_FILENAME).is_file():
+        if _h3_holds_dit(root):
             return root / H3_LORAS_DIRNAME
     return H3_MODELS / H3_LORAS_DIRNAME
 
