@@ -19,7 +19,7 @@
 
 </p>
 
-> **Current release: v4.18.0.** **Your gallery plays itself, and your audio goes where it is needed.** **Play all** shows every output full size, one after another: each clip plays once, each photo stays as long as you choose (1-10 s), a song plays to its end, and the controls fade away while it runs. Any audio in Outputs has **Use this audio for...**: Lip-sync, a Music video, the soundtrack of an image-to-video clip, or a Music Studio cover - no trip to Finder. **Enhance knows your LoRAs**: it reads each active LoRA's guide or creator notes and puts back a trigger word the rewrite left out. A CivitAI LoRA download shows its percentage and can be **cancelled**, and toast messages show their words again (since 4.17.0 they appeared empty). 4.17.5: renders that recover when macOS stops the GPU on M1/M2. 4.17.0: estimates for your Mac, faces kept in portrait and phone photos, Lip-sync as a Video mode, and a much bigger Editor. Press Update in Pinokio, then restart. Full notes on the [releases page](https://github.com/mrbizarro/Phosphene/releases).
+> **Current release: v4.19.0.** **Hailuo H3 grows up, and trained characters look like themselves again.** On Hailuo H3: **Keyframes** (an end frame, first + last, or stills at exact moments), **Extend** any clip, **Lip-sync** a face to your own voice or song, **Add sound** to a silent clip, smoother 10-15 s shots (each window carries the end of the last one, picture and sound), and **Fast HD**. Characters and voices trained in Phosphene since June were saved with their numbers in the wrong order and carried no likeness; new trainings save correctly and **Update repairs the ones you already have** (found by @tanis2000, #62). **Extend no longer wears your clip down** round after round: the part you already had is delivered untouched and only the new part is encoded (#48). 4.18.0: Play all, Use this audio for..., LoRA-aware Enhance. Press Update in Pinokio, then restart. Full notes on the [releases page](https://github.com/mrbizarro/Phosphene/releases).
 
 ## Overview
 
@@ -67,8 +67,8 @@ Text-to-video, image-to-video, and audio-to-video, all delivered as MP4 with joi
 | | [**LTX-Video 2.5**](https://github.com/Lightricks/LTX-Video) | [**Hailuo H3**](https://github.com/MiniMax-AI) (MiniMax-H3 FL2VA) |
 |---|---|---|
 | **How you get it** | The base install (27.5 GB) | One click in the Pinokio sidebar (75 GB) |
-| **Modes** | Text, image, keyframes, extend, audio-to-video, character | Text and image |
-| **Character LoRAs** | Yes — trained in-panel, face + voice | Not yet |
+| **Modes** | Text, image, keyframes, extend, audio-to-video, character | Text, image, keyframes (end frame, first + last, timed), extend, lip-sync to your audio, add sound to a silent clip |
+| **Character LoRAs** | Yes — trained in-panel, face + voice | Imported H3 LoRAs (no in-panel training yet) |
 | **Memory** | Every tier in the table above; the surface adapts | 36 GB+ on the compact Q8 engine (the install builds it); 60 GB+ also runs the full bf16 engine |
 | **Best at** | Breadth: every workflow the panel offers, plus your own trained faces | Dialogue: joint video + spoken lines + sound, from one prompt |
 | **Weights licence** | [LTX-2.x Community License](LICENSES/LTX-2.x-Community-License.md) (Lightricks) | MiniMax Community License — territory restrictions apply |

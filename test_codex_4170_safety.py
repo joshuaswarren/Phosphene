@@ -320,7 +320,10 @@ loadParams({ params: %s }).then(() => console.log(JSON.stringify({ calls,
 }""" % json.dumps(params))
 
 
-def test_safety_4_a_queued_h3_job_restores_its_engine_and_h3_recipe():
+def test_safety_4_a_queued_h3_job_restores_its_engine_and_h3_recipe(monkeypatch):
+    # As an H3-capable Mac (issue #90): below the RAM floor make_job falls
+    # back to LTX by design, and there is no H3 recipe left to restore.
+    monkeypatch.setenv("LTX_H3_FORCE_CAPABLE", "1")
     h3 = p.make_job({"mode": "t2v", "engine": "h3", "prompt": "a hen skates",
                      "h3_quality": "high", "h3_length": "15s", "h3_tristep": "1",
                      "h3_chain_prompts": json.dumps(["w1", "w2", "w3"]), "seed": "-1"})["params"]
@@ -369,7 +372,8 @@ editQueuedJob('j-h3').then(() => console.log(JSON.stringify({ got, editingSeen, 
     assert out["editingSeen"] is None and out["after"] == "j-h3"
 
 
-def test_safety_4_update_keeps_what_the_form_cannot_express(queue_state):
+def test_safety_4_update_keeps_what_the_form_cannot_express(queue_state, monkeypatch):
+    monkeypatch.setenv("LTX_H3_FORCE_CAPABLE", "1")     # see the test above
     orig = p.make_job({"mode": "t2v", "engine": "h3", "prompt": "old", "h3_quality": "high",
                        "h3_length": "10s", "session_tag": "sb:sb_1#2"})
     orig["params"]["source"] = "storyboard"

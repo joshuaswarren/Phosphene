@@ -30,16 +30,29 @@ import mlx.nn as nn
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent
+ENGINE_SRC = ROOT / "yue2-mlx" / "vendor" / "yue" / "src"
 sys.path.insert(0, str(ROOT / "scripts" / "music"))
-sys.path.insert(0, str(ROOT / "yue2-mlx" / "vendor" / "yue" / "src"))
+sys.path.insert(0, str(ENGINE_SRC))
 os.environ.setdefault("LTX_STATE_DIR", tempfile.mkdtemp(prefix="yue2-voice-state-"))
 os.environ["PHOSPHENE_ANALYTICS_DISABLED"] = "1"
 os.environ["PHOSPHENE_DISABLE_VERSION_CHECK"] = "1"
 
-import yue2_lora as L                                            # noqa: E402
-import yue2_train_voice as V                                     # noqa: E402
-from yue2.protocol import (CODEC_OFFSET, MUSIC_END, MUSIC_START,  # noqa: E402
-                           SongRequest, token_prefixes)
+# Every rule below is checked against the music ENGINE's own code
+# (`yue2.protocol.token_prefixes`), which lives in the yue2-mlx/ checkout that
+# "Install the music engine" clones at its pin: gitignored, optional, and
+# absent on any install that never installed music. Without it there is
+# nothing to check the trainer against, so every case SKIPS with that reason
+# (see the bottom of this file) instead of the module dying at import with
+# "No module named 'yue2'" (issue #90).
+ENGINE_PRESENT = (ENGINE_SRC / "yue2" / "protocol.py").is_file()
+ENGINE_MISSING = (f"music engine checkout not installed ({ENGINE_SRC / 'yue2'} "
+                  "missing) - run 'Install the music engine' to check the "
+                  "trainer against it")
+if ENGINE_PRESENT:
+    import yue2_lora as L                                        # noqa: E402
+    import yue2_train_voice as V                                 # noqa: E402
+    from yue2.protocol import (CODEC_OFFSET, MUSIC_END,  # noqa: E402
+                               MUSIC_START, SongRequest, token_prefixes)
 
 HIDDEN, KV, INTERMEDIATE, LAYERS, RANK = 16, 8, 32, 2, 4
 
@@ -545,6 +558,12 @@ class CommandLine(unittest.TestCase):
                                 "--head", str(head), "--plan-only")
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("No trainable windows", done.stdout + done.stderr)
+
+
+if not ENGINE_PRESENT:
+    for _name, _obj in list(globals().items()):
+        if isinstance(_obj, type) and issubclass(_obj, unittest.TestCase):
+            globals()[_name] = unittest.skip(ENGINE_MISSING)(_obj)
 
 
 if __name__ == "__main__":

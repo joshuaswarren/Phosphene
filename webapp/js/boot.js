@@ -73,7 +73,11 @@ function setKeyframeMode(n) {
   const countSelect = document.getElementById('keyframe_count');
   if (countSelect && n >= 3) countSelect.value = String(n);
   const hint = document.getElementById('keyframeHint');
-  if (hint) {
+  if (hint && document.body.dataset.engine === 'h3') {
+    hint.textContent = n >= 3
+      ? `Hailuo H3 passes through every still at its At(s) time and lands exactly on the end frame — with the sound and dialogue made around them.`
+      : 'Hailuo H3 starts on the start frame and lands exactly on the end frame. The start frame is optional: leave it empty and H3 invents the opening, then arrives at your end frame.';
+  } else if (hint) {
     hint.textContent = n >= 3
       ? `${n} Keyframes needs Q8 — it always renders the Q8 two-stage pass, whatever the Quality pill says. Intermediate beats are locked at their At(s) times below.`
       : 'FFLF needs Q8 — it always renders the Q8 two-stage pass, whatever the Quality pill says. The model interpolates between the first and last frames.';
@@ -736,7 +740,10 @@ function setMode(mode) {
   // NOTE: 'restore' (Colorize) is also NOT in this list — its IC-LoRA was
   // trained against the Q4 distilled checkpoint, so it RUNS on the Q4 tier.
   // Don't add either back here or you'll break the feature on sub-48GB.
-  if (window.PHOSPHENE_CAP_TIER === 'q4' && (mode === 'keyframe' || mode === 'extend')) {
+  // Hailuo H3 renders both on its own engine (its Q8 lane fits 36 GB+), so
+  // the LTX tier rule does not apply while H3 is the engine.
+  if (window.PHOSPHENE_CAP_TIER === 'q4' && (mode === 'keyframe' || mode === 'extend')
+      && document.body.dataset.engine !== 'h3') {
     console.warn(`setMode(${mode}): not available on Q4 tier — snapping to t2v`);
     mode = 't2v';
   }
@@ -886,6 +893,9 @@ function setMode(mode) {
   // Studio to a video mode.
   if (typeof renderLorasList === 'function') renderLorasList();
   document.getElementById('mode').value = mode;
+  // The form's mode on <body>, for the engine-specific folds in panel.css
+  // (e.g. H3's Length strip means nothing while extending a clip).
+  document.body.dataset.vmode = mode;
   document.querySelectorAll('#modeGroup .pill-btn').forEach(b => {
     if (mode === 'keyframe') {
       b.classList.toggle('active', isKeyframeModeChipActive(b, window._kfMode));

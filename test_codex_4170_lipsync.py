@@ -190,7 +190,11 @@ def test_lipsync_3_retake_and_extend_decode_at_the_source_rate():
     assert '"fps": fps, "frames": win["pixel_frames"]' in blk
     # Extend: same class — the decode reads the source rate.
     ext = HELPER_SRC[HELPER_SRC.index('if action == "extend":'):HELPER_SRC.index('if action == "retake_segment":')]
-    assert "frame_rate=_source_fps(video_path, p.get(\"frame_rate\"))" in ext
+    # 4.19.0 (#48): the extend decode has two paths (the splice-ready
+    # _decode_extend_stems and the old one), both fed one source-rate value.
+    assert "_ext_fps = _source_fps(video_path, p.get(\"frame_rate\"))" in ext
+    assert "frame_rate=_ext_fps" in ext and ", _ext_fps)" in ext, \
+        "both extend decodes (stems + mp4) must use the source rate"
     assert 'frame_rate=float(p.get("frame_rate", 24.0))' not in ext
 
 

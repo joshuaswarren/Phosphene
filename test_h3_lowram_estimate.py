@@ -24,6 +24,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -36,7 +37,10 @@ import mlx_ltx_panel as P  # noqa: E402
 
 
 class _Mac:
-    """Rebuild the H3 table as a given Mac would at import."""
+    """Rebuild the H3 table as a given Mac would at import — a fresh install,
+    with no learned ETA calibration (issue #90: an install that had learned a
+    1.45 H3 correction priced the 26.6-minute receipt at 38.57, because
+    `_hw_speed_factor` folds this install's own eta_calibration.json in)."""
 
     def __init__(self, ram_gb: float, chip: str):
         self.ram_gb, self.chip = ram_gb, chip
@@ -44,11 +48,14 @@ class _Mac:
     def __enter__(self):
         self.saved = (P.SYSTEM_RAM_GB, P._HW_CHIP_FAMILY,
                       os.environ.pop("PHOSPHENE_SPEED_FACTOR", None))
+        self._calibration = mock.patch.object(P, "_load_eta_calibration", lambda: {})
+        self._calibration.start()
         P.SYSTEM_RAM_GB = self.ram_gb
         P._HW_CHIP_FAMILY = self.chip
         return P._build_h3_tiers()
 
     def __exit__(self, *exc):
+        self._calibration.stop()
         P.SYSTEM_RAM_GB, P._HW_CHIP_FAMILY, env = self.saved
         if env is not None:
             os.environ["PHOSPHENE_SPEED_FACTOR"] = env
@@ -73,6 +80,13 @@ class ReducedRamLanePrice(unittest.TestCase):
                 with self.subTest(cell=key):
                     k = (P.H3_LOWRAM_FACTOR_CHAIN if c["chain_windows"] > 1
                          else P.H3_LOWRAM_FACTOR_SINGLE)
+                    if c.get("fast_hd") and c.get("tristep_min") is not None:
+                        # Fast HD = the H3 Fast pass (RAM lane factor applies)
+                        # + an LTX Face Fix (chip factor only, no H3 lane).
+                        self.assertAlmostEqual(
+                            c["eta_min"], c["tristep_min"] + c["facefix_min"], delta=0.02)
+                        self.assertAlmostEqual(c["tristep_min"], base[key][1] * k, delta=0.02)
+                        continue
                     self.assertAlmostEqual(c["eta_min"], base[key][0] * k, delta=0.02)
                     if base[key][1] is not None:
                         self.assertAlmostEqual(c["tristep_min"], base[key][1] * k,

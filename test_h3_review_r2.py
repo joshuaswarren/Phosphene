@@ -235,6 +235,10 @@ class TestHardwareFactor(unittest.TestCase):
         os.environ.pop("PHOSPHENE_SPEED_FACTOR", None)
 
     def test_measured_and_coefficients_scale(self):
+        # The baseline is the M4 Max factor, pinned (issue #90): built with
+        # THIS Mac's own chip/RAM factor, "2x the base" compared a factor of
+        # 2 against e.g. 2 x 2.14 on an M4 Pro and failed 18.2 != 38.94.
+        os.environ["PHOSPHENE_SPEED_FACTOR"] = "1"
         base = P._build_h3_tiers()
         os.environ["PHOSPHENE_SPEED_FACTOR"] = "2"
         slow = P._build_h3_tiers()

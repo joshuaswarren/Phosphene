@@ -29,8 +29,10 @@ class EngineMenuTaglinesDontOverclaimExclusivity(unittest.TestCase):
                        PANEL_PY)
 
     def test_h3_tagline_names_its_own_loras(self):
+        # 4.19: H3 serves Keyframes, Extend, Lip-sync and Add sound too, so the
+        # old "Text and Image only." clause would now under-claim.
         self.assertIn(
-            '"tagline": "joint video + dialogue + sound, its own LoRAs. Text and Image only.",',
+            '"tagline": "joint video + dialogue + sound, its own LoRAs. Keyframes, Extend, Lip-sync and Add sound too.",',
             PANEL_PY)
 
 

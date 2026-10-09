@@ -103,7 +103,15 @@ defuse() { tee -a "$LOG" | sed -u -e 's/[Ee][Rr][Rr][Oo][Rr]:/problem -/g' -e 's
 attempt() {
   uv pip install --python env/bin/python 'mlx==0.31.1' 'mlx-lm==0.31.1' \
     'mlx-metal==0.31.1' 'transformers>=5.0.0,<5.13.0' 2>&1 | defuse || return 1
+  # The packages' dependencies resolve WITH the pins, the same as
+  # scripts/post_update.sh step 3 (4.19.0). Alone, this resolve took the newest
+  # mlx-arsenal (ltx-core-mlx asks only >=0.2.4); 0.12.0 onward (2026-08-24)
+  # requires mlx>=0.32.1, so it moved mlx to 0.32.3, and the mflux pack then
+  # walked it DOWN to 0.31.2 (mflux 0.18.0 wants <0.32) - every fresh install
+  # since late August ran mlx 0.31.2 with an mlx-arsenal that declares it
+  # cannot. Pinned here the solver picks mlx-arsenal 0.11.1 and mlx stays 0.31.1.
   uv pip install --python env/bin/python --build-constraints ../pip-build-constraints.txt \
+    'mlx==0.31.1' 'mlx-lm==0.31.1' 'mlx-metal==0.31.1' 'transformers>=5.0.0,<5.13.0' \
     ./packages/ltx-core-mlx ./packages/ltx-pipelines-mlx ./packages/ltx-trainer 2>&1 | defuse || return 1
   uv pip install --python env/bin/python --reinstall --no-deps \
     --build-constraints ../pip-build-constraints.txt \

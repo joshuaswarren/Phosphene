@@ -117,9 +117,9 @@ function updateModelsCard(s) {
   // Y1.036 — Extend joins FFLF and High in needing Q8. The Extend pipeline
   // loads `transformer-dev.safetensors` for CFG-guided denoise; Q4 doesn't
   // ship it after the Y1.024 download trim, so surface the same CTA here.
-  const needsQ8 = (currentMode === 'keyframe')
-                || (currentMode === 'extend')
-                || _qualityUsesHq(document.getElementById('quality').value);
+  const _onH3 = document.body.dataset.engine === 'h3';
+  const needsQ8 = (!_onH3 && (currentMode === 'keyframe' || currentMode === 'extend'))
+                || (!_onH3 && _qualityUsesHq(document.getElementById('quality').value));
   if (needsQ8 && !q8Ok && tier.allows_q8 !== false) {
     if (dismissed) { card.style.display = 'none'; return; }
     card.style.display = '';
@@ -304,8 +304,10 @@ function applyTierGates(tier) {
   // Mode pills
   document.querySelectorAll('#modeGroup .pill-btn').forEach(b => {
     const m = b.dataset.mode;
-    const allowed = (m === 'keyframe') ? tier.allows_keyframe
-                  : (m === 'extend')   ? tier.allows_extend
+    // Hailuo H3 serves Keyframes and Extend on its own engine and lane.
+    const _h3 = document.body.dataset.engine === 'h3';
+    const allowed = (m === 'keyframe') ? (_h3 || tier.allows_keyframe)
+                  : (m === 'extend')   ? (_h3 || tier.allows_extend)
                   : true;
     b.classList.toggle('disabled', !allowed);
     if (!allowed) {

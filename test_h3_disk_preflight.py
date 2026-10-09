@@ -54,6 +54,12 @@ def _fakebin(tmp: Path, *, avail_kb: int, mem_bytes: str = PLENTY_MEM) -> Path:
 def _run(cwd: Path, fakebin: Path) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env["PATH"] = f"{fakebin}:{env.get('PATH', '')}"
+    # The script resolves the H3 tree from LTX_H3_ROOT / LTX_H3_MODELS when
+    # set (h3_roots.sh). These cases lay their fake tree out under `cwd`, so
+    # an operator's own override must not point the script somewhere else
+    # (issue #90: the weights-present case failed with LTX_H3_MODELS set).
+    for var in ("LTX_H3_ROOT", "LTX_H3_MODELS", "LTX_H3_COMPACT_DIR"):
+        env.pop(var, None)
     return subprocess.run(["bash", str(SCRIPT)], cwd=str(cwd), env=env,
                           capture_output=True, text=True, timeout=15)
 

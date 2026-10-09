@@ -106,6 +106,10 @@ class TheRunnerRefusesTheImpossible(unittest.TestCase):
         self.assertIn("invalid choice", out.lower())
 
 
+ENGINE_MODEL = (Path(__file__).with_name("yue2-mlx") / "src" / "lyra"
+                / "transcription" / "model.py")
+
+
 class TheModelsAreOptional(unittest.TestCase):
 
     def test_status_reports_what_is_missing_rather_than_a_boolean(self):
@@ -120,12 +124,19 @@ class TheModelsAreOptional(unittest.TestCase):
         """The Compose card reads one payload."""
         self.assertIn("cover", P.music_status())
 
+    # The engine's side of this pin lives in the yue2-mlx/ checkout, which
+    # "Install the music engine" clones (gitignored, optional). On an install
+    # without music there is no second half to compare: a loud skip, not an
+    # import-time crash (issue #90).
+    @unittest.skipUnless(
+        ENGINE_MODEL.is_file(),
+        "music engine checkout not installed (yue2-mlx/src/lyra/transcription/"
+        "model.py missing) - run 'Install the music engine' to check the pins")
     def test_the_fetcher_pins_the_revisions_the_engine_pins(self):
         """SheetSage2's config carries the sha256 of the MERT checkpoint it was
         trained against and refuses to load beside any other one."""
         from scripts.pinokio.music_cover_fetch import SOURCES
-        model = (Path(__file__).with_name("yue2-mlx") / "src" / "lyra" /
-                 "transcription" / "model.py").read_text()
+        model = ENGINE_MODEL.read_text()
         self.assertIn(SOURCES["sheetsage2"]["revision"], model)
         self.assertIn(SOURCES["mert2"]["revision"], model)
 

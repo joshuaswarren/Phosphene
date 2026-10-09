@@ -59,9 +59,28 @@ class _Mac:
         self._path_patch.start()
         P.SYSTEM_RAM_GB = self.ram_gb
         P._HW_CHIP_FAMILY = self.chip
+        # ...on the full, unclamped canvases (issue #90). The quality table
+        # bakes the BOOTING Mac's t2v_max_dim in at import, so on a <48 GB
+        # Mac running this suite every Mac below was priced on clamped,
+        # non-native canvases and balanced_5s stopped being a measured cell.
+        # Pinned to the standard tier rather than derived from `ram_gb`:
+        # these tests vary chip and RAM FACTOR at a fixed canvas, which is
+        # how the measured rows were taken.
+        tier = "standard"
+        self._tier_patches = [
+            mock.patch.object(P, "SYSTEM_TIER", tier),
+            mock.patch.object(P, "SYSTEM_CAPS", P.CAPABILITIES[tier]),
+        ]
+        for patch in self._tier_patches:
+            patch.start()
+        self._tier_patches.append(
+            mock.patch.object(P, "LTX_QUALITIES", P._ltx_qualities()))
+        self._tier_patches[-1].start()
         return P._build_ltx_tiers()
 
     def __exit__(self, *exc):
+        for patch in reversed(self._tier_patches):
+            patch.stop()
         self._path_patch.stop()
         P.SYSTEM_RAM_GB, P._HW_CHIP_FAMILY, env = self.saved
         if env is not None:
@@ -181,12 +200,19 @@ class SelfCalibration(unittest.TestCase):
     def test_record_from_job_computes_the_right_ratio(self):
         """A finished balanced/5s job that took exactly 2x the chip-only
         prediction should record a ~2.0 ratio."""
-        with mock.patch.object(P, "_hw_chip_family", lambda: "M4 Max"), \
-             mock.patch.object(P, "SYSTEM_RAM_GB", 64.0):
-            base_min = P.LTX_TIERS["balanced_5s"]["eta_min"]  # cal factor 1.0 here
+        # Booted as an uncalibrated 64 GB M4 Max (issue #90). The baseline is
+        # read from the tier table priced at IMPORT and the factor it was
+        # priced with (_ETA_CAL_PRICED), so with the live module tables this
+        # recorded 2.6 on a Mac with a learned 1.3 correction and 1.18 on an
+        # M4 Pro: the mocks below never reached the price being compared.
+        with _Mac(64.0, "M4 Max", calib_path=self.calib_path) as tiers, \
+             mock.patch.object(P, "LTX_TIERS", tiers), \
+             mock.patch.dict(P._ETA_CAL_PRICED, {"ltx": 1.0}), \
+             mock.patch.object(P, "_hw_chip_family", lambda: "M4 Max"):
+            base_min = tiers["balanced_5s"]["eta_min"]
             job = {"status": "done", "elapsed_sec": base_min * 60.0 * 2.0,
                    "params": {"engine": "ltx", "quality": "balanced",
-                              "frames": P.LTX_TIERS["balanced_5s"]["frames"]}}
+                              "frames": tiers["balanced_5s"]["frames"]}}
             P._record_eta_calibration_from_job(job)
         self.assertAlmostEqual(P._eta_calibration_factor("ltx"), 2.0, delta=0.05)
 

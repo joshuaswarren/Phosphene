@@ -28,12 +28,23 @@ bash scripts/release_gates.sh          # everything (~2 min)
 bash scripts/release_gates.sh --fast   # skips the two slowest
 ```
 
+- **The gates need pytest in the repo venv** — users never do, so no install
+  pins it: `ltx-2-mlx/env/bin/python -m pip install pytest`. Without it the
+  pytest-style suites are a loud SKIP, never a pass.
+- **The gates need a real install, not a bare clone.** `ltx-2-mlx/` (the
+  vendored engine and its venv) is gitignored and created by `install.js`, and
+  the registry gate reads the weights under `mlx_models/`. Run them inside an
+  installed Phosphene (or a worktree whose `ltx-2-mlx` and `mlx_models` point
+  at one); a fresh `git clone` cannot run them.
+
 It runs every check on this page that a command can run — `py_compile`, the
 three `node` gates, `assert_registry`, `assert_schedules`, `check_output_codec`
-(§3a), the whole root `test_*.py` sweep, and `scripts/test_*.py` **through
-pytest** (three of those suites are pytest-style; `python -m unittest` collects
-zero tests from them and prints a green "Ran 0 tests / OK" that asserts
-nothing). It prints a PASS/FAIL/SKIP table and exits non-zero on any failure.
+(§3a), the whole root `test_*.py` sweep, and `scripts/test_*.py` — every
+pytest-style file (module-level `def test_*`) **through pytest**, because
+`python -m unittest` collects zero tests from those and prints a green "Ran 0
+tests / OK" that asserts nothing. Each suite runs in its own empty state/
+outputs/uploads sandbox. It prints a PASS/FAIL/SKIP table, lists every test
+skipped inside a passing suite, and exits non-zero on any failure.
 **A SKIP is not a PASS** — it means the gate could not run.
 
 **Key every public step on the runner's exit code, explicitly.** On 2026-09-08 a

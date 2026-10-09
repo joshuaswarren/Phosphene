@@ -39,6 +39,10 @@ webapp/                 ← the frontend, as plain files served from disk
     └── panel.css       ← ALL panel CSS (slice 1, landed)
 mlx_warm_helper.py      ← the render subprocess (JSON over stdin/stdout);
                           not part of the web frontend at all
+extend_splice.py        ← an Extend's delivery (issue #48): the source file's
+                          own frames (H.264 copied bit-exact when possible) +
+                          only the new frames, audio encoded once from a
+                          lossless master; numpy + ffmpeg, no model
 ltx_windows.py          ← PURE: the sliding-window schedule and per-window
                           prompt contract for long LTX clips; the panel turns
                           it into one generate + N extend calls

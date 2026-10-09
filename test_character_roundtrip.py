@@ -803,12 +803,13 @@ class TestQueueCharacterVoiceContract(unittest.TestCase):
         installed, the Mac lacks the RAM, or the mode is one H3 does not serve.
         The character refusal used to re-read the RAW form field instead of the
         resolved engine, so a request that was about to render correctly on LTX
-        with the full character stack got a 400 instead. `extend` is one of the
-        modes H3 never serves, so this can be asserted without depending on
+        with the full character stack got a 400 instead. `restore` (Colorize)
+        is one of the modes H3 never serves (`extend` was, until 4.19 taught H3
+        to continue a clip), so this can be asserted without depending on
         whether H3 is installed on the machine running the test.
         """
         reply, params = self._post({
-            "mode": "extend", "engine": "h3", "character_id": "bizarrotrn",
+            "mode": "restore", "engine": "h3", "character_id": "bizarrotrn",
             "prompt": "bizarrotrn keeps speaking",
         })
         self.assertEqual(reply["status"], 200, reply)

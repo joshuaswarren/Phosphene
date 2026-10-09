@@ -386,6 +386,8 @@ function _h3IsI2V() {
 // Would THIS cell render Fast, as things stand?
 function h3TriStepOn(cell) {
   cell = cell || h3CurrentCell();
+  // Fast HD is the Fast pass by definition (the server forces it too).
+  if (cell && cell.fast_hd) return !!(cell.tristep_min != null && h3TriStepState().available);
   return !!(cell && cell.tristep_min != null
             && h3TriStepState().available && h3SpeedPref() === 'fast');
 }
@@ -412,6 +414,8 @@ function _h3EtaPlain(s) {
 // fixed seconds for a pinned Steps count); nothing here models anything.
 function h3CellEtaMin(cell, opts) {
   if (!cell) return 0;
+  // Fast HD is priced whole: the Fast H3 pass plus its Upscale & Face Fix.
+  if (cell.fast_hd) return (_h3TriStepMin(cell) || cell.tristep_min || 0) + (cell.facefix_min || 0);
   opts = opts || {};
   const fast = (opts.fast != null) ? opts.fast : h3TriStepOn(cell);
   if (fast && cell.tristep_min != null) return _h3TriStepMin(cell);
@@ -445,6 +449,7 @@ function h3FmtEtaMin(m) {
 // wherever it priced that state (that is where a MEASURED wall clock lives).
 function h3CellEta(cell, opts) {
   if (!cell) return '';
+  if (cell.fast_hd) return h3FmtEtaMin(h3CellEtaMin(cell));
   opts = opts || {};
   const fast = (opts.fast != null) ? opts.fast : h3TriStepOn(cell);
   if (fast && cell.tristep_min != null) return _h3TriStepEta(cell);
@@ -703,13 +708,16 @@ document.querySelectorAll('#h3SpeedGroup [data-h3-speed]').forEach(b => {
 // The Upscale & Face Fix pair, priced from the cell's own numbers: the
 // checkbox beside Generate and the estimate line in the footer.
 function h3FaceFixOn() {
+  const cell = (typeof h3CurrentCell === 'function') ? h3CurrentCell() : null;
+  if (cell && cell.fast_hd) return true;   // Fast HD always finishes with it
   return ((document.getElementById('h3_upscale') || {}).value) === 'ltx_x2';
 }
 function _h3SyncFaceFixEta() {
   const cell = h3CurrentCell();
   const allowed = (H3.upscale_modes || []).indexOf('ltx_x2') !== -1;
   const row = document.getElementById('h3FaceFixFooterRow');
-  if (row) row.hidden = !allowed;
+  // Fast HD always finishes with it, so the toggle has nothing to decide.
+  if (row) row.hidden = !allowed || !!(cell && cell.fast_hd);
   const eta = document.getElementById('h3FaceFixFooterEta');
   if (eta) {
     eta.textContent = (cell && cell.facefix_min != null)
@@ -727,8 +735,31 @@ function _h3SyncFaceFixEta() {
 function h3EstimateLine() {
   const cell = h3CurrentCell();
   if (!cell) return '';
+  // 4.19: Extend and Add sound are priced by the 5 s window they run in, not
+  // by the Length strip (which they do not use).
+  const _mode = (typeof currentMode !== 'undefined') ? currentMode : '';
+  if (_mode === 'extend' || _mode === 'v2a') {
+    const win = h3CellFor(cell.quality, '5s') || cell;
+    const per = h3CellEtaMin(win);
+    const fmt = (m) => h3FmtEtaMin(m).replace(/^~/, '').replace(/ · batch$/, '');
+    if (_mode === 'extend') {
+      const sec = Math.max(0.5, Math.min(15, parseFloat((document.getElementById('extend_seconds') || {}).value) || 5));
+      const windows = 1 + Math.max(0, Math.ceil((sec * 24 + 1 - 124) / 123));
+      return 'Extend +' + sec.toFixed(1) + ' s · ' + win.quality_label + ' · ' + windows
+        + ' window' + (windows > 1 ? 's' : '') + ' ≈ ' + fmt(per * windows);
+    }
+    // Add sound never upscales (the picture is the user's), so a Fast HD pick
+    // costs only its H3 pass here.
+    const v2aPer = win.fast_hd ? (_h3TriStepMin(win) || win.tristep_min || per) : per;
+    return 'Add sound · picture kept · ≈ ' + fmt(v2aPer) + ' per 5 s of clip';
+  }
   const fast = h3TriStepOn(cell);
   let m = h3CellEtaMin(cell);
+  if (cell.fast_hd) {
+    // Already includes its Upscale & Face Fix (h3CellEtaMin prices it whole).
+    return 'Fast HD · ' + cell.width + '×' + cell.height + ' → ' + cell.final_width + '×'
+      + cell.final_height + ' ≈ ' + h3FmtEtaMin(m).replace(/^~/, '').replace(/ · batch$/, '');
+  }
   let txt = cell.quality_label + ' · ' + (fast ? 'Fast' : 'Best');
   if (h3FaceFixOn()) {
     txt += ' + Face Fix';
@@ -1852,6 +1883,44 @@ document.getElementById('prompt') && document.getElementById('prompt')
   });
 
 
+// ---- 4.19: H3 media modes ----------------------------------------------------
+// Keyframes, Extend, Lip-sync and Add sound each need a runner flag an older
+// H3 pack does not have. /status.h3 carries one boolean per capability, probed
+// on the INSTALLED runner; the server (make_job + the worker) makes the same
+// decision from the same probes — this copy only lets the UI say so first.
+globalThis.H3_MODE_CAP = { keyframe: 'keyframes', extend: 'extend', a2v: 'audio_drive', v2a: 'video_to_audio' };
+globalThis.H3_MODE_LABEL = { keyframe: 'Keyframes', extend: 'Extend', a2v: 'Lip-sync', v2a: 'Add sound' };
+
+function h3CanServe(mode) {
+  const st = (window._ENGINE_PROBES && window._ENGINE_PROBES.h3) || {};
+  if (!st.available) return false;
+  const cap = H3_MODE_CAP[mode];
+  return cap ? !!st[cap] : true;
+}
+
+function h3ClipIsH3(o) {
+  return !!(o && o.engine === 'h3');
+}
+
+// The Extend panel's length control speaks per engine: LTX adds 8-frame
+// latents up to 10 s; H3 adds 5 s windows and lands on the exact seconds,
+// up to 15 s (three windows, each carrying the last 17 frames and their sound).
+function syncH3MediaModeUi() {
+  const onH3 = document.body.dataset.engine === 'h3';
+  const sec = document.getElementById('extend_seconds');
+  if (sec) {
+    sec.max = onH3 ? '15' : '10';
+    if (!onH3 && parseFloat(sec.value) > 10) sec.value = '10';
+  }
+  const hint = document.getElementById('extendDurationHint');
+  if (hint && onH3 && sec) {
+    const s = Math.max(0.5, Math.min(15, parseFloat(sec.value) || 5));
+    const windows = 1 + Math.max(0, Math.ceil((s * 24 + 1 - 124) / 123));
+    hint.textContent = `Adds ${s.toFixed(1)} s · ${windows} H3 window${windows > 1 ? 's' : ''}`;
+  }
+}
+
+
 // ---- published to the page --------------------------------------------------
 // Inline handlers in the markup and the other files resolve these through
 // the global scope; everything NOT listed here is private to this module.
@@ -1876,4 +1945,5 @@ Object.assign(globalThis, {
   ltxCellInstallLabel, _ltxApplyShape, setH3Quality, _h3ApplyShape,
   renderH3WindowPrompts, toggleH3WindowHelp, setH3ChainPrompts, setH3Tier,
   h3InsertPromptStructure, h3InsertDialogueLine, h3SyncPromptHelper,
+  h3CanServe, h3ClipIsH3, syncH3MediaModeUi, h3FmtEtaMin,
 });

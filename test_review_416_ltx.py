@@ -639,7 +639,12 @@ class HardwareClampsKeepShapeAndGrid(unittest.TestCase):
     def test_the_compact_profile_clamp_stays_on_the_grid(self):
         job = P.make_job({"mode": "t2v", "prompt": "x", "quality": "balanced",
                           "width": "1536", "height": "832", "frames": "49"})
-        with mock.patch.object(P, "GENERATION_PROFILE", P._select_generation_profile(48.0, "standard")):
+        # The tier is pinned with the profile (issue #90): the profile's
+        # max_dim clamp is skipped on the `base` tier, where CAPABILITIES'
+        # own clamp in run_job_inner is the authority, so on a <48 GB Mac
+        # this asserted a clamp that tier never applies here.
+        with mock.patch.object(P, "GENERATION_PROFILE", P._select_generation_profile(48.0, "standard")), \
+                mock.patch.object(P, "SYSTEM_TIER", "standard"):
             P._apply_generation_profile_to_job(job)
         got = (job["params"]["width"], job["params"]["height"])
         self._check(got, 1024, (1536, 832))

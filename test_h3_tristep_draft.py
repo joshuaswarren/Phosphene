@@ -313,8 +313,20 @@ class TestMakeJob(_Env):
 
 
 class TestEstimates(unittest.TestCase):
+    """The receipts below are M4 Max wall clocks, so the cells are priced at
+    the M4 Max factor (issue #90). The module's H3_TIERS is priced at import
+    with THIS Mac's chip, RAM lane and learned calibration; on an M4 Pro the
+    3.0-minute receipt read 6.42 and the assertions failed by machine."""
+
+    def _at_m4_max(self):
+        patcher = unittest.mock.patch.dict(os.environ, {"PHOSPHENE_SPEED_FACTOR": "1"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return P._build_h3_tiers()
+
     def test_draft_cells_are_priced(self):
-        cell = P.H3_TIERS["draft_5s"]
+        tiers = self._at_m4_max()
+        cell = tiers["draft_5s"]
         self.assertEqual(cell["tristep_min_i2v"], 3.0)
         self.assertEqual(cell["tristep_eta_i2v"], "~3 min")
         self.assertTrue(cell["tristep_measured_i2v"])
@@ -326,15 +338,16 @@ class TestEstimates(unittest.TestCase):
         self.assertEqual(cell["facefix_min"], P.FACE_FIX_DRAFT_5S_MIN)
         self.assertAlmostEqual(cell["tristep_min_i2v"] + cell["facefix_min"], 5.5)
         self.assertLess(cell["tristep_min"], cell["eta_min"])
-        short = P.H3_TIERS["draft_3s"]
+        short = tiers["draft_3s"]
         self.assertFalse(short["tristep_measured"])
         self.assertLess(short["tristep_min"], short["eta_min"])
         self.assertEqual(short["tristep_min"], round(P.h3_estimate_minutes(640, 384, 73, 1, 3), 2))
-        self.assertEqual(P.H3_TIERS["draft_10s"]["tristep_forwards"], 6)
+        self.assertEqual(tiers["draft_10s"]["tristep_forwards"], 6)
         self.assertTrue(cell["tristep_default"])
 
     def test_standard_and_high_are_priced_from_their_receipts(self):
-        std, high = P.H3_TIERS["standard_5s"], P.H3_TIERS["high_5s"]
+        tiers = self._at_m4_max()
+        std, high = tiers["standard_5s"], tiers["high_5s"]
         self.assertEqual((std["tristep_min"], std["tristep_eta"]), (4.9, "~5 min"))
         self.assertEqual((std["tristep_min_i2v"], std["tristep_eta_i2v"]), (4.8, "~5 min"))
         self.assertEqual((high["tristep_min"], high["tristep_eta"]), (8.4, "~8 min"))
@@ -345,9 +358,9 @@ class TestEstimates(unittest.TestCase):
         self.assertEqual(std["facefix_min"], 4.0)
         self.assertEqual(high["facefix_min"], 9.0)
         self.assertLess(high["tristep_min_i2v"], high["eta_min"] / 3)
-        self.assertIn("tristep_min", P.H3_TIERS["high_15s"])
-        self.assertNotIn("tristep_min", P.H3_TIERS["native_5s"])
-        self.assertNotIn("tristep_min", P.H3_TIERS["high_10s_dense"])
+        self.assertIn("tristep_min", tiers["high_15s"])
+        self.assertNotIn("tristep_min", tiers["native_5s"])
+        self.assertNotIn("tristep_min", tiers["high_10s_dense"])
 
     def test_other_canvases_are_not(self):
         for key, cell in P.H3_TIERS.items():

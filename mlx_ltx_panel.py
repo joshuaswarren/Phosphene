@@ -3388,6 +3388,54 @@ def _suggest_trigger_token() -> str:
         return token
 
 
+def _caption_declared_trigger(text: str) -> str | None:
+    """Best-effort extraction of the trigger token a caption file actually
+    uses, for error messages when it disagrees with the job's configured
+    trigger (#62, 2026-09-30 — a dataset reused across training attempts
+    silently carried a DIFFERENT trigger's captions forward).
+
+    The canonical shape written by both the trainer's own fallback and
+    caption_with_gemma.py is `[VISUAL]: <trigger>, <body>`, so the token
+    right after `[VISUAL]: ` is authoritative when present. Anything else
+    (a naked `<trigger> man` caption, or free-form user text) falls back to
+    the first comma-separated segment, which is where every caption
+    convention this trainer has ever used puts the trigger.
+    """
+    m = re.match(r"\s*\[VISUAL\]:\s*([^\s,]+)", text)
+    if m:
+        return m.group(1)
+    first = text.split(",", 1)[0].strip()
+    return first or None
+
+
+def _caption_trigger_mismatches(
+    caption_files: list[Path], trigger: str
+) -> tuple[list[str], tuple[str, int] | None]:
+    """Which of ``caption_files`` do NOT contain ``trigger`` (case-insensitive
+    substring match), and what trigger they carry instead.
+
+    Returns ``(mismatched_tokens, dominant_other)`` — one entry in
+    ``mismatched_tokens`` per file that doesn't mention ``trigger`` (its own
+    declared trigger via :func:`_caption_declared_trigger`, or ``"?"`` if
+    none could be extracted), and ``dominant_other`` is the most common real
+    (non-``"?"``) token among them with its count, or ``None`` if every
+    mismatch was unparseable. Unreadable files are skipped, not counted as
+    mismatches — an I/O error here is not evidence about caption content.
+    """
+    mismatched: list[str] = []
+    for cap in caption_files:
+        try:
+            text = cap.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if trigger.lower() not in text.lower():
+            mismatched.append(_caption_declared_trigger(text) or "?")
+    dominant = collections.Counter(
+        t for t in mismatched if t != "?"
+    ).most_common(1)
+    return mismatched, (dominant[0] if dominant else None)
+
+
 def _train_estimate_seconds(preset: str, image_count: int, *,
                             steps_override: int | None = None,
                             is_style: bool = False) -> int:
@@ -9262,7 +9310,7 @@ H3_TRISTEP_NOTE = ("Fast: 3 steps — about 4× faster, great for drafts and mos
                    "shots (TaoMate's 3-step adapter on the same H3 model). "
                    "Turbo is never stacked on it.")
 # Canvases that offer it, and the ones where it is the default once installed.
-H3_TRISTEP_QUALITIES = ("draft", "preview", "standard", "high")
+H3_TRISTEP_QUALITIES = ("draft", "preview", "fast_hd", "standard", "high")
 H3_TRISTEP_DEFAULT_QUALITIES = H3_TRISTEP_QUALITIES
 # End-to-end wall clocks for TriStep cells, M4 Max, keyed (quality, length).
 # Keyed (quality, length, mode). All with the character + vh5tape LoRAs on top
@@ -9283,7 +9331,18 @@ H3_TRISTEP_MEASURED_ETA: dict[tuple[str, str, str], tuple[float, str]] = {
 # 8.2–9.9 min (panel history, 2026-09-16/17); 768×448 is interpolated between
 # them on output pixels (~4 min, not measured). Other lengths scale by frames.
 FACE_FIX_DRAFT_5S_MIN = 2.5
-FACE_FIX_5S_MIN = {"draft": 2.5, "preview": 2.0, "standard": 4.0, "high": 9.0}
+# Fast HD = a 640×384 H3 render on the 3-step Fast pass, then the LTX x2
+# Upscale & Face Fix "face kept" recipe (start from the clip,
+# FAST_HD_FACEFIX_STEPS refine step) to 1280×768. Measured on a 5 s (124 f)
+# Bizarro close-up, same prompt and seed, M4 Max 64 GB: H3 640×384 Fast 181 s;
+# x2 at 1 step 158 s (ArcFace 0.891 vs refs) and at 3 steps 357 s (0.850 — the
+# extra steps redraw the face AND erase the speed win: 538 s total against High
+# Fast's 535 s at 0.914). So 1 step: 339 s total, 37% under High Fast. Table in
+# docs/H3_ENGINE.md ("Fast HD").
+FAST_HD_FACEFIX_STEPS = 1
+FAST_HD_FACEFIX_5S_MIN = 2.7
+FACE_FIX_5S_MIN = {"draft": 2.5, "preview": 2.0, "standard": 4.0, "high": 9.0,
+                   "fast_hd": FAST_HD_FACEFIX_5S_MIN}
 
 # ============================================================================
 # H3 RENDER SHAPE — two independent axes, priced by one measured cost model
@@ -10765,6 +10824,25 @@ def _h3_qualities() -> dict[str, dict]:
             "note": H3_TIER_DRAFT_NOTE,
             "offered": True,
         },
+        # 4.19 "Fast HD": draft-then-sharpen. H3 renders the scene, motion,
+        # dialogue and sound at 640×384 on the 3-step Fast pass; LTX's x2
+        # Upscale & Face Fix then redraws the pixels at 1280×768, starting
+        # from the clip itself so the face is refined, not re-imagined. One
+        # click, two queued jobs, delivered as one clip beside its draft.
+        "fast_hd": {
+            "key": "fast_hd", "label": "Fast HD", "order": 0.5,
+            "width": 640, "height": 384,
+            "final_width": 1280, "final_height": 768,
+            "fast_hd": True,
+            # Same canvas as Draft, but the H3 pass decodes with the full VAE
+            # (the Face Fix starts from it), so it is not a "draft" tier.
+            "blurb": "H3 makes the shot fast at 640×384, then LTX's Upscale & "
+                     "Face Fix sharpens it to 1280×768 from the clip itself, "
+                     "keeping the face. About two thirds of High's wait on the "
+                     "Fast pass; fine detail comes from the upscaler, so check "
+                     "faces on your own shots.",
+            "offered": True,
+        },
         "standard": {
             "key": "standard", "label": "Standard", "order": 1,
             "width": 768, "height": 448,
@@ -10843,6 +10921,11 @@ def _h3_qualities() -> dict[str, dict]:
         q["wide"] = (int(q["width"]) * 9 == int(q["height"]) * 16)
         q["canvas"] = f"{q['width']}×{q['height']}"
         q["spec"] = f"{q['canvas']} · {q['aspect']}"
+        if q.get("fast_hd"):
+            # What the user gets is the upscaled clip; say both sizes.
+            q["canvas"] = f"{q['final_width']}×{q['final_height']}"
+            q["spec"] = f"{q['width']}×{q['height']} → {q['canvas']} · {q['aspect']}"
+        q.setdefault("fast_hd", False)
         q.setdefault("draft", False)
         q.setdefault("note", "")
         # 0 = no canvas opinion; the length's own count applies.
@@ -10995,7 +11078,9 @@ def _build_h3_tiers() -> dict[str, dict]:
                 # the model (no mode term) covers the rest.
                 for mode_key, suffix in (("t2v", ""), ("i2v", "_i2v")):
                     m_min, m_eta, m_meas = tri_min, _fmt_eta(tri_min), False
-                    hit = H3_TRISTEP_MEASURED_ETA.get((q["key"], ln["key"], mode_key))
+                    # Fast HD's H3 half IS a Draft-canvas Fast render.
+                    hit = H3_TRISTEP_MEASURED_ETA.get(
+                        ("draft" if q.get("fast_hd") else q["key"], ln["key"], mode_key))
                     if hit:
                         m_min, m_meas = hit[0] * hw, True
                         m_eta = hit[1] if hw == 1.0 else _fmt_eta(m_min)
@@ -11009,6 +11094,11 @@ def _build_h3_tiers() -> dict[str, dict]:
                     # An LTX pass: the chip factor only, not H3's RAM lane.
                     tristep["facefix_min"] = round(
                         ff * _hw_speed_factor("h3") * frames / 124.0, 2)
+                if q.get("fast_hd"):
+                    # Fast HD never renders on Best: the 3-step pass IS the
+                    # recipe, so the cell's own price is Fast + the fix.
+                    eta_min = tristep["tristep_min"] + tristep.get("facefix_min", 0.0)
+                    eta, eta_measured = _fmt_eta(eta_min), False
             spec = f"{w}×{h} · {frames}f"
             if windows > 1:
                 spec += f" · {windows}×5s"
@@ -11055,6 +11145,9 @@ def _build_h3_tiers() -> dict[str, dict]:
                 "notes": notes,
                 "note": " ".join(notes),
                 "draft": bool(q["draft"]),
+                "fast_hd": bool(q.get("fast_hd")),
+                "final_width": int(q.get("final_width") or w),
+                "final_height": int(q.get("final_height") or h),
                 "dense": bool(ln["dense"]),
                 "offered": bool(q["offered"] and ln["offered"]),
                 **tristep,
@@ -11155,6 +11248,17 @@ def h3_cell_gate(cell: dict) -> tuple[bool, str]:
                 f"`--chain-windows` on the installed H3 runner. Re-run "
                 f"'Install Hailuo H3' from the Phosphene sidebar to update the "
                 f"clone — your weights stay.")
+    if cell.get("fast_hd"):
+        if cell.get("dense"):
+            return (False, "Fast HD is built from 5 s windows; pick 3s, 5s, 10s or 15s.")
+        _tri = h3_tristep_status() if h3_available() else {"available": False}
+        if not _tri.get("available"):
+            return (False, "Fast HD renders on H3's Fast (3-step) pass — install "
+                           "Fast first (one click on Speed → Fast, 180 MB).")
+        if not face_fix_adapter_ready():
+            return (False, f"Fast HD finishes with {FACE_FIX_NAME}, which needs the "
+                           "LTX-2.5 Pixel Spatial Upscaler adapter (0.3 GB) — "
+                           "download it in Settings → Models.")
     allowed = H3_LENGTHS[cell["length"]].get("qualities") or ()
     if allowed and cell["quality"] not in allowed:
         return (False,
@@ -12729,9 +12833,32 @@ H3_UPSCALE_DEFAULT = "fit_720p"
 H3_ORIENTATIONS = ("landscape", "portrait")
 H3_ORIENTATION_DEFAULT = "landscape"
 # Modes H3 can serve. Text = prompt only; Image = FL2VA first-frame
-# conditioning. Everything else (FFLF, Extend, Remix, Character, A2V) is
-# LTX-pipeline-specific and has no H3 equivalent.
-H3_MODES = ("t2v", "i2v")
+# conditioning; Keyframes = first/last/timed stills (the official FL2VA task,
+# timed frames on the same clock); Extend = continue a clip from its last 17
+# frames and their sound; a2v = Lip-sync (the picture follows a soundtrack
+# held clean in the target audio rows); v2a = Add sound (the picture held, only
+# the audio generated). Every mode past Image needs a runner flag the panel
+# probes (h3_supports_keyframes / _extend / _audio_drive / _video_to_audio), so
+# an older pack hides the control instead of failing mid-render. Remix and
+# Character stay LTX-pipeline-specific.
+H3_MODES = ("t2v", "i2v", "keyframe", "extend", "a2v", "v2a")
+# Modes past Text/Image and the runner capability each one needs — the one map
+# make_job, the worker and the UI gate read.
+H3_MODE_CAPABILITY = {
+    "keyframe": "keyframes",
+    "extend": "extend",
+    "a2v": "audio_drive",
+    "v2a": "video_to_audio",
+}
+# Carried context between chained windows, in frames: one 17-frame VAE clip
+# (0.7 s) of picture plus its sound. Measured on seams before it shipped as
+# the default; `h3_continuity=off` keeps the old one-still hand-over.
+H3_CONTEXT_FRAMES = 17
+# Every window decodes on its own and lands a percent or two off its
+# predecessor's grade; easing the new window onto the carried last frame over
+# 24 frames took the colour step at the seam from 13x the clip's own
+# frame-to-frame change to 1.7x on the first measured chain (H3_BUILD_REPORT).
+H3_SEAM_COLOUR_FRAMES = 24
 
 
 def _h3_model_roots() -> list[Path]:
@@ -15274,6 +15401,54 @@ def h3_supports_chain_prompts() -> bool:
     return _h3_runner_has_flag("--chain-prompts")
 
 
+def h3_supports_keyframes() -> bool:
+    """Whether the INSTALLED runner takes a last frame and timed keyframes
+    (`--last-frame`, `--keyframe PATH@WHEN`) — Start & end frame and
+    Keyframes on H3. Same probe as every other capability: the script text."""
+    return _h3_runner_has_flag("--last-frame") and _h3_runner_has_flag("--keyframe")
+
+
+def h3_supports_continuation() -> bool:
+    """Whether the INSTALLED runner carries real context between chained
+    windows (`--chain-context-frames`): the last 17 frames and their sound,
+    not one still and a fresh seed."""
+    return _h3_runner_has_flag("--chain-context-frames")
+
+
+def h3_supports_extend() -> bool:
+    """Whether the INSTALLED runner can continue an existing clip (`--extend-from`)."""
+    return _h3_runner_has_flag("--extend-from") and h3_supports_continuation()
+
+
+def h3_supports_audio_drive() -> bool:
+    """Whether the INSTALLED runner can render to a supplied soundtrack
+    (`--audio-drive`, H3 lip-sync)."""
+    return _h3_runner_has_flag("--audio-drive")
+
+
+def h3_supports_video_to_audio() -> bool:
+    """Whether the INSTALLED runner can score a silent clip (`--video-to-audio`)."""
+    return _h3_runner_has_flag("--video-to-audio")
+
+
+H3_MODE_LABELS = {"keyframe": "keyframes", "extend": "Extend",
+                  "a2v": "Lip-sync", "v2a": "Add sound"}
+
+
+def h3_mode_supported(mode: str) -> bool:
+    """Can the INSTALLED runner serve this H3 mode? Text/Image always (their
+    flags are older than every gate here); the rest per H3_MODE_CAPABILITY."""
+    cap = H3_MODE_CAPABILITY.get(str(mode or ""))
+    if cap is None:
+        return True
+    return {
+        "keyframes": h3_supports_keyframes,
+        "extend": h3_supports_extend,
+        "audio_drive": h3_supports_audio_drive,
+        "video_to_audio": h3_supports_video_to_audio,
+    }[cap]()
+
+
 def h3_supports_memory_limits() -> bool:
     """Whether the INSTALLED runner accepts `--memory-gb` / `--wired-gb`."""
     return (_h3_runner_has_flag("--memory-gb")
@@ -15662,6 +15837,13 @@ def h3_status() -> dict:
         # what each window should do. False hides the control and leaves the
         # cell carrying H3_TIER_CHAIN_NOTE_LEGACY instead.
         "chain_prompts": available and h3_supports_chain_prompts(),
+        # 4.19 H3 capabilities, each probed on the INSTALLED runner so an older
+        # pack hides the control instead of failing 30 s into a render.
+        "keyframes": available and h3_supports_keyframes(),
+        "continuation": available and h3_supports_continuation(),
+        "extend": available and h3_supports_extend(),
+        "audio_drive": available and h3_supports_audio_drive(),
+        "video_to_audio": available and h3_supports_video_to_audio(),
         # The `?` copy for that control, so the sentence explaining the
         # mechanic lives next to the mechanic.
         "chain_prompt_help": H3_CHAIN_PROMPT_HELP,
@@ -16917,7 +17099,9 @@ ENGINES: tuple[dict, ...] = (
         "builtin": True,
         "probe": None,
         "modes": None,
-        "excluded_modes": (),
+        # Add sound (v2a) scores a silent clip with H3's joint audio; LTX has
+        # no picture-held audio pass, so the mode is H3's alone.
+        "excluded_modes": ("v2a",),
         "serves_label": "every mode",
         "surfaces": ("video",),
         # LTX fuses as many LoRAs as you stack, from mlx_models/loras/.
@@ -16938,7 +17122,7 @@ ENGINES: tuple[dict, ...] = (
         # H3-16: named the modes it lacks (Text and Image only) but not that
         # it takes LoRAs from its own library, the one real capability a
         # user comparing rows would want stated next to LTX's.
-        "tagline": "joint video + dialogue + sound, its own LoRAs. Text and Image only.",
+        "tagline": "joint video + dialogue + sound, its own LoRAs. Keyframes, Extend, Lip-sync and Add sound too.",
         "mark": "eng-mark-h3",
         "accent": "#FF2E9F",
         "accent_dim": "rgba(255,46,159,0.14)",
@@ -16947,7 +17131,7 @@ ENGINES: tuple[dict, ...] = (
         "probe": "h3",
         "modes": H3_MODES,
         "excluded_modes": ("character", "i2v_clean_audio"),
-        "serves_label": "Text and Image",
+        "serves_label": "Text, Image, Keyframes, Extend, Lip-sync and Add sound",
         "surfaces": ("video",),
         # H3 takes ONE adapter through the same `--lora` flag Turbo rides, out
         # of its own library (see _h3_loras_dir). The picker is additionally
@@ -20049,6 +20233,87 @@ def _ensure_downscaled(src: Path, max_dim: int = 768, align: int = 32) -> Path:
             pass
         raise
     return cached
+
+
+def _extend_audio_master_for(src: Path) -> Path | None:
+    """The lossless audio master an earlier Extend left for `src` (its
+    sidecar's `extend_audio_master`), or None when there is none on disk."""
+    try:
+        data = json.loads(src.with_suffix(src.suffix + ".json").read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError):
+        return None
+    cand = data.get("extend_audio_master") if isinstance(data, dict) else None
+    try:
+        return Path(cand) if cand and Path(cand).is_file() else None
+    except OSError:
+        return None
+
+
+def deliver_extend(src: Path, generated: Path, generated_audio: Path | None,
+                   final_out: Path, work: Path, *, engine: str, codec: dict,
+                   direction: str = "after", new_frames: int | None = None,
+                   generated_lossless: bool = True, picked: Path | None = None) -> dict:
+    """Write an Extend's delivery: the SOURCE file's own frames, untouched,
+    plus the frames the model added (issue #48). Returns the splice report
+    the sidecar records.
+
+    Both engines carry the source region through the model without
+    re-denoising it, but used to deliver the pipeline's own copy of it — so
+    every round of an extend chain re-encoded (and, on LTX, VAE- and
+    vocoder-round-tripped) the WHOLE accumulated clip, and the damage
+    compounded: the "made out of particles" picture and the audio mush in
+    the report. `extend_splice` keeps the source's H.264 stream bit-exact
+    when it can, decodes it exactly once when it cannot, and encodes the
+    soundtrack once from a lossless master (see that module's docstring for
+    the measurements). The model's conditioning is not touched.
+
+    Never loses a render: if the splice cannot produce a verified file, the
+    model's own output is delivered exactly as before this change and the
+    log says so."""
+    import extend_splice as xs                                        # noqa: PLC0415
+    master_out = OUTPUT / ".extend" / "masters" / (final_out.name + ".flac")
+    try:
+        n_gen = xs.probe(FFPROBE, generated)["frames"]
+        if engine == "h3":
+            layout = xs.h3_layout(n_gen, int(new_frames or 0))
+        else:
+            layout = xs.ltx_layout(xs.probe(FFPROBE, src)["frames"], n_gen, direction)
+        report = xs.splice(
+            ffmpeg=FFMPEG, ffprobe=FFPROBE, source=src, generated=generated,
+            generated_audio=generated_audio, out=final_out, layout=layout, work=work,
+            pix_fmt=codec["pix_fmt"], crf=codec["crf"],
+            generated_lossless=generated_lossless,
+            # The master hangs off whichever sidecar the earlier render wrote:
+            # its own (an LTX extend) or its export's (H3 shows the `_720p`
+            # file, and that is the one with a sidecar). splice() still checks
+            # the master's length against the source before trusting it.
+            source_master=(_extend_audio_master_for(src)
+                           or (_extend_audio_master_for(picked) if picked else None)),
+            master_out=master_out,
+            run=run_ffmpeg_tracked)
+    except JobCancelled:
+        raise
+    except Exception as exc:                                        # noqa: BLE001
+        push(f"Extend: could not keep {src.name} as it was ({exc}) — delivering the "
+             f"model's own output for this round instead.")
+        if generated_lossless:
+            cmd = [str(FFMPEG), "-y", "-v", "error", "-i", str(generated)]
+            if generated_audio and Path(generated_audio).is_file():
+                cmd += ["-i", str(generated_audio), "-map", "0:v:0", "-map", "1:a:0"]
+            cmd += ["-c:v", "libx264", "-pix_fmt", codec["pix_fmt"], "-crf", codec["crf"],
+                    "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(final_out)]
+            run_ffmpeg_tracked(cmd, "Extend: encode")
+        elif generated != final_out:
+            os.replace(generated, final_out)
+        return {"video": "fallback", "error": str(exc)[:300]}
+    push(f"Extend: delivered {final_out.name} — source {report['video']} "
+         f"({layout.source_frames} frames"
+         + (", bit-exact" if report["video"] == "copy" else "")
+         + f") + {layout.new_frames} new, audio from the {report['audio']} source "
+         f"track, {report['fade_ms']:g} ms crossfade at {report['seam_seconds']:.2f}s"
+         + (f" [{report['video_note']}]" if report.get("video_note") else ""))
+    shutil.rmtree(work, ignore_errors=True)
+    return report
 
 
 # ============================================================================
@@ -29782,6 +30047,13 @@ def _engine_would_be_h3(requested: str, mode: str) -> bool:
         return False
     if not engine_serves_mode(engine_by_id("h3") or {}, (mode or "t2v")):
         return False
+    # make_job's older-runner fallback (Codex 4.19.0): a Keyframes / Extend /
+    # Lip-sync job on a runner that predates the mode renders on LTX, so a
+    # character on it is an LTX character, not "H3 cannot load the character".
+    # Add sound has no LTX lane and stays H3 (the worker refuses it).
+    m = mode or "t2v"
+    if m != "v2a" and h3_available() and not h3_mode_supported(m):
+        return False
     return bool(h3_capable())
 
 
@@ -30770,7 +31042,7 @@ def a2v_requested_scale(params: dict):
 # from make_job before this matters (their own branches validate them).
 QUEUEABLE_VIDEO_MODES = frozenset((
     "t2v", "i2v", "i2v_clean_audio", "extend", "keyframe", "a2v", "retake",
-    "restore", "ingredients", "control", "upscale", "sharp_export",
+    "restore", "ingredients", "control", "upscale", "sharp_export", "v2a",
 ))
 _IMAGE_CONDITIONED_MODES = ("i2v", "i2v_clean_audio")
 INPUT_MISSING_IMAGE = ("Image mode needs a reference image — drop one into the "
@@ -30854,10 +31126,10 @@ def job_input_refusal(params: dict) -> str | None:
         if not src or not _exists(src):
             return (f"source video for Colorize not found: {src!r}. Pick a B&W "
                     "clip in the Colorize source picker (or paste a path).")
-    elif m in ("extend", "retake"):
+    elif m in ("extend", "retake", "v2a"):
         src = _path("video_path")
         if not src or not _exists(src):
-            what = "Extend" if m == "extend" else "Retake"
+            what = {"extend": "Extend", "retake": "Retake"}.get(m, "Add sound")
             return (f"{what} needs the clip it continues - pick a finished clip "
                     f"(source {src!r} is not on disk).")
     elif m == "a2v":
@@ -31369,6 +31641,10 @@ def make_job(form: dict[str, list[str]] | dict[str, str], *,
     _engine = (f("engine", ENGINE_DEFAULT) or ENGINE_DEFAULT).strip().lower()
     if _engine not in ENGINE_IDS:
         _engine = ENGINE_DEFAULT
+    if mode_in == "v2a":
+        # Add sound exists on one engine only; a form or curl that left the
+        # engine field at its default still means H3.
+        _engine = "h3"
     # An engine can be in the table and still not be renderable (Flux Video is
     # `announced` — no weights exist). Refuse it here, not at the worker.
     if (engine_by_id(_engine) or {}).get("state") == "announced":
@@ -31453,6 +31729,14 @@ def make_job(form: dict[str, list[str]] | dict[str, str], *,
             push(f"engine=h3 requested for mode={mode_in!r} — Hailuo H3 only "
                  f"serves {', '.join(H3_MODES)}; falling back to LTX.")
             _engine = "ltx"
+        elif (mode_in != "v2a" and h3_available() and not h3_mode_supported(mode_in)):
+            # A mode the INSTALLED runner predates: render it on LTX with a
+            # sentence rather than queue an argparse failure. (Add sound has no
+            # LTX lane; the worker refuses it with the update sentence.)
+            push(f"Hailuo H3 can render {H3_MODE_LABELS.get(mode_in, mode_in)} once "
+                 "its runner is updated (Update in Pinokio, or 'Update Hailuo H3 "
+                 "runner') — rendering this one on LTX.")
+            _engine = "ltx"
         elif not h3_capable():
             # Same verdict the refusal raises: the floor depends on the lane,
             # and on a 46-60 GB Mac the answer is a build step, not a number.
@@ -31516,6 +31800,16 @@ def make_job(form: dict[str, list[str]] | dict[str, str], *,
                 push(f"Fast runs {H3_TRISTEP_FORWARDS} forwards on "
                      f"its own ladder — ignoring the {_h3_steps}-step override.")
                 _h3_steps = 0
+        if H3_TIERS[_h3_tier].get("fast_hd"):
+            # Fast HD is a recipe, not a canvas: the 3-step Fast pass, then the
+            # x2 Upscale & Face Fix. Both are forced here so a stale Speed pill
+            # or Export choice cannot quietly render half of it.
+            if not _h3_tristep and h3_available():
+                push("Fast HD always renders on Fast (3 steps).")
+            _h3_tristep = bool(h3_available()) or _h3_tristep
+            _h3_turbo = False
+            _h3_steps = 0
+            _h3_upscale = "ltx_x2"
         # Per-window prompts, matched to the cell that will ACTUALLY render.
         # Normalising after the fallback above is the whole point: a 15 s
         # request that degraded to 5 s has one window, and three prompts on a
@@ -31676,6 +31970,17 @@ def make_job(form: dict[str, list[str]] | dict[str, str], *,
             # action/dialogue. Same allowlist trap: leave it out and it no-ops.
             "h3_chain_prompts_complete": f("h3_chain_prompts_complete", "").strip().lower()
                                           in ("1", "true", "on", "yes"),
+            # 4.19: carried context between H3 windows (the last 17 frames and
+            # their sound ride into the next window). On unless the form says
+            # "off" — "off" is the old one-still hand-over, kept for A/B and
+            # for a runner that predates it. SAME allowlist trap as every key.
+            "h3_continuity": (f("h3_continuity", "on").strip().lower()
+                              not in ("0", "false", "off", "no")),
+            # Extend on H3: how many seconds to add after the source clip. The
+            # LTX lane's `extend_frames` counts its 8-frame latents and cannot
+            # say this. SAME allowlist trap.
+            "h3_extend_seconds": _safe_float(f("h3_extend_seconds", "5"), 5.0,
+                                             minimum=0.5),
             "take": _take,
             # LTX-2.5 distilled schedule preset — "" (tuned default) or
             # "fast"/"vendor", already gated above to the lane that defines
@@ -31917,6 +32222,10 @@ def make_job(form: dict[str, list[str]] | dict[str, str], *,
         else:
             job["params"]["width"] = _tier_cfg["width"]
             job["params"]["height"] = _tier_cfg["height"]
+        if job["params"].get("mode") == "a2v":
+            # Lip-sync's length is the form's duration (the audio's), not the
+            # cell's: keep what was asked before the cell's frames land below.
+            job["params"]["h3_a2v_frames"] = max(1, int(job["params"].get("frames") or 0))
         # DELIVERED frames — for a chained tier that is the stitched total, not
         # the per-window count, so the queue card and the duration line read the
         # clip the user actually gets. run_h3_job_inner splits it back out.
@@ -32943,10 +33252,12 @@ def run_train_job_inner(job: dict) -> None:
 
     user_caps = 0
     auto_caps = 0
+    user_cap_files: list[Path] = []
     for img in image_files:
         cap = captions_dir / (img.stem + ".txt")
         if cap.exists():
             user_caps += 1
+            user_cap_files.append(cap)
             continue
         try:
             cap.write_text(fallback_text, encoding="utf-8")
@@ -32965,6 +33276,42 @@ def run_train_job_inner(job: dict) -> None:
     elif caption_strategy == "user_provided":
         push(f"[train] caption_strategy=user_provided but no .txt files found — "
              f"auto-filled all {total_imgs} images with '{fallback_summary}'")
+
+    # Trigger/caption consistency check (#62, Morac2 / valeriosan_v2, 2026-09-30).
+    # `user_provided` captions are trusted verbatim above — nothing before
+    # this point ever reads what's actually IN them. A dataset carried over
+    # from an earlier training attempt (same cropped photos, old caption
+    # .txt files still sitting in captions/) silently retrains a perfectly
+    # good identity under the OLD trigger while every surface a user can
+    # see (sidecar, Train tab, Characters picker) reports the NEW one.
+    # Measured on a real case: 42/42 existing captions carried a trigger
+    # different from the one the job was submitted with; the resulting
+    # LoRA attached cleanly (576/576 modules, healthy-looking delta_rms)
+    # and simply never responded to the word the user was told to prompt
+    # with. Refuse before burning GPU hours on a run nobody can use;
+    # matches the existing "0 modules attached" refusal shape in
+    # runtime_loras.py — a contract violation caught before it produces a
+    # plausible-looking, silently-wrong result.
+    if user_cap_files:
+        mismatched, other = _caption_trigger_mismatches(user_cap_files, trigger)
+        if mismatched:
+            other_desc = (f"; the dominant one instead is {other[0]!r} "
+                          f"({other[1]}/{len(mismatched)} mismatched files)"
+                          if other else "")
+            if len(mismatched) == len(user_cap_files):
+                raise RuntimeError(
+                    f"none of the {len(user_cap_files)} existing caption files "
+                    f"contain the trigger {trigger!r} this job was submitted "
+                    f"with{other_desc}. This dataset's captions/ almost "
+                    "certainly carries leftovers from an earlier training run "
+                    "on the same photos. Training would silently produce a "
+                    f"LoRA that never responds to {trigger!r} — delete or "
+                    "regenerate captions/ for this trigger before retrying."
+                )
+            push(f"[train] WARNING: {len(mismatched)} / {len(user_cap_files)} "
+                 f"existing caption files do not contain the trigger "
+                 f"{trigger!r}{other_desc}. Proceeding, but the resulting "
+                 "LoRA may only partially respond to the intended trigger.")
 
     # Output path for the trained LoRA. Going straight into
     # mlx_models/loras/ so the existing picker scan finds it.
@@ -33653,7 +34000,7 @@ def _cover_crop_image(im, width: int, height: int, focus: float = 0.5):
 
 
 def _h3_fit_first_frame(src: Path, width: int, height: int, job_id: str,
-                        focus: float = 0.5) -> Path:
+                        focus: float = 0.5, tag: str = "firstframe") -> Path:
     """Cover-crop `src` onto the H3 canvas and return the path to use.
 
     Why the panel does this instead of the runner: upstream's
@@ -33697,7 +34044,7 @@ def _h3_fit_first_frame(src: Path, width: int, height: int, job_id: str,
                 return src          # runner's own early-return handles it
             fitted = _cover_crop_image(im, width, height, focus)
             UPLOADS.mkdir(parents=True, exist_ok=True)
-            out = UPLOADS / f".h3_{job_id}_firstframe_{width}x{height}.png"
+            out = UPLOADS / f".h3_{job_id}_{tag}_{width}x{height}.png"
             fitted.save(out, format="PNG")
         return out
     except Exception as exc:                     # noqa: BLE001 - never fatal
@@ -34152,6 +34499,10 @@ def _chain_upscale_after_h3(job: dict, p: dict, native_path: Path) -> None:
                   else (p.get("seed") if p.get("seed") not in (None, "") else "-1")),
             label=str(p.get("label") or native_path.stem),
             frames=_probe_video_frames(str(native_path)) or 0)
+        if str(p.get("h3_quality") or "") == "fast_hd":
+            # Fast HD's finish: the "face kept" recipe (1 step from the clip).
+            form["upscale_steps"] = str(FAST_HD_FACEFIX_STEPS)
+            form["preset_label"] = f"{str(p.get('label') or native_path.stem)} · Fast HD"
         nxt = make_job(form)
         nxt["params"]["source"] = "chain"
         nxt["params"]["chained_from"] = job.get("id")
@@ -34176,6 +34527,280 @@ def _chain_upscale_after_h3(job: dict, p: dict, native_path: Path) -> None:
 # chains — /stop/after_part refuses it and the Stop dialog leaves it out.
 # (4.17 Codex review, H3-1.) The panel-side machinery below stays, gated.
 H3_RUNNER_KEEPS_WINDOWS_ON_STOP = False
+
+H3_WINDOW_FRAMES = 124          # one 5 s window on the 17n+5 grid
+H3_EXTEND_MAX_SECONDS = 15.0
+H3_A2V_MAX_SECONDS = 30.0
+H3_V2A_MAX_SECONDS = 60.0
+# The runner decodes the whole source clip onto the render canvas (the new
+# part is stitched after it), so an Extend source is capped like Add sound's:
+# a minute at 1024x576 is ~2.5 GB of frames held through the render.
+H3_EXTEND_SOURCE_MAX_SECONDS = 60.0
+# The prompt contract a held soundtrack is rendered under: the picture performs
+# the supplied sound and invents none of its own. Appended when the user's
+# prompt does not already say it (the LTX lip-sync recipe's lesson: name the
+# sync, never the stillness).
+H3_A2V_CONTRACT = ("The speaker lip-syncs every syllable to the supplied "
+                   "soundtrack, exactly as it is.")
+
+
+def h3_a2v_prompt(prompt: str) -> str:
+    """The lip-sync prompt with its sync contract, added once.
+
+    Inside the description field when the prompt uses H3's three-field form
+    (before `overall_soundscape:`), else at the end."""
+    text = (prompt or "").strip()
+    if "lip-sync" in text.lower() or "lip sync" in text.lower():
+        return text
+    marker = "\n\noverall_soundscape:"
+    if marker in text:
+        head, tail = text.split(marker, 1)
+        return f"{head.rstrip()} {H3_A2V_CONTRACT}{marker}{tail}"
+    return f"{text} {H3_A2V_CONTRACT}".strip()
+
+
+def h3_windows_for(frames: int, window_frames: int = H3_WINDOW_FRAMES) -> int:
+    """Windows a chain of `window_frames` windows needs to deliver `frames`
+    (each window after the first adds window_frames - 1)."""
+    frames = max(1, int(frames))
+    if frames <= window_frames:
+        return 1
+    return 1 + -(-(frames - window_frames) // (window_frames - 1))
+
+
+def h3_window_for_short(frames: int) -> int:
+    """The smallest 17n+5 window that holds `frames` (one window, no chain)."""
+    n = max(22, int(frames))
+    while n % 17 != 5:
+        n += 1
+    return n
+
+
+def _h3_keyframe_list(p: dict) -> list[tuple[str, int | None]]:
+    """[(image path, frame index or None)] in time order from the Keyframe
+    form: `keyframes_json` (first … last) when present, else the start/end
+    pair. None = "the clip's own first/last frame"."""
+    raw = str(p.get("keyframes_json") or "").strip()
+    out: list[tuple[str, int | None]] = []
+    if raw:
+        try:
+            items = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"keyframes_json must be valid JSON: {exc}") from exc
+        if not isinstance(items, list) or len(items) < 2:
+            raise RuntimeError("keyframes_json must be a list with at least two stills")
+        for i, item in enumerate(items):
+            img = normalize_pasted_path(str((item or {}).get("image_path") or "").strip())
+            if i in (0, len(items) - 1):
+                out.append((img, None))
+            else:
+                out.append((img, int((item or {}).get("frame_index") or 0)))
+        return out
+    start = normalize_pasted_path(str(p.get("start_image") or "").strip())
+    end = normalize_pasted_path(str(p.get("end_image") or "").strip())
+    return [(start, None), (end, None)]
+
+
+def h3_media_plan(job: dict, p: dict, mode: str, tier: dict, width: int,
+                  height: int, window_frames: int, chain_windows: int,
+                  frames: int, paths: dict) -> dict:
+    """The runner flags and the render shape for H3's media modes.
+
+    Text and Image pass straight through (empty argv, shape unchanged). The
+    others each name what they need and refuse what they cannot use, before
+    the GPU is touched:
+
+    * keyframe — Start & end frame / Keyframes: `--first-frame` (optional on
+      H3: an end frame alone is the official last-frame task), `--last-frame`,
+      and `--keyframe PATH@FRAME` for every beat in between, on the clip's own
+      24 fps timeline.
+    * extend — `--extend-from SOURCE`, as many new 5 s windows as the seconds
+      asked for, `--extend-frames` to land on the exact length. Always carries
+      the source's last 17 frames and their sound.
+    * a2v — Lip-sync: the soundtrack is held in the target audio rows
+      (`--audio-drive`, the separated vocal when "voice only" is on) and the
+      user's file is what the clip delivers (`--audio-mux`).
+    * v2a — Add sound: the clip's picture is held (`--video-to-audio`), only
+      its sound is generated, and the delivery is the source's own video
+      stream with the new track.
+    """
+    out = {"argv": [], "first_frame": None, "chain_windows": chain_windows,
+           "window_frames": window_frames, "frames": frames, "notes": [],
+           "tristep_off": False}
+    if mode not in H3_MODE_CAPABILITY:
+        return out
+    flag = {"keyframe": "--last-frame", "extend": "--extend-from",
+            "a2v": "--audio-drive", "v2a": "--video-to-audio"}[mode]
+    if not h3_mode_supported(mode):
+        raise RuntimeError(f"{H3_MODE_LABELS[mode]} on Hailuo H3: "
+                           + _h3_runner_behind(flag, paths["runner"],
+                                               "Or render it on LTX."))
+    focus = _job_crop_focus(p)
+
+    def _still(src: str, tag: str) -> Path:
+        if not src or not Path(src).is_file():
+            raise RuntimeError(f"The {tag.replace('_', ' ')} still is not on disk "
+                               f"({src or 'none picked'}) — pick it again.")
+        err = h3_reference_image_error(Path(src))
+        if err:
+            raise RuntimeError(err)
+        return _h3_fit_first_frame(Path(src), width, height, job["id"], focus, tag=tag)
+
+    if mode == "keyframe":
+        kfs = _h3_keyframe_list(p)
+        start, end = kfs[0][0], kfs[-1][0]
+        if not end:
+            raise RuntimeError("Keyframes on H3 need an end frame — pick the still "
+                               "the clip should land on (the start frame is optional).")
+        if start:
+            out["first_frame"] = _still(start, "start_frame")
+        out["argv"] += ["--last-frame", str(_still(end, "end_frame"))]
+        for i, (img, idx) in enumerate(kfs[1:-1], start=2):
+            # The beat's own frame on the 24 fps timeline, kept strictly
+            # inside the clip so it cannot collide with the first/last frame.
+            at = max(1, min(int(frames) - 2, int(idx or 0)))
+            out["argv"] += ["--keyframe", f"{_still(img, f'beat{i}')}@{at}"]
+        out["notes"].append(
+            "keyframes: " + " → ".join(
+                [("start" if start else "(free start)")]
+                + [f"beat at {max(1, min(int(frames) - 2, int(i or 0))) / H3_FPS:.2f}s"
+                   for _, i in kfs[1:-1]]
+                + ["end"]))
+        return out
+
+    if mode == "extend":
+        src = str(p.get("video_path") or "").strip()
+        if not src or not Path(src).is_file():
+            raise RuntimeError("Extend needs the clip it continues — pick a finished clip.")
+        # Continue the NATIVE render, never the gallery's export of it (issue
+        # #48, the same fix the LTX lane got in v3.4.2). An H3 render is shown
+        # as its `_720p` export, so the picker hands Extend a lanczos-upscaled
+        # re-encode; the runner then cover-scales it back DOWN onto the
+        # canvas, and every round of a chain paid that resample twice.
+        _native = _native_render_for(Path(src))
+        if _native != Path(src):
+            out["notes"].append(f"extend: using the native render {_native.name} "
+                                f"instead of the export {Path(src).name}")
+            src = str(_native)
+        if str(p.get("extend_direction") or "after") == "before":
+            out["notes"].append("H3 extends forward only — adding after the clip.")
+        seconds = max(0.5, min(H3_EXTEND_MAX_SECONDS,
+                               float(p.get("h3_extend_seconds") or 5.0)))
+        new_frames = int(round(seconds * H3_FPS))
+        src_dur = probe_media_duration(src) or 0.0
+        if src_dur > H3_EXTEND_SOURCE_MAX_SECONDS:
+            raise RuntimeError(
+                f"Extend continues clips up to {H3_EXTEND_SOURCE_MAX_SECONDS:.0f}s long; "
+                f"{Path(src).name} is {src_dur:.1f}s. Extend a shorter cut of it.")
+        src_frames = _probe_video_frames(src) or 0
+        src_fps = _probe_video_fps(src) or float(H3_FPS)
+        src_frames_24 = int(round(src_frames * H3_FPS / src_fps)) if src_frames else 0
+        if src_frames_24 and src_frames_24 < 2:
+            raise RuntimeError("That clip is too short to continue.")
+        out["window_frames"] = H3_WINDOW_FRAMES
+        out["chain_windows"] = h3_windows_for(new_frames + 1)
+        out["frames"] = (src_frames_24 or 0) + new_frames
+        out["argv"] += ["--extend-from", src, "--extend-frames", str(new_frames)]
+        out["extend_source"] = src
+        out["extend_new_frames"] = new_frames
+        out["notes"].append(f"extend: +{seconds:g}s after {Path(src).name} "
+                            f"({out['chain_windows']} new window(s), the last "
+                            f"{H3_CONTEXT_FRAMES} frames and their sound carried in)")
+        return out
+
+    if mode == "a2v":
+        audio = str(p.get("audio") or "").strip()
+        if not audio or not Path(audio).is_file():
+            raise RuntimeError(INPUT_MISSING_AUDIO)
+        start_t = max(0.0, float(p.get("audio_start_time") or 0.0))
+        total = probe_media_duration(audio) or 0.0
+        avail = max(0.0, total - start_t) if total else None
+        want = int(p.get("h3_a2v_frames") or frames) / float(H3_FPS)
+        if avail is not None:
+            if avail <= 0.2:
+                raise RuntimeError(f"Start at {start_t:.1f}s is past the end of "
+                                   f"{Path(audio).name} ({total:.1f}s).")
+            want = min(want, avail)
+        want = min(want, H3_A2V_MAX_SECONDS)
+        # The track decides the length. A short line still renders one whole
+        # 22-frame window (the model's smallest), but --chain-total-frames trims
+        # delivery back to the audio, so a 0.5 s line is not padded with silence.
+        delivered = max(6, int(round(want * H3_FPS)))
+        if delivered <= H3_WINDOW_FRAMES:
+            out["window_frames"] = h3_window_for_short(delivered)
+            out["chain_windows"] = 1
+        else:
+            out["window_frames"] = H3_WINDOW_FRAMES
+            out["chain_windows"] = h3_windows_for(delivered)
+        out["frames"] = delivered
+        drive, note = a2v_conditioning_audio(p, audio)
+        if note:
+            out["notes"].append(note)
+        out["argv"] += ["--audio-drive", str(drive),
+                        "--audio-drive-offset", f"{start_t:.3f}"]
+        if str(drive) != audio:
+            out["argv"] += ["--audio-mux", audio]
+        image = str(p.get("image") or "").strip()
+        if image and Path(image).is_file():
+            out["first_frame"] = _still(image, "face")
+        if out["chain_windows"] > 1:
+            out["argv"] += ["--chain-windows", str(out["chain_windows"])]
+        out["argv"] += ["--chain-total-frames", str(delivered)]
+        out["notes"].append(f"lip-sync: {delivered / H3_FPS:.2f}s of "
+                            f"{Path(audio).name} from {start_t:.1f}s")
+        return out
+
+    # v2a
+    src = str(p.get("video_path") or "").strip()
+    if not src or not Path(src).is_file():
+        raise RuntimeError("Add sound needs the clip to score — pick a finished clip.")
+    dur = probe_media_duration(src) or 0.0
+    if dur <= 0:
+        raise RuntimeError(f"{Path(src).name} has no readable video.")
+    if dur > H3_V2A_MAX_SECONDS:
+        raise RuntimeError(f"Add sound scores up to {H3_V2A_MAX_SECONDS:.0f}s at a time; "
+                           f"{Path(src).name} is {dur:.1f}s. Cut it shorter first.")
+    delivered = int(round(dur * H3_FPS))
+    out["window_frames"] = H3_WINDOW_FRAMES
+    out["chain_windows"] = h3_windows_for(delivered)
+    out["frames"] = delivered
+    out["argv"] += ["--video-to-audio", src]
+    out["notes"].append(f"add sound: {dur:.2f}s of {Path(src).name}, "
+                        "picture kept exactly as it is")
+    return out
+
+
+
+def _h3_drop_runner_wavs(out_path: Path, since: float, *, keep_main: bool = False) -> list[str]:
+    """Remove the intermediate WAVs the H3 runner leaves beside its mp4.
+
+    The runner (minimax_h3_mlx/media.py save_mp4 / mux_audio_onto_video)
+    writes the soundtrack to ``<out>.wav`` (and ``<out>_source.wav`` when it
+    time-stretches) only to mux it, and never removes it. In OUTPUT that is
+    a stray file per render that the gallery and the Editor's sound pool list
+    as a separate audio output: 188 of them had piled up on one install. The
+    mp4 carries the same sound.
+
+    Only files this render wrote are touched: same stem as the job's own
+    output path AND modified at or after the job started, so a user's own
+    WAV that happens to share the name is never removed. ``keep_main`` keeps
+    ``<out>.wav`` for a caller that still needs it (Extend moves it into its
+    splice work dir first). #48's FLAC masters live in OUTPUT/.extend/masters
+    and are never matched here.
+    """
+    out_path = Path(out_path)
+    names = [out_path.with_name(out_path.stem + "_source.wav")]
+    if not keep_main:
+        names.append(out_path.with_suffix(".wav"))
+    removed: list[str] = []
+    for w in names:
+        try:
+            if w.is_file() and not w.is_symlink() and w.stat().st_mtime >= since - 1.0:
+                w.unlink()
+                removed.append(w.name)
+        except OSError:
+            continue
+    return removed
 
 
 def run_h3_job_inner(job: dict) -> None:
@@ -34552,6 +35177,43 @@ def run_h3_job_inner(job: dict) -> None:
                  f"conditioning (keeps its proportions — the runner would "
                  f"stretch the first keyframe onto the canvas).")
 
+    # ---- 4.19: keyframes, extend, lip-sync, add sound --------------------
+    # Each is one or two runner flags; the shape bookkeeping (how many windows,
+    # how many frames are delivered) is what the rest of this function reads.
+    plan = h3_media_plan(job, p, mode, tier, width, height, window_frames,
+                         chain_windows, frames, paths)
+    if mode in ("extend", "a2v", "v2a"):
+        # One prompt for the whole clip on these modes; a shot list belongs to
+        # a chained Text/Image/Keyframes render.
+        chain_prompts = []
+    if mode == "a2v":
+        prompt = h3_a2v_prompt(prompt)
+    mode_argv: list[str] = plan["argv"]
+    if plan.get("first_frame") is not None:
+        first_frame = plan["first_frame"]
+    chain_windows = plan["chain_windows"]
+    window_frames = plan["window_frames"]
+    frames = plan["frames"]
+    if mode in H3_MODE_CAPABILITY:
+        # The clip these modes deliver (source + new frames, the track's
+        # length, the scored clip's length) — not the cell's — so the Now card
+        # and the sidecar read the real duration.
+        p["frames"] = frames
+    for _note in plan.get("notes") or []:
+        push(f"[h3] {_note}")
+    if plan.get("tristep_off") and tristep:
+        tristep = False
+        p["h3_tristep"] = False
+        steps = int(p.get("h3_steps") or tier["steps"])
+    # Carried context between chained windows (and always for Extend and Add
+    # sound, where it is the point). Off only when the job says so or the
+    # runner predates it — the old one-still hand-over then runs unchanged.
+    context_frames = 0
+    if (chain_windows > 1 or mode in ("extend", "v2a")) and h3_supports_continuation():
+        if p.get("h3_continuity", True) or mode in ("extend", "v2a"):
+            context_frames = H3_CONTEXT_FRAMES
+    p["h3_context_frames"] = context_frames
+
     # Seed: the panel keeps "-1" = random. H3's runner has no random mode, so
     # resolve it here and record what we used (matches the LTX seed_used
     # contract the ⓘ modal + Load Params already read).
@@ -34658,10 +35320,22 @@ def run_h3_job_inner(job: dict) -> None:
         _native_crf = min(18, max(0, int(float(job_codec["crf"]))))
     except (TypeError, ValueError):
         _native_crf = 18
-    if _native_crf != 18 and _h3_runner_has_flag("--crf"):
+    # Extend: the runner's file is an INTERMEDIATE — the delivery is spliced
+    # from it after the run (the source's own frames + only the new ones,
+    # issue #48) — so ask for it lossless and encode the new part once.
+    h3_extend_lossless = mode == "extend" and _h3_runner_has_flag("--crf")
+    if h3_extend_lossless:
+        cmd += ["--crf", "0"]
+        native_codec["crf"] = str(_native_crf)      # what the splice encodes at
+    elif _native_crf != 18 and _h3_runner_has_flag("--crf"):
         cmd += ["--crf", str(_native_crf)]
         native_codec["crf"] = str(_native_crf)
-    if chain_windows > 1:
+    if mode == "extend":
+        # New windows after the source; --extend-frames trims the last one.
+        cmd += ["--chain-windows", str(chain_windows)]
+    elif mode in ("v2a", "a2v"):
+        pass            # the media plan carries this shape's own window flags
+    elif chain_windows > 1:
         # Window chaining: each window after the first is conditioned on its
         # predecessor's last decoded frame, and --chain-total-frames trims the
         # stitched clip to the tier's delivered length. The audio cross-fade
@@ -34672,6 +35346,11 @@ def run_h3_job_inner(job: dict) -> None:
             cmd += ["--chain-prompts", str(chain_prompts_path)]
     if first_frame is not None:
         cmd += ["--first-frame", str(first_frame)]
+    cmd += mode_argv
+    if context_frames:
+        cmd += ["--chain-context-frames", str(context_frames)]
+        if mode != "v2a" and _h3_runner_has_flag("--seam-colour-frames"):
+            cmd += ["--seam-colour-frames", str(H3_SEAM_COLOUR_FRAMES)]
     # Skip the 26 GB text encoder when this exact prompt+first-frame has been
     # encoded before. On the Q8 path that phase IS the run peak (25.71 GiB vs
     # 21.28-24.68 GiB for denoise), so a hit lowers the ceiling as well as
@@ -34738,7 +35417,8 @@ def run_h3_job_inner(job: dict) -> None:
     # tensor). Runner refuses the flag on chained renders, so gate to one
     # window; the cache is a few hundred MB and rides the output's lifecycle.
     stage_a_path = None
-    if tier.get("draft") and chain_windows == 1 and h3_supports_stage_a():
+    if (tier.get("draft") and chain_windows == 1 and h3_supports_stage_a()
+            and mode in ("t2v", "i2v")):
         stage_a_path = out_path.with_suffix(".stage_a")
         cmd += ["--save-stage-a", str(stage_a_path)]
     if turbo:
@@ -35206,6 +35886,10 @@ def run_h3_job_inner(job: dict) -> None:
                 STATE["pid"] = None
                 STATE["h3_pgid"] = None
             _proc_guard_clear("h3")
+        # Whatever happened (done, stopped, failed), the runner's mux WAVs are
+        # intermediates. Extend still needs <out>.wav for its splice; it is
+        # dropped after that below.
+        _h3_drop_runner_wavs(out_path, t0, keep_main=(mode == "extend"))
 
     if not out_path.is_file():
         raise RuntimeError(
@@ -35227,6 +35911,39 @@ def run_h3_job_inner(job: dict) -> None:
                if _loras else ". Please report it with the log.")
             + f" (clip hidden: {out_path.name})")
 
+    h3_splice_report = None
+    if mode == "extend" and plan.get("extend_source"):
+        # Issue #48: the runner delivers its own copy of the source (decoded,
+        # put on the canvas, audio resampled to 32 kHz, the whole clip
+        # re-encoded) — one more lossy generation over the entire clip on
+        # every round of a chain. Splice the delivery from the source file
+        # itself + the new frames instead; the runner's file and its leftover
+        # 32 kHz wav are the intermediate.
+        ext_work = OUTPUT / ".extend" / str(job["id"])
+        ext_work.mkdir(parents=True, exist_ok=True)
+        h3_gen = ext_work / "generated.mp4"
+        h3_gen_wav = ext_work / "generated.wav"
+        os.replace(out_path, h3_gen)
+        try:
+            os.replace(out_path.with_suffix(".wav"), h3_gen_wav)
+        except OSError:
+            h3_gen_wav = None
+        h3_splice_report = deliver_extend(
+            Path(plan["extend_source"]), h3_gen, h3_gen_wav, out_path, ext_work,
+            engine="h3", new_frames=int(plan.get("extend_new_frames") or 0),
+            picked=Path(str(p.get("video_path") or "")) if p.get("video_path") else None,
+            codec={"pix_fmt": native_codec["pix_fmt"], "crf": native_codec["crf"]},
+            generated_lossless=h3_extend_lossless)
+    if mode == "extend":
+        _h3_drop_runner_wavs(out_path, t0)
+
+    if mode == "v2a":
+        # The delivery is the source's own stream: record ITS size, not the
+        # canvas the picture was read at for conditioning.
+        _vw, _vh = _probe_video_dims(str(out_path))
+        if _vw and _vh:
+            width, height = _vw, _vh
+
     # ---- export pass: the SAME post-process an LTX render gets ------------
     # Most tiers write 768×448 (12:7), which is neither 720p nor 1080p and looks
     # like a bug next to LTX output in the gallery. Run the identical ffmpeg
@@ -35241,6 +35958,11 @@ def run_h3_job_inner(job: dict) -> None:
     h3_upscale_mode = (p.get("h3_upscale") or H3_UPSCALE_DEFAULT).strip().lower()
     if h3_upscale_mode not in H3_UPSCALE_MODES:
         h3_upscale_mode = H3_UPSCALE_DEFAULT
+    if mode == "v2a":
+        # Add sound delivers the source's own video stream, untouched: no
+        # export re-encode, no Face Fix redraw — the picture is the user's.
+        h3_upscale_mode = "off"
+        p["h3_upscale"] = "off"
     upscale_plan = None
     try:
         upscale_plan = compute_upscale_plan(width, height, h3_upscale_mode)
@@ -35300,6 +36022,12 @@ def run_h3_job_inner(job: dict) -> None:
         "output": str(final_target),
         "raw_output": str(native_path),
         "native_output": str(native_path),
+        # Issue #48 — how an Extend's delivery was assembled, and the lossless
+        # audio master the next extend of this clip (either engine) starts from.
+        **({"extend_splice": h3_splice_report,
+            "extend_audio_master": h3_splice_report.get("audio_master"),
+            "extend_source": plan.get("extend_source")}
+           if h3_splice_report else {}),
         "params": {
             **p,
             "engine": "h3",
@@ -36584,6 +37312,13 @@ def run_job_inner(job: dict) -> None:
         out_name = Path(src).stem + f"_ext{p['extend_frames']}_{stamp}.mp4"
         final_out = OUTPUT / out_name
         job["raw_path"] = str(final_out)
+        # Issue #48: the helper writes the model's output LOSSLESS into a
+        # dot-folder (invisible to every gallery listing) and the delivery is
+        # spliced from it below — the source's own frames + only the new ones.
+        ext_work = OUTPUT / ".extend" / str(job["id"])
+        ext_work.mkdir(parents=True, exist_ok=True)
+        gen_out = ext_work / "generated.mp4"
+        gen_wav = ext_work / "generated.wav"
 
         # Extend memory profile: pipe loads the ~10–12 GB dev transformer
         # (Q4-quantized) and does CFG-guided denoising over the source's
@@ -36617,7 +37352,8 @@ def run_job_inner(job: dict) -> None:
                 "video_path": src,
                 "extend_frames": p["extend_frames"],
                 "direction": p["extend_direction"],
-                "output_path": str(final_out),
+                "output_path": str(gen_out),
+                "audio_wav_path": str(gen_wav),
                 "seed": p["seed"],
                 "steps": steps,
                 "cfg_scale": cfg_scale,
@@ -36634,6 +37370,10 @@ def run_job_inner(job: dict) -> None:
         if "seed_used" in result:
             push(f"seed used: {result['seed_used']}")
             p["seed_used"] = result["seed_used"]
+        splice_report = deliver_extend(
+            Path(src), gen_out, gen_wav, final_out, ext_work, engine="ltx", picked=picked_src,
+            direction=p.get("extend_direction") or "after",
+            codec=output_codec_settings())
 
         sidecar = {
             "output": str(final_out), "raw_output": str(final_out),
@@ -36656,6 +37396,10 @@ def run_job_inner(job: dict) -> None:
             "extend_picked": str(picked_src),
             "extend_source": src,
             "extend_new_frames": int(p["extend_frames"]) * 8,
+            # How the delivery was assembled (copy / reencode / generated) and
+            # the lossless audio master the NEXT extend of this clip starts from.
+            "extend_splice": splice_report,
+            "extend_audio_master": splice_report.get("audio_master"),
         }
         write_sidecar(final_out.with_suffix(final_out.suffix + ".json"), sidecar)
         job["output_path"] = str(final_out)

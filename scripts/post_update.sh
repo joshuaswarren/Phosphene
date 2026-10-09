@@ -332,6 +332,25 @@ if { [ -f "$H3_MODELS_ROOT/models/$H3_DIT_REL" ] || [ -f "$H3_MODELS_ROOT/$H3_DI
     || echo 'WARN: H3 Q8 build failed — H3 keeps the full bf16 engine for now; re-run the H3 engine Install to retry.'
 fi
 
+# ---- 8c. Characters and voices saved scrambled (#62) -----------------------
+# Every character and voice LoRA trained on a venv with safetensors 0.8.0
+# (released 2026-06-09; every fresh install and Update since picked it up) was
+# written with its numbers in the wrong order: it attached, changed the video,
+# and carried no likeness. Found by @tanis2000 (PR #89). The trainer saves
+# correctly from 4.19.0; this repairs the files users already have, exactly
+# (no numbers are lost, only reordered), with the original kept beside it as
+# <file>.scrambled.bak. Only adapters this app trained are read (a trainer or
+# panel sidecar; a voice only beside its trained face), never a symlink or a
+# downloaded LoRA; a file is changed only when the content check says scrambled. BEST-EFFORT and idempotent: a repaired file is never read
+# again, and a clean install has nothing to check.
+MODELS_ROOT="${LTX_MODELS_DIR:-$ROOT/mlx_models}"
+if [ -d "$MODELS_ROOT/loras" ] || [ -d "$MODELS_ROOT/characters" ]; then
+  echo 'Checking trained characters and voices for the scrambled save (#62)…'
+  "$PY" -m lora_lab.repair_scrambled_lora --auto "$MODELS_ROOT" 2>&1 \
+    | sed -u -e 's/[Ee][Rr][Rr][Oo][Rr]:/problem -/g' -e 's/[Ee]rrno /errno-/g' \
+    || echo 'WARN: the trained-LoRA check did not finish - renders are unaffected; Update again to retry.'
+fi
+
 # ---- 9. Trim variants we never load ----------------------------------------
 # Pre-Y1.024 installs downloaded whole repos (Q4 56 GB instead of 20, Q8 82 GB
 # instead of 37). `rm -f` is a no-op when the file is already gone.

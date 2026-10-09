@@ -494,6 +494,55 @@ def _source_fps(video_path: str, fallback=None) -> float:
         return 24.0
 
 
+@contextmanager
+def _env_override(**values):
+    """Set environment variables for the duration of a block, then restore
+    them exactly (absent stays absent). The patched encoder in
+    `video_vae.decode_and_stream` reads LTX_OUTPUT_PIX_FMT / LTX_OUTPUT_CRF
+    at call time, so this is how one call asks it for a lossless file."""
+    saved = {k: os.environ.get(k) for k in values}
+    try:
+        os.environ.update({k: str(v) for k, v in values.items()})
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _decode_extend_stems(pipe, video_lat, audio_lat, video_out: str, wav_out: str,
+                         frame_rate: float) -> None:
+    """Decode an Extend result the way `_decode_and_save_video` does, but keep
+    both halves lossless: the vocoder's 48 kHz PCM as a wav at `wav_out`, and
+    the decoded frames as yuv444p crf 0 at `video_out` (the wav muxed in).
+
+    Issue #48. The panel builds the delivery from these — the source's own
+    frames plus only the new ones — so the new region must not carry a lossy
+    generation of its own before it is encoded once at the user's preset.
+    Same blocks, same order, same phase label as the upstream wrapper (the
+    panel's post-decode watchdog keys on "[Decoding video + audio + muxing]
+    done in"), and the same DiT drop before the decode."""
+    from ltx_core_mlx.utils.memory import aggressive_cleanup
+    from ltx_pipelines_mlx.utils._orchestration import save_waveform
+    from ltx_pipelines_mlx.utils.progress import phase
+
+    if pipe.low_memory and pipe.dit is not None:
+        pipe.dit = None
+        pipe._loaded = False
+        aggressive_cleanup()
+    with phase("Decoding video + audio + muxing", verbose=getattr(pipe, "verbose", True)):
+        waveform = pipe.audio_decoder_block(audio_lat)
+        if pipe.low_memory:
+            aggressive_cleanup()
+        save_waveform(waveform, wav_out, sample_rate=48000)
+        with _env_override(LTX_OUTPUT_PIX_FMT="yuv444p", LTX_OUTPUT_CRF="0"):
+            pipe.video_decoder_block.decode_and_stream(
+                video_lat, video_out, frame_rate=frame_rate, audio_path=wav_out)
+        aggressive_cleanup()
+
+
 def _retake_latent_window(start_sec: float, end_sec: float, fps: float,
                           source_frames: int) -> dict:
     """Seconds on the source clip -> RetakePipeline's LATENT frame interval.
@@ -3833,8 +3882,17 @@ for line in sys.__stdin__:
             # LIPSYNC-3 (same class as Retake): extend_from_video encodes the
             # source at ITS OWN rate, so decode at it too — a 12-fps native
             # render saved at the panel's 24 played twice as fast.
-            pipe._decode_and_save_video(video_lat, audio_lat, p["output_path"],
-                                        frame_rate=_source_fps(video_path, p.get("frame_rate")))
+            _ext_fps = _source_fps(video_path, p.get("frame_rate"))
+            if p.get("audio_wav_path"):
+                # Issue #48: the panel splices the delivery itself (the source's
+                # own frames + only the new ones), so it needs the model's
+                # output WITHOUT a lossy generation on it — lossless video and
+                # the vocoder's 48 kHz PCM, not the preset-encoded mp4 + AAC.
+                _decode_extend_stems(pipe, video_lat, audio_lat, p["output_path"],
+                                     p["audio_wav_path"], _ext_fps)
+            else:
+                pipe._decode_and_save_video(video_lat, audio_lat, p["output_path"],
+                                            frame_rate=_ext_fps)
             elapsed = round(time.time() - t0, 2)
             _last_activity = time.time()
             emit({

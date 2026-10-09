@@ -29,6 +29,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -44,9 +45,24 @@ import mlx_ltx_panel as P  # noqa: E402
 EJS = (ROOT / "webapp" / "js" / "engines.js").read_text(encoding="utf-8")
 
 
+def _payload_on_a_standard_tier_mac() -> dict:
+    """ltx_tiers_payload() as a 48-79 GB Mac boots with it (issue #90).
+
+    LTX_QUALITIES bakes this Mac's `t2v_max_dim` into every canvas at import:
+    a <48 GB (`base`) Mac renders Balanced at 768x448 by design and its chip
+    says so. The delivered-size contract below is about the full canvases,
+    so the tables are rebuilt for the standard tier rather than read as
+    whichever Mac runs the suite booted them."""
+    with mock.patch.object(P, "SYSTEM_TIER", "standard"), \
+            mock.patch.object(P, "SYSTEM_CAPS", P.CAPABILITIES["standard"]):
+        with mock.patch.object(P, "LTX_QUALITIES", P._ltx_qualities()):
+            with mock.patch.object(P, "LTX_TIERS", P._build_ltx_tiers()):
+                return P.ltx_tiers_payload()
+
+
 class TestDeliveredSize(unittest.TestCase):
     def setUp(self):
-        self.payload = P.ltx_tiers_payload()
+        self.payload = _payload_on_a_standard_tier_mac()
         self.tiers = {t["key"]: t for t in self.payload["tiers"]}
         self.qualities = {q["key"]: q for q in self.payload["qualities"]}
 

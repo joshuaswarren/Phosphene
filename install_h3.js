@@ -43,6 +43,10 @@
 // quantizer for 48 GB Macs, and the LoRA-on-quantized logical-dims fix.
 // Published as a NEW branch: the histories diverged, and force-moving a
 // branch users' installs already track is how updates break mid-clone.
+// 4.19.0: this is ONLY the branch a fresh clone starts on. The engine commit
+// the app runs is the PIN in scripts/pinokio/h3_checkout.sh (an exact SHA),
+// which the next step moves the checkout to — so pushing this branch no
+// longer changes what any 4.19+ install runs.
 const H3_BRANCH = "codex/h3-engine-v2"
 // Every step that works inside the checkout starts here: resolve the roots the
 // panel uses (LTX_H3_ROOT / LTX_H3_MODELS), then enter the checkout. See
@@ -145,7 +149,7 @@ module.exports = {
         message: [
           // The pin itself lives in scripts/pinokio/h3_checkout.sh (#74: Update
           // must make the same move; one literal, two callers). H3_BRANCH above
-          // is only the fresh-clone branch and must match it.
+          // is only the fresh-clone branch; the pin is a commit it need not contain.
           RH3 + "bash \"$APP_ROOT/scripts/pinokio/h3_checkout.sh\" \"$(pwd)\"",
           RH3 + "git rev-parse --short HEAD"
         ]

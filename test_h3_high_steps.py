@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent
 STATE = Path(tempfile.mkdtemp(prefix="phos-h3-high-steps-"))
@@ -29,10 +30,29 @@ import storyboard as SB  # noqa: E402
 
 
 def h3_job(form: dict) -> dict:
+    """Build an H3 job as an install WITHOUT the TriStep (Fast) adapter.
+
+    Issue #90: on an install that has the adapter, Auto on Draft/Standard/High
+    is Fast — 4 sigma points — by design (test_h3_tristep_draft owns that
+    lane), so reading the live install made "Auto High stamps 16" fail with
+    steps=4 on exactly the Macs that had installed it."""
     base = {"mode": "t2v", "engine": "h3", "prompt": "a man lifts a dumbbell",
             "h3_turbo": "0"}
     base.update(form)
-    return P.make_job({k: [v] for k, v in base.items()})
+    no_fast = {"available": False, "supported": True,
+               "missing": ["adapter (pinned absent by test_h3_high_steps)"]}
+    with mock.patch.object(P, "h3_tristep_status", lambda: no_fast):
+        return P.make_job({k: [v] for k, v in base.items()})
+
+
+def _tiers_at_m4_max() -> dict:
+    """H3_TIERS as the M4 Max baseline prices them (speed factor 1.0).
+
+    The module table is priced at import with THIS Mac's chip, RAM lane and
+    learned calibration, while the storyboard's fallback constant is an
+    M4 Max number. Comparing the two on an M4 Pro failed by 5x (issue #90)."""
+    with mock.patch.dict(os.environ, {"PHOSPHENE_SPEED_FACTOR": "1"}):
+        return P._build_h3_tiers()
 
 
 class TestHighCellsRunFifteenForwards(unittest.TestCase):
@@ -89,7 +109,7 @@ class TestMeasuredEtaMatchesDepth(unittest.TestCase):
                 self.assertGreaterEqual(int(v[2]), 1)
 
     def test_storyboard_fallback_tracks_the_model(self):
-        per_sec = P.H3_TIERS["high_5s"]["eta_min"] * 60 / 5
+        per_sec = _tiers_at_m4_max()["high_5s"]["eta_min"] * 60 / 5
         self.assertLess(abs(SB._H3_SECS_PER_VIDEO_SEC["high"] - per_sec),
                         0.1 * per_sec)
 

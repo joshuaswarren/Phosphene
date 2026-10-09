@@ -98,7 +98,12 @@ class TheRoute(unittest.TestCase):
         self.assertGreater(body["minutes"], 0)
 
     def test_explicit_frames_and_canvas_are_honoured(self):
-        code, body = self.get(frames=241, width=1024, height=576)
+        # On a standard-tier Mac (issue #90): a <48 GB Mac prices the canvas
+        # its tier clamps to (768x448) by design, which is the exact clamp
+        # run_job_inner applies, not a request being ignored.
+        with mock.patch.object(P, "SYSTEM_TIER", "standard"), \
+                mock.patch.object(P, "SYSTEM_CAPS", P.CAPABILITIES["standard"]):
+            code, body = self.get(frames=241, width=1024, height=576)
         self.assertEqual(code, 200)
         self.assertEqual(body["width"], 1024)
         self.assertEqual(body["height"], 576)

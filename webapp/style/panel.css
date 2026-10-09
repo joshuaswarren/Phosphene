@@ -3983,8 +3983,8 @@
        reason in the title, and the same reason into #engineRowNote if
        they click. Hiding a capability is only kind when there is nothing
        to say; there is something to say here. */
-    body[data-cap-tier="q4"] #modeGroup [data-mode="keyframe"],
-    body[data-cap-tier="q4"] #modeGroup [data-mode="extend"] {
+    body[data-cap-tier="q4"]:not([data-engine="h3"]) #modeGroup [data-mode="keyframe"],
+    body[data-cap-tier="q4"]:not([data-engine="h3"]) #modeGroup [data-mode="extend"] {
       display: none !important;
     }
 
@@ -12650,3 +12650,31 @@ label > .ph:first-child:not(:only-child),
 /* FILM-39 (4.17): the SLOW flag on a clip is a button — click runs Prepare. */
 .sbe-slow-flag { cursor: pointer; pointer-events: auto; }
 .sbe-slow-flag:hover { color: var(--accent-bright, var(--accent)); }
+
+/* ===== 4.19 — Hailuo H3 media modes (Extend / Add sound share #extendSection) =====
+   Add sound reuses Extend's source picker; everything that only means "extend"
+   folds while the form is in Add sound, and the reverse. H3's Length strip
+   means nothing for either (the clip, or the seconds asked for, decide the
+   length), so it folds while H3 renders them. */
+body[data-vmode="v2a"] #extendSection .extend-only { display: none !important; }
+body:not([data-vmode="v2a"]) #extendSection .v2a-only { display: none !important; }
+body[data-engine="h3"][data-vmode="extend"] #h3LengthGroup,
+body[data-engine="h3"][data-vmode="extend"] #h3LengthLabel,
+body[data-engine="h3"][data-vmode="v2a"] #h3LengthGroup,
+body[data-engine="h3"][data-vmode="v2a"] #h3LengthLabel { display: none !important; }
+#extendSection .h3-mode-hint {
+  margin: 0 0 10px; padding: 9px 11px; border-radius: 10px;
+  border: 1px solid var(--eng-soft, rgba(255,46,159,0.42));
+  background: var(--eng-dim, rgba(255,46,159,0.14));
+  color: var(--text, #e8e8ef); line-height: 1.45;
+}
+
+/* ===== 4.19 — Lip-sync engine choice (LTX | Hailuo H3) ===== */
+.a2v-engine { display: flex; flex-direction: column; gap: 8px; margin: 10px 0 4px; }
+.a2v-engine[hidden] { display: none !important; }
+.a2v-engine .pill-btn { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; }
+.a2v-engine .pill-btn .sub { font-size: 11px; opacity: .72; }
+.a2v-engine [data-a2v-engine="h3"].active { border-color: rgba(255,46,159,0.55); box-shadow: inset 0 0 0 1px rgba(255,46,159,0.35); }
+#a2vH3QualityGroup .pill-btn { align-items: center; text-align: center; }
+#mvOneShotDetails:not([data-a2v-engine="h3"]) .a2v-h3-only { display: none !important; }
+#mvOneShotDetails[data-a2v-engine="h3"] .a2v-ltx-only { display: none !important; }

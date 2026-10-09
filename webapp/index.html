@@ -406,6 +406,7 @@
            chooses any total anchor count from 3–8. -->
       <button type="button" class="mode-chip pill-btn" data-mode="keyframe" data-kf-default="multi">Keyframes<span class="mc-sub sub">3–8 frames</span></button>
       <button type="button" class="mode-chip pill-btn" data-mode="extend">Extend<span class="mc-sub sub">continue a clip</span></button>
+      <button type="button" class="mode-chip pill-btn" data-mode="v2a" data-h3-only title="Hailuo H3 — give a silent (or any) clip new sound made for its picture. The picture is kept exactly.">Add sound<span class="mc-sub sub">your clip → its sound</span></button>
       <!-- VA-01: lip-sync's only entrance used to be Audio tab → Music video
            → a folded "One shot (audio → video)" row that shared its name
            with the unrelated One Shot tab — nothing on the Video mode bar
@@ -663,7 +664,7 @@
           </div>
 
           <div class="mode-only" id="keyframeSection">
-            <h2>Start frame (frame 0)</h2>
+            <h2>Start frame (frame 0)<span class="h2-hint" data-h3-only> · optional on Hailuo H3</span></h2>
             <div class="picker" data-key="start_image">
               <div class="picker-drop" id="picker_drop_start_image">
                 <div class="picker-empty">
@@ -730,16 +731,22 @@
                extend-mode preset. Lives inside the composer card so the
                prompt sits below the source picker, mirroring the I2V flow. -->
           <div class="mode-only" id="extendSection">
-            <h2>Source video</h2>
+            <h2><span class="extend-only">Source video</span><span class="v2a-only">Clip to add sound to</span></h2>
+            <!-- 4.19: Hailuo H3 versions of this panel. Extend continues the
+                 clip from its last 17 frames AND their sound; Add sound keeps
+                 the picture exactly and generates only its audio. Both read
+                 the same source picker below. -->
+            <div class="hint h3-mode-hint extend-only" data-h3-only>Hailuo H3 continues this clip from its last 17 frames and their sound, so the motion and the voice carry on instead of restarting. Any clip works; an H3 clip continues on its own canvas. Describe what happens next in the prompt.</div>
+            <div class="hint h3-mode-hint v2a-only" data-h3-only>Hailuo H3 watches the clip and makes its sound — ambience, footsteps, impacts, voices — in sync with the picture. The picture is kept exactly as it is. Describe the sound you want in the prompt, or leave it short and H3 fills in what it sees.</div>
             <!-- VA-13: the clamp used to be a log line nobody saw until the
                  6-16 min render finished softer than the clip it extended.
                  extendClampNote is filled by refreshExtendClampNote() (from
                  BOOT.tier.extend_max_dim) on boot and on every mode switch
                  into Extend, so it's said BEFORE Generate every time. -->
-            <div class="hint" id="extendClampNote" style="margin-bottom:6px"></div>
+            <div class="hint" id="extendClampNote" style="margin-bottom:6px" data-ltx-only></div>
             <select id="extendSrcSelect" onchange="document.getElementById('video_path').value=this.value"></select>
             <input name="video_path" id="video_path" placeholder="/path/to/source.mp4" style="margin-top:6px">
-            <div class="row" style="margin-top:8px">
+            <div class="row extend-only" style="margin-top:8px">
               <div>
                 <label class="lbl">Extend by (seconds)</label>
                 <!-- min must align to step from value=2: with min=0.4 step=0.5 the
@@ -753,7 +760,7 @@
                 <input type="hidden" name="extend_frames" id="extend_frames" value="6">
                 <div class="hint" id="extendDurationHint" style="margin-top:4px" title="6 latent frames × 8 video frames at 24 fps">Adds 2.0 s</div>
               </div>
-              <div>
+              <div data-ltx-only>
                 <label class="lbl">Direction</label>
                 <select name="extend_direction" id="extend_direction">
                   <option value="after" selected>After</option>
@@ -769,7 +776,7 @@
                  sampler's stage_1/stage_2 step model. Same labels make it
                  visually clear both intents live in the Q8 family without
                  forcing the implementation onto the HQ sampler. -->
-            <label class="lbl" style="margin-top:10px">Quality</label>
+            <label class="lbl" style="margin-top:10px" data-ltx-only>Quality</label>
             <!-- VA-12: the "N steps · ~M min" text below is the pre-JS
                  fallback only — applyExtendPillPrices() (characters.js)
                  overwrites both spans from the server's real, clamped-canvas
@@ -777,7 +784,7 @@
                  switch. Static fallback values must still be the REAL
                  defaults (8 steps, not the old 12 this pill used to submit —
                  see setExtendMode). -->
-            <div class="pill-group cols-2 quality-strip" id="extendModeGroup">
+            <div class="pill-group cols-2 quality-strip" id="extendModeGroup" data-ltx-only>
               <button type="button" class="pill-btn pill-quality active" data-extend-mode="fast">
                 <span class="ql-name">Q8 Draft</span>
                 <span class="q-spec ql-spec sub">8 steps · 64 GB safe</span>
@@ -791,12 +798,12 @@
             </div>
             <input type="hidden" name="extend_steps" id="extend_steps" value="8">
             <input type="hidden" name="extend_cfg"   id="extend_cfg"   value="1.0">
-            <div class="hint">Each latent ≈ 8 frames (~0.33s). Q8 Pro runs the upstream Lightricks defaults but pushes 1280×704 into swap below the Roomy tier — it only appears there. Stick with Q8 Draft unless you've got more RAM.</div>
+            <div class="hint" data-ltx-only>Each latent ≈ 8 frames (~0.33s). Q8 Pro runs the upstream Lightricks defaults but pushes 1280×704 into swap below the Roomy tier — it only appears there. Stick with Q8 Draft unless you've got more RAM.</div>
             <!-- VA-13: Extend clamps to this Mac's tier cap and hands back
                  whatever it renders at, softer than the source it extended
                  into. This queues the fix behind it instead of leaving the
                  user to notice and do it by hand. -->
-            <label class="check" style="margin-top:8px">
+            <label class="check extend-only" style="margin-top:8px" data-ltx-only>
               <input type="checkbox" name="extend_face_fix_after" id="extendFaceFixAfter" value="1">
               Also run Upscale &amp; Face Fix after
             </label>
@@ -3897,6 +3904,21 @@ The last line"></textarea>
           <span class="cz-sum">a picture and a stretch of audio → one clip whose mouth follows the track</span>
         </summary>
         <div class="cz-body">
+        <!-- 4.19: which engine performs the track. LTX (the built-in a2v
+             pipeline) or Hailuo H3, which holds the supplied soundtrack and
+             renders the picture to it — face, body and room, with the
+             runner's own lip-sync contract. Hidden until the installed H3
+             runner can take a soundtrack (BOOT/status.h3.audio_drive). -->
+        <div class="a2v-engine" id="a2vEngineRow" hidden>
+          <span class="mf-label">Engine</span>
+          <div class="pill-group cols-2" id="a2vEngineGroup" role="radiogroup" aria-label="Lip-sync engine">
+            <button type="button" class="pill-btn active" role="radio" aria-checked="true" data-a2v-engine="ltx" onclick="setA2vEngine('ltx')">LTX<span class="sub">your audio drives the picture</span></button>
+            <button type="button" class="pill-btn" role="radio" aria-checked="false" data-a2v-engine="h3" onclick="setA2vEngine('h3')">Hailuo H3<span class="sub">performs it — face, body and room</span></button>
+          </div>
+          <div class="pill-group cols-3 a2v-h3-only" id="a2vH3QualityGroup" role="radiogroup" aria-label="Hailuo H3 canvas"></div>
+          <div class="hint a2v-h3-only" id="a2vH3Note">H3 keeps your track exactly as it is and renders the picture to it. Start on a closed-mouth, face-forward picture and say what the performance looks like — never "still" or "static".</div>
+        </div>
+
         <div class="composer-card">
           <div class="composer-refs">
             <div class="show">
@@ -4000,12 +4022,12 @@ The last line"></textarea>
         <div class="quick-settings">
           <div>
             <div class="mini-fields">
-              <div class="mf-cell">
+              <div class="mf-cell a2v-ltx-only">
                 <span class="mf-label">Width</span>
                 <input type="number" id="audioStudioWidth" value="1024" min="256" max="1920" step="32"
                        oninput="audioStudioDurationChanged()">
               </div>
-              <div class="mf-cell">
+              <div class="mf-cell a2v-ltx-only">
                 <span class="mf-label">Height</span>
                 <input type="number" id="audioStudioHeight" value="576" min="256" max="1920" step="32"
                        oninput="audioStudioDurationChanged()">
@@ -4061,7 +4083,7 @@ The last line"></textarea>
                    decide with the same information the maintainer has. -->
               <div class="hint" id="audioStudioDurationWarn" style="margin-top:4px; display:none"></div>
             </div>
-            <div class="mf-cell" style="margin-top:8px">
+            <div class="mf-cell a2v-ltx-only" style="margin-top:8px">
               <span class="mf-label">Audio conditioning strength</span>
               <!-- Starts on AUTO and stays there until the thumb is dragged:
                    the two A2V pipelines read this number differently and only
@@ -4382,6 +4404,17 @@ The last line"></textarea>
             <path d="M3 8 L13 8 M9 4 L13 8 L9 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
           </svg>
           <span class="po-act-label">Extend</span>
+        </button>
+        <!-- 4.19: Add sound — Hailuo H3 scores the clip on screen (its
+             picture is kept exactly). Shown only when the installed H3 runner
+             can (queue.js toggles it with the other player actions). -->
+        <button id="addSoundBtn" class="po-act" type="button" style="display:none"
+                onclick="useAsAddSoundSource()" title="Give this clip new sound made for its picture, with Hailuo H3 — the picture is kept exactly as it is">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M2.5 6.5 H5 L8.5 3.5 V12.5 L5 9.5 H2.5 Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+            <path d="M11 6 Q12.5 8 11 10 M12.8 4.5 Q15.4 8 12.8 11.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+          </svg>
+          <span class="po-act-label">Add sound</span>
         </button>
         <!-- VA-36 / "Continue the song": on a lip-sync (a2v) clip, Extend
              regenerates LTX's own joint audio over the new frames — a

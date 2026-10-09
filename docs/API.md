@@ -35,7 +35,7 @@ Add a job to the panel's queue. Returns immediately; the helper renders it async
 
 | Field | Type | Note |
 |---|---|---|
-| `mode` | `t2v` \| `i2v` \| `extend` \| `keyframe` \| `image` | Job type. |
+| `mode` | `t2v` \| `i2v` \| `extend` \| `keyframe` \| `a2v` \| `v2a` \| `image` | Job type. `v2a` (Add sound) is Hailuo H3 only. |
 | `prompt` | string | Full prompt text. Trigger words for LoRAs go here. |
 | `negative_prompt` | string | Optional. Honoured only where the pipeline runs classifier-free guidance: `high`, `extend`, `keyframe`, `a2v`. The distilled `quick` / `balanced` / `standard` paths have no guidance branch and ignore it (they used to fold the terms into the prompt, which made the model draw them, #81). |
 | `width`, `height` | int | Both divisible by 32. |
@@ -61,6 +61,17 @@ Add a job to the panel's queue. Returns immediately; the helper renders it async
 | `window_prompts` | JSON array (or newline-separated) of one line per window; line 1 blank = the prompt; a later blank line holds the previous moment. Each later window's prompt is its line FIRST, then the continuation clause, then `Throughout: <window_invariants>.` — the H3 chain contract, and the lead-with-the-move rule. |
 | `window_invariants` | What must not change between windows (who, where, light, lens). Re-injected into every later window. |
 | `loras` | JSON-encoded array | See LoRA payload below. |
+
+**Hailuo H3 (`engine=h3`), 4.19 fields.** H3 renders `t2v`, `i2v`, `keyframe`, `extend`, `a2v` and `v2a`; each mode past `i2v` needs a flag on the INSTALLED runner (`/status.h3.keyframes` / `.extend` / `.audio_drive` / `.video_to_audio`), and a job for one the runner lacks renders on LTX with a sentence (Add sound has no LTX lane and is refused with the update sentence instead).
+
+| Field | Type | Note |
+|---|---|---|
+| `h3_quality`, `h3_length` | string | The cell. `h3_quality=fast_hd` = the 640×384 Fast pass + Upscale & Face Fix to 1280×768, queued together; Fast and the fix are forced. |
+| `h3_continuity` | `on` \| `off` | Default `on`: a chained window carries the last 17 frames of the previous one and their sound (`--chain-context-frames 17`). `off` = the one-still hand-over. |
+| `start_image`, `end_image`, `keyframes_json` | path / JSON | `mode=keyframe`. On H3 the start frame is optional (an end frame alone is MiniMax's last-frame task); `keyframes_json` beats land at their `frame_index` on the 24 fps timeline. |
+| `video_path`, `h3_extend_seconds` | path / float | `mode=extend`: any clip, continued from its last 17 frames and their sound; 0.5–15 s added after it. |
+| `audio`, `image`, `frames`, `audio_start_time`, `audio_stem_auto` | | `mode=a2v` with `engine=h3`: the track is held exactly and the picture rendered to it; `frames` (24 fps) is the length, capped at the audio left after `audio_start_time` and at 30 s; `audio_stem_auto=on` conditions on the separated vocal and delivers the original. |
+| `video_path` | path | `mode=v2a` (Add sound, H3 only): the clip's picture is kept exactly and only its sound is generated; up to 60 s. |
 
 **LoRA payload:** the `loras` field is a JSON-encoded array of `{path, strength}` objects. Stack as many as needed: On Hailuo H3, stacking needs the engine's repeatable `--lora` (`/status.h3.loras.max_stack` > 1); an older pack takes one adapter and the `h3_lora_slot` field decides whether it goes to Turbo or to the LoRA.
 

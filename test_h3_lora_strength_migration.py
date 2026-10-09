@@ -75,6 +75,15 @@ class _LoraDir(unittest.TestCase):
         self.st.enter_context(unittest.mock.patch.object(P, "_h3_loras_dir", lambda: self.dir))
         self.logs = []
         self.st.enter_context(unittest.mock.patch.object(P, "push", self.logs.append))
+        # As an install WITHOUT the TriStep (Fast) adapter (issue #90). With it
+        # installed, make_job turns Fast on by default for Draft/Standard/High,
+        # and the dispatch below then refuses the test's own runner for having
+        # no --sigma-subset: these cases failed on exactly the Macs that had
+        # installed Fast. The strength contract under test is the Best lane's.
+        self.st.enter_context(unittest.mock.patch.object(
+            P, "h3_tristep_status",
+            lambda: {"available": False, "supported": True,
+                     "missing": ["adapter (pinned absent by this suite)"]}))
         P._H3_LORA_LAYOUT_CACHE.clear()
 
     def tearDown(self):

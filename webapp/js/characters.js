@@ -502,7 +502,87 @@ function openLipSyncEntry() {
   });
 }
 
+// ---- 4.19: Lip-sync on Hailuo H3 -------------------------------------------
+// The engine row appears once the installed H3 runner can hold a soundtrack.
+// LTX stays the default; the choice is remembered per browser. On H3 the
+// canvas comes from H3's own quality cells (Draft / Standard / High) instead
+// of free Width × Height, and the LTX-only conditioning knob folds away.
+const A2V_ENGINE_KEY = 'phos_a2v_engine';
+const A2V_H3_QUALITY_KEY = 'phos_a2v_h3_quality';
+globalThis.A2V_ENGINE = (() => {
+  try { return localStorage.getItem(A2V_ENGINE_KEY) === 'h3' ? 'h3' : 'ltx'; } catch (e) { return 'ltx'; }
+})();
+globalThis.A2V_H3_QUALITY = (() => {
+  try { return localStorage.getItem(A2V_H3_QUALITY_KEY) || 'high'; } catch (e) { return 'high'; }
+})();
+
+function a2vH3Offered() {
+  return typeof h3CanServe === 'function' && h3CanServe('a2v');
+}
+
+function a2vEngineActive() {
+  return (A2V_ENGINE === 'h3' && a2vH3Offered()) ? 'h3' : 'ltx';
+}
+
+function setA2vEngine(id) {
+  A2V_ENGINE = (id === 'h3') ? 'h3' : 'ltx';
+  try { localStorage.setItem(A2V_ENGINE_KEY, A2V_ENGINE); } catch (e) {}
+  renderA2vEngineRow();
+  if (typeof audioStudioDurationChanged === 'function') audioStudioDurationChanged();
+}
+
+function setA2vH3Quality(key) {
+  A2V_H3_QUALITY = key;
+  try { localStorage.setItem(A2V_H3_QUALITY_KEY, key); } catch (e) {}
+  renderA2vEngineRow();
+  if (typeof audioStudioDurationChanged === 'function') audioStudioDurationChanged();
+}
+
+// The H3 canvases a lip-sync can use: every offered quality (not the lab
+// Preview canvas).
+function _a2vH3Qualities() {
+  const qs = ((window._ENGINE_PROBES || {}).h3 || {}).qualities || [];
+  // Not Fast HD: its Face Fix redraws the mouth the soundtrack just drove.
+  return qs.filter(q => q && q.offered !== false && q.key !== 'preview' && !q.fast_hd);
+}
+
+function renderA2vEngineRow() {
+  const row = document.getElementById('a2vEngineRow');
+  const det = document.getElementById('mvOneShotDetails');
+  const offered = a2vH3Offered();
+  if (row) row.hidden = !offered;
+  const active = a2vEngineActive();
+  if (det) det.dataset.a2vEngine = active;
+  document.querySelectorAll('#a2vEngineGroup [data-a2v-engine]').forEach(b => {
+    const on = b.dataset.a2vEngine === active;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-checked', on ? 'true' : 'false');
+  });
+  const qg = document.getElementById('a2vH3QualityGroup');
+  if (qg && offered) {
+    const qs = _a2vH3Qualities();
+    if (qs.length && !qs.some(q => q.key === A2V_H3_QUALITY)) A2V_H3_QUALITY = qs[Math.min(2, qs.length - 1)].key;
+    qg.innerHTML = qs.map(q => `<button type="button" class="pill-btn${q.key === A2V_H3_QUALITY ? ' active' : ''}"
+        role="radio" aria-checked="${q.key === A2V_H3_QUALITY}" onclick="setA2vH3Quality('${escapeHtml(q.key)}')">
+        ${escapeHtml(q.label)}<span class="sub">${escapeHtml(q.canvas || '')}</span></button>`).join('');
+  }
+}
+
+// Minutes for an H3 lip-sync of `sec` seconds at the chosen canvas: the 5 s
+// cell's own price (Fast when installed) times the windows the length needs.
+function a2vH3EstimateMin(sec) {
+  if (typeof h3CellFor !== 'function' || typeof h3CellEtaMin !== 'function') return null;
+  const cell = h3CellFor(A2V_H3_QUALITY, '5s');
+  if (!cell) return null;
+  const per = h3CellEtaMin(cell);
+  if (!(per > 0)) return null;
+  const frames = Math.round(sec * 24);
+  const windows = frames <= 124 ? 1 : 1 + Math.ceil((frames - 124) / 123);
+  return per * windows;
+}
+
 function audioStudioInit() {
+  renderA2vEngineRow();
   if (musicComposeActive()) setMainOutputsFilter('audio');
   // The Drive-video pane is the Music video pane now (music.js owns it; the
   // single-clip form this function wires is the "One shot" disclosure at the
@@ -929,7 +1009,14 @@ function audioStudioDurationChanged(val) {
   const frames = _a2vFramesForSeconds(sec);
   const w = parseInt((document.getElementById('audioStudioWidth') || {}).value || '1024', 10);
   const h = parseInt((document.getElementById('audioStudioHeight') || {}).value || '576', 10);
-  if (typeof a2vUpdateEstimate === 'function') a2vUpdateEstimate(frames, w, h);
+  if (typeof a2vEngineActive === 'function' && a2vEngineActive() === 'h3') {
+    const el = document.getElementById('audioStudioEstimate');
+    const m = a2vH3EstimateMin(sec);
+    const cell = (typeof h3CellFor === 'function') ? h3CellFor(A2V_H3_QUALITY, '5s') : null;
+    if (el) el.textContent = cell
+      ? `Hailuo H3 · ${cell.width}×${cell.height}` + (m ? ` · about ${typeof h3FmtEtaMin === 'function' ? h3FmtEtaMin(m) : Math.round(m) + ' min'} on this Mac` : '')
+      : 'Hailuo H3';
+  } else if (typeof a2vUpdateEstimate === 'function') a2vUpdateEstimate(frames, w, h);
   const warn = document.getElementById('audioStudioDurationWarn');
   if (!warn) return;
   const area = (w > 0 && h > 0) ? w * h : 1024 * 576;
@@ -1243,6 +1330,23 @@ function a2vLoadParams(p) {
     const autoOn = ['1', 'true', 'on', 'yes'].includes(String(p.audio_stem_auto ?? '').trim().toLowerCase());
     stemEl.checked = autoOn || !!String(p.audio_stem || '').trim();
   }
+  // 4.19: an H3 lip-sync reopens on H3, at its canvas and its own length
+  // (24 fps frames, not LTX's 8k+1 grid).
+  if (String(p.engine || '') === 'h3') {
+    if (p.h3_quality) {
+      A2V_H3_QUALITY = String(p.h3_quality);
+      try { localStorage.setItem(A2V_H3_QUALITY_KEY, A2V_H3_QUALITY); } catch (e) {}
+    }
+    if (typeof setA2vEngine === 'function') setA2vEngine('h3');
+    const f24 = parseInt(p.h3_a2v_frames || p.frames, 10);
+    const slider = document.getElementById('audioStudioDuration');
+    if (Number.isFinite(f24) && f24 > 0 && slider) {
+      slider.value = String(Math.max(1, Math.round(f24 / 24)));
+      audioStudioDurationChanged(slider.value);
+    }
+  } else if (p.mode === 'a2v' && typeof setA2vEngine === 'function') {
+    setA2vEngine('ltx');
+  }
   audioStudioRenderLoraNote();
 }
 
@@ -1522,6 +1626,14 @@ async function audioStudioGenerate(opts) {
     fd.set('mode', 'a2v');
     fd.set('prompt', prompt);
     fd.set('audio', AUDIO_STUDIO.audioPath);
+    const _onH3 = typeof a2vEngineActive === 'function' && a2vEngineActive() === 'h3';
+    if (_onH3) {
+      // Hailuo H3 lip-sync: the canvas is the H3 cell's; the length is the
+      // seconds asked for (24 fps, H3's own clock — not LTX's 8k+1 grid).
+      fd.set('engine', 'h3');
+      fd.set('h3_quality', A2V_H3_QUALITY);
+      fd.set('h3_length', '5s');
+    }
     if (a2vImagePath) {
       fd.set('image', a2vImagePath);
       // VA-02: the crop-preview overlay's drag position for this picker.
@@ -1530,9 +1642,9 @@ async function audioStudioGenerate(opts) {
     }
     fd.set('width', String(w));
     fd.set('height', String(h));
-    fd.set('frames', String(frames));
+    fd.set('frames', String(_onH3 ? Math.max(24, Math.round((draft ? Math.min(3, dur) : dur) * 24)) : frames));
     fd.set('seed', String(seed));
-    if (audioConditioningScale !== null && !Number.isNaN(audioConditioningScale)) {
+    if (!_onH3 && audioConditioningScale !== null && !Number.isNaN(audioConditioningScale)) {
       fd.set('audio_conditioning_scale', String(audioConditioningScale));
     }
     fd.set('audio_start_time', String(audioStart));
@@ -4504,6 +4616,10 @@ function updatePromptPlaceholder() {
     prompt.placeholder = 'Describe how the reference image should move, plus sound cues. The image anchors frame 0; the prompt directs the full clip.';
   } else if (currentMode === 'ingredients') {
     prompt.placeholder = "Describe WHAT'S in the reference sheet — each character, prop, and the location. e.g. a friendly cartoon hedgehog with rounded chestnut fur; a green coiled garden hose; the bright interior of a 'Greenfield' garden store. (The Action field above describes the shot itself.)";
+  } else if (currentMode === 'v2a') {
+    prompt.placeholder = 'Describe the sound this clip should have — e.g. a busy kitchen, a pan sizzling, a knife on a board, two people murmuring off-screen. The picture stays exactly as it is.';
+  } else if (currentMode === 'extend' && document.body.dataset.engine === 'h3') {
+    prompt.placeholder = 'What happens next — the action, the camera, and the sound. Hailuo H3 carries on from the last 17 frames and their sound.';
   } else if (currentMode === 'control') {
     prompt.placeholder = "Describe the NEW subject/scene to paint onto the control clip's motion and structure — plus sound cues. e.g. a red origami crane unfolding on a black table · soft paper rustle. The control video drives the composition; this prompt swaps what's in it.";
   } else {
@@ -4592,6 +4708,7 @@ document.querySelectorAll('#extendModeGroup .pill-btn').forEach(b => b.onclick =
 // the global scope; everything NOT listed here is private to this module.
 Object.assign(globalThis, {
   musicComposeActive, musicInit, updateMusicAvailability, audioModeSet, musicPick, musicFormChanged,
+  setA2vEngine, setA2vH3Quality, renderA2vEngineRow, a2vEngineActive,
   musicFormParams, musicGenerate, useTrackInA2V, audioStudioUseAudio, openMusicInstallCard, closeMusicInstallCard,
   musicInstallRender, musicInstallStart, musicInstallStop,
   // Music Studio (cover): the install card's button is generated markup.

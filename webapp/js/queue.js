@@ -73,7 +73,9 @@ function h3FinishTierKey(srcCell) {
     const hit = targets.find(t => t.quality === q);
     if (hit) return hit.key;
   }
-  return targets[0].key;   // one rung up
+  // One rung up — never Fast HD by default: it is a speed recipe on the Draft
+  // canvas, offered in the list but not the "finish it properly" instinct.
+  return (targets.find(t => !t.fast_hd) || targets[0]).key;
 }
 
 function h3FinishSetTier(key) {
@@ -720,6 +722,12 @@ function setEngine(engine, opts) {
       target = fallback.id;
       reason = 'This ' + e.label + ' build has no first-frame support — '
              + 'update the pack to use Image mode.';
+    } else if (H3_MODE_CAP[currentMode] && st[H3_MODE_CAP[currentMode]] === false) {
+      // 4.19 modes ride on runner flags an older H3 pack does not have.
+      target = fallback.id;
+      reason = 'This ' + e.label + ' runner predates ' + (H3_MODE_LABEL[currentMode] || currentMode)
+             + ' — press Update in Pinokio (your weights stay). Back on '
+             + fallback.label + ' for now.';
     }
   }
   if (target !== (e || {}).id) e = engineById(target) || fallback;
@@ -731,6 +739,11 @@ function setEngine(engine, opts) {
   // emitted from the same ENGINES table that produced `target`.
   document.body.dataset.engine = target;
   if (note) { note.textContent = reason; note.hidden = !reason; }
+  // The keyframe hint and the Extend/Add-sound panels speak per engine.
+  if (currentMode === 'keyframe' && typeof setKeyframeMode === 'function') {
+    try { setKeyframeMode(window._kfMode); } catch (e) {}
+  }
+  if (typeof syncH3MediaModeUi === 'function') { try { syncH3MediaModeUi(); } catch (e) {} }
   renderEngineSwitch();
   try { syncModeStripToEngine(); } catch (e) {}
 
@@ -920,6 +933,12 @@ function updateH3Availability(s) {
                // sentence on the chained cells, so a pack update that brings
                // --chain-prompts in has to re-render both without a reload.
                || (next.chain_prompts !== H3.chain_prompts)
+               // 4.19: an H3 runner update brings Keyframes / Extend /
+               // Lip-sync / Add sound in without a reload.
+               || (next.keyframes !== H3.keyframes)
+               || (next.extend !== H3.extend)
+               || (next.audio_drive !== H3.audio_drive)
+               || (next.video_to_audio !== H3.video_to_audio)
                // Install→repair→install flips the pill's copy and the models
                // card even when `available` itself hasn't moved yet.
                || (next.repairable !== H3.repairable)
@@ -946,6 +965,8 @@ function updateH3Availability(s) {
   }
   if (changed) {
     setEngine(currentEngine(), { persist: false });
+    // The Lip-sync form's engine row follows the runner's capabilities too.
+    if (typeof renderA2vEngineRow === 'function') { try { renderA2vEngineRow(); } catch (e) {} }
     // The Finish button's label and its picker are both derived from the
     // engine's own tier table, so a pack install/repair that changes the
     // offered tiers has to re-label the currently-selected clip's
@@ -972,6 +993,9 @@ function updateH3Availability(s) {
 // `source` is 'chip' from the engine switcher and undefined from the explicit
 // "How to install" / "How to repair" buttons in the Models list, which must
 // ALWAYS open the card: the user asked for it by name there.
+// H3 carried context for the next submit: 'on' unless Load Params restored a
+// recipe that ran with it off (h3_continuity=false on the sidecar).
+let _h3ContinuityRecipe = 'on';
 let _h3CardSeen = false;
 function openH3InstallCard(source) {
   if (source === 'chip' && _h3CardSeen) { _h3NudgeEngineOffer(); return; }
@@ -1306,6 +1330,8 @@ function syncExtendDuration() {
   // about 2 seconds" — kept as a tooltip for anyone who does want it.
   hint.textContent = `Adds ${actualSec.toFixed(2)} s`;
   hint.title = `${latents} latent frames × 8 video frames at 24 fps`;
+  // H3 counts in seconds and 5 s windows, not latents.
+  if (typeof syncH3MediaModeUi === 'function') { try { syncH3MediaModeUi(); } catch (e) {} }
   // VC-25: the sticky footer's derived line has its own Extend-aware branch
   // (updateDerived()) that reads this same #extend_seconds/#extend_direction
   // pair — refresh it here too, or it keeps showing whatever it last said
@@ -1602,7 +1628,9 @@ function updateDerived() {
   // everything below the footer (which form sections show for this mode,
   // the keyframe slots, the frames gate) still has to run, or switching to
   // Extend / Keyframe would leave the previous mode's sections on screen.
-  const clampedMode = (mode === 'keyframe' || currentMode === 'extend');
+  // On H3 both are priced by the H3 footer line (the H3 cell), not LTX's card.
+  const clampedMode = (mode === 'keyframe' || currentMode === 'extend')
+    && document.body.dataset.engine !== 'h3';
   const w = parseInt(document.getElementById('width').value || 0);
   const h = parseInt(document.getElementById('height').value || 0);
   const f = parseInt(document.getElementById('frames').value || 0);
@@ -1750,7 +1778,10 @@ function updateDerived() {
   if (typeof _applyI2vRefModeVisibility === 'function') {
     try { _applyI2vRefModeVisibility(); } catch (_) {}
   }
-  document.getElementById('extendSection').classList.toggle('show', currentMode === 'extend');
+  // Add sound (H3) shares Extend's source-clip picker; the extend-only
+  // controls fold under body[data-vmode="v2a"] in panel.css.
+  document.getElementById('extendSection').classList.toggle('show',
+    currentMode === 'extend' || currentMode === 'v2a');
   // Colorize (restore) shows its own source-video picker. Unlike Extend it
   // KEEPS the sizing + quick-metrics rows below (the source's own dims/length
   // drive the output, but the prompt + seed still apply).
@@ -3663,7 +3694,9 @@ async function poll() {
   // that state. Y1.036 added Extend to the same gate after the Y1.024
   // download trim exposed that Extend is structurally Q8-class.
   const genBtn = document.getElementById('genBtn');
-  const q8GatedMode = (currentMode === 'keyframe' || currentMode === 'extend');
+  // H3 renders Keyframes and Extend on its own engine — no LTX Q8 needed.
+  const q8GatedMode = (currentMode === 'keyframe' || currentMode === 'extend')
+    && document.body.dataset.engine !== 'h3';
   if (currentMode === 'ingredients' && !ingredientsServed()) {
     // Belt to setMode's braces. setMode should make this unreachable, but
     // this is the state the button is in if anything ever gets there again
@@ -5419,7 +5452,14 @@ function selectOutput(path, options) {
   // singing shot would "continue" with invented gibberish. Swap Extend for
   // "Continue the song" there instead (see /a2v/continue_song).
   const outIsA2v = !!(o && o.mode === 'a2v');
-  if (useExtBtn) useExtBtn.style.display = (isPhoto || isAudio || outIsH3 || outIsA2v) ? 'none' : '';
+  // 4.19: an H3 clip CAN be extended now — on H3, which carries its last 17
+  // frames and their sound into the new window. Only an H3 runner that
+  // predates --extend-from still hides the button.
+  const _h3Ext = (typeof h3CanServe === 'function') && h3CanServe('extend');
+  if (useExtBtn) useExtBtn.style.display = (isPhoto || isAudio || (outIsH3 && !_h3Ext) || outIsA2v) ? 'none' : '';
+  const addSoundBtn = document.getElementById('addSoundBtn');
+  if (addSoundBtn) addSoundBtn.style.display = (!isPhoto && !isAudio
+    && typeof h3CanServe === 'function' && h3CanServe('v2a')) ? '' : 'none';
   const continueSongBtn = document.getElementById('continueSongBtn');
   if (continueSongBtn) continueSongBtn.style.display = (outIsA2v && !isPhoto && !isAudio) ? '' : 'none';
   // VA-26: Retake is video-only, engine-agnostic (any finished clip, H3
@@ -5499,8 +5539,13 @@ function audioUseTargets(o, probes) {
   } else if (!music.available) {
     cover.sub = 'needs the music engine — opens its install card';
   }
+  const h3 = (probes && probes.h3) || {};
+  const h3Lip = !!(h3.available && h3.audio_drive)
+    ? [{ id: 'lipsync_h3', label: 'Lip-sync with Hailuo H3', sub: 'H3 performs it — face, body and room, your track kept exactly' }]
+    : [];
   return [
     { id: 'lipsync', label: 'Lip-sync', sub: 'a face in your picture talks or sings to it' },
+    ...h3Lip,
     { id: 'musicvideo', label: 'Music video', sub: 'your pictures, planned and cut to it' },
     { id: 'soundtrack', label: 'Soundtrack for a video', sub: 'image-to-video, with this as its sound' },
     cover,
@@ -5510,8 +5555,10 @@ function audioUseTargets(o, probes) {
 function audioUseApply(path, target) {
   closeAudioUseMenu();
   const o = findOutputByPath(path);
-  if (target === 'lipsync') {
+  if (target === 'lipsync' || target === 'lipsync_h3') {
     if (typeof audioStudioUseAudio !== 'function') return;
+    // The Lip-sync form's engine row decides which engine performs it.
+    if (typeof setA2vEngine === 'function') setA2vEngine(target === 'lipsync_h3' ? 'h3' : 'ltx');
     audioStudioUseAudio(path, o ? o.clip_sec : null, o ? o.url : '');
     phosToast('Audio loaded into Lip-sync — add a picture of the face, then Generate.', { kind: 'success' });
   } else if (target === 'musicvideo') {
@@ -6130,6 +6177,12 @@ function useAsExtendSourcePath(path) {
   // Audio/One Shot/Images set mode=extend behind a hidden #genForm (0 px
   // tall) — same root cause as VA-08's Load Params, same fix.
   if (typeof workflowSwitch === 'function') { try { workflowSwitch('manual'); } catch (e) {} }
+  // 4.19: an H3 clip continues on H3 (its own motion and voice carry on);
+  // any other clip keeps the engine the user has chosen.
+  const _o = (typeof findOutputByPath === 'function') ? findOutputByPath(path) : null;
+  if (_o && h3ClipIsH3(_o) && h3CanServe('extend') && typeof setEngine === 'function') {
+    setEngine('h3');
+  }
   setMode('extend');
   document.getElementById('video_path').value = path;
   document.getElementById('extendSrcSelect').value = path;
@@ -6137,6 +6190,27 @@ function useAsExtendSourcePath(path) {
   document.querySelector('aside.form-pane').scrollTop = 0;
 }
 function useAsExtendSource() { if (!activePath) return alert('Pick an output first.'); useAsExtendSourcePath(activePath); }
+
+// 4.19: Add sound — the clip on screen goes to Hailuo H3's Add sound form
+// (the Extend panel's source picker), engine switched to H3. Nothing renders
+// until Generate; the prompt is left for the user to describe the sound.
+function useAsAddSoundSource(path) {
+  path = path || activePath;
+  if (!path) { phosToast('Pick a clip first.', { kind: 'warn' }); return; }
+  if (typeof h3CanServe !== 'function' || !h3CanServe('v2a')) {
+    phosToast('Add sound needs Hailuo H3 with an up-to-date runner — press Update in Pinokio.', { kind: 'warn', duration: 6000 });
+    return;
+  }
+  if (typeof workflowSwitch === 'function') { try { workflowSwitch('manual'); } catch (e) {} }
+  if (typeof setEngine === 'function') setEngine('h3');
+  setMode('v2a');
+  document.getElementById('video_path').value = path;
+  const sel = document.getElementById('extendSrcSelect');
+  if (sel) sel.value = path;
+  updateDerived();
+  document.querySelector('aside.form-pane').scrollTop = 0;
+  phosToast('Clip loaded into Add sound — describe the sound you want, then Generate.', { kind: 'success' });
+}
 
 // VA-38: hands a published Windows-partial to Extend as its source. Not a
 // byte-exact resume of the original chain's plan (that would need the
@@ -6926,6 +7000,18 @@ async function loadParams(recipe) {
   if (typeof workflowSwitch === 'function') { try { workflowSwitch('manual'); } catch (e) {} }
   const _lpPane = document.querySelector('aside.form-pane');
   if (_lpPane) _lpPane.scrollTop = 0;
+  // An H3 recipe switches the ENGINE before the mode is restored: setMode()'s
+  // Q4-tier guard and the LTX Extend clamp both read the engine, so restoring
+  // the mode first under LTX snapped H3 Keyframes/Extend to Text and clipped a
+  // 15 s H3 Extend to LTX's 10 s (Codex 4.19 #2/#3). The full engine restore
+  // further down runs again and lands on the same engine.
+  if (String((p && p.engine) || '').toLowerCase() === 'h3'
+      && typeof setEngine === 'function' && typeof engineById === 'function' && engineById('h3')) {
+    try { setEngine('h3', { persist: false }); } catch (e) {}
+  }
+  // Carried context is on unless the recipe says it ran without it; the form
+  // has no control for it, so it rides on this and goes back out on submit.
+  _h3ContinuityRecipe = (p && (p.h3_continuity === false || p.h3_continuity === 'off')) ? 'off' : 'on';
   if (p.mode === 'upscale') {
     // Upscale & Face Fix reopens in its own lane on the same source clip with
     // the EXACT recipe that ran. A pill lights only when it names that recipe;
@@ -6962,6 +7048,7 @@ async function loadParams(recipe) {
     return;
   }
   else if (p.mode === 'extend') setMode('extend');
+  else if (p.mode === 'v2a') setMode('v2a');
   else if (p.mode === 'keyframe') setMode('keyframe');
   else if (p.mode === 'i2v_clean_audio' || p.mode === 'i2v') { setMode('i2v'); document.getElementById('i2vMode').value = p.mode; document.getElementById('mode').value = p.mode; }
   else if (p.character_id) setMode('character');
@@ -7097,7 +7184,11 @@ async function loadParams(recipe) {
   // and never read back — a Load Params + Generate on an Extend silently
   // re-rendered with the defaults (journey audit, High).
   if (p.video_path) document.getElementById('video_path').value = p.video_path;
-  if (p.mode === 'extend') {
+  if (p.mode === 'extend' && String(p.engine || '') === 'h3' && Number(p.h3_extend_seconds) > 0) {
+    // H3 Extend records seconds, not LTX latents.
+    const sEl = document.getElementById('extend_seconds');
+    if (sEl) { sEl.value = String(Number(p.h3_extend_seconds)); sEl.dispatchEvent(new Event('input')); }
+  } else if (p.mode === 'extend') {
     const extFrames = parseInt(p.extend_frames, 10);
     if (Number.isFinite(extFrames) && extFrames > 0) {
       const fEl = document.getElementById('extend_frames');
@@ -8374,8 +8465,14 @@ document.getElementById('genForm').addEventListener('submit', async e => {
     if (kfMode === 'keyframe') {
       const startImg = (fd.get('start_image') || '').toString().trim();
       const endImg = (fd.get('end_image') || '').toString().trim();
-      if (!startImg || !endImg) {
-        alert('Pick both a start frame and an end frame before generating.');
+      const _kfOnH3 = (fd.get('engine') || '').toString() === 'h3';
+      if (_kfOnH3 ? !endImg : (!startImg || !endImg)) {
+        // H3 needs only the end frame (its last-frame task); LTX needs both.
+        const _msg = _kfOnH3
+          ? 'Pick the end frame — the still the clip should land on. The start frame is optional on Hailuo H3.'
+          : 'Pick both a start frame and an end frame before generating.';
+        if (typeof phosToast === 'function') phosToast(_msg, { kind: 'warn', duration: 6000 });
+        else alert(_msg);
         reenable();
         return;
       }
@@ -8391,7 +8488,8 @@ document.getElementById('genForm').addEventListener('submit', async e => {
           })),
           { image: endImg, frame: frames - 1, label: 'End' },
         ];
-        const missing = slots.filter(s => !s.image).map(s => s.label || 'Start/End');
+        const missing = slots.filter(s => !s.image && !(_kfOnH3 && s.label === 'Start'))
+          .map(s => s.label || 'Start/End');
         if (missing.length) {
           alert(`Pick all ${window._kfMode} keyframe images before generating: ` + missing.join(', '));
           reenable();
@@ -8456,6 +8554,13 @@ document.getElementById('genForm').addEventListener('submit', async e => {
         fd.set('height', String(_t.height));
         fd.set('frames', String(_t.frames));
         fd.set('steps', String(_t.steps));
+      }
+      // 4.19: Extend on H3 adds whole seconds after the clip (its own
+      // field — LTX's extend_frames counts 8-frame latents).
+      fd.set('h3_continuity', _h3ContinuityRecipe);
+      if ((fd.get('mode') || '').toString() === 'extend') {
+        fd.set('h3_extend_seconds', (document.getElementById('extend_seconds') || {}).value || '5');
+        fd.set('extend_direction', 'after');
       }
     }
     await api('/queue/add','POST',fd);
@@ -8667,7 +8772,7 @@ Object.assign(globalThis, {
   lbToggleFullscreen,
   audioUseTargets, audioUseApply, useAudioAsSoundtrack, openAudioUseMenu, closeAudioUseMenu,
   animateActive, hide, unhide, openOutputsFolder, hideActive,
-  useAsExtendSource, useAsUpscaleSource, useAsUpscaleSourcePath, setUpscalePreset,
+  useAsExtendSource, useAsAddSoundSource, useAsUpscaleSource, useAsUpscaleSourcePath, setUpscalePreset,
   faceFixClip, faceFixActive, isUpscaledPath, loadParams, _flashActionDone, closeOutputInfoModal,
   queueSharpExport, sharpExportActive, useLastFramePath, useLastFrameActive,
   revealClipInFinder, revealActive, openClipInEditor, openActiveInEditor, kebabToggle,

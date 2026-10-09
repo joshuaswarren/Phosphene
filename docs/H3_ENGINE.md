@@ -368,6 +368,77 @@ The dense 10 s tier ("10s single pass") ships visible by default, always —
 `LTX_H3_DENSE_10S` is not read anywhere and restores nothing; see the
 constants table above.
 
+### Media modes (4.19): Keyframes, Extend, Lip-sync, Add sound, carried context
+
+All of these ride on the packed sequence the reference already defines —
+video conditioning rows held at the keyframe noise level (0.999), audio
+conditioning rows held clean, and per-row timesteps — and on runner flags the
+panel probes on the INSTALLED runner (`/status.h3.keyframes`, `.continuation`,
+`.extend`, `.audio_drive`, `.video_to_audio`). An older pack falls back to LTX
+with a sentence (Add sound, which has no LTX lane, is refused with the update
+sentence). The panel-side map is `h3_media_plan()` in `mlx_ltx_panel.py`.
+
+| Capability | Runner flags | What the model sees |
+|---|---|---|
+| Carried context (chained 10 s / 15 s, Extend, Add sound) | `--chain-context-frames 17`, `--seam-colour-frames 24` | the previous window's last 17 frames as history rows placed just BEFORE the target on the rotary clock (one VAE clip, 5 latents), plus their sound as clean audio rows from the same instant; the hand-over frame stays the "first" anchor. Each window's grade is eased onto the carried frame over 24 frames. |
+| Start & end frame / Keyframes | `--first-frame`, `--last-frame`, `--keyframe PATH@FRAME` | MiniMax's FL2VA / L2VA tasks; a timed still is a `frame:<i>` anchor at `origin + i·5/3` (the same clock every target frame lives on). Each still also goes to the vision tower as `<Picture n>`, and the official alignment sentence is prepended when the prompt has none. On a chain each still is routed to the window that owns its frame. The start frame is optional on H3. |
+| Extend | `--extend-from SRC --extend-frames N` | the source is window 0; new 5 s windows continue from its last 17 frames and their sound. Output = source (on the H3 canvas) + N frames. Sources up to 60 s (the decoded source is held through the render). |
+| Lip-sync | `--audio-drive TRACK [--audio-mux ORIGINAL]` | the track is written into the TARGET audio rows and held clean (t = 1) for every step; only the picture is denoised. The delivered audio is the user's file, never the VAE round trip. "Voice only" conditions on the demucs vocal stem and delivers the mix. |
+| Add sound | `--video-to-audio SRC` | the clip is written into the TARGET video rows and held clean; only the audio is denoised. The delivery is the source's own video stream (`-c:v copy`) with the new track — no export re-encode, no Face Fix. |
+| Fast HD (quality) | the Draft canvas + Fast, then `mode=upscale` (start = source, 1 refine step — the "face kept" recipe) | H3 at 640×384 on the 3-step pass, LTX's x2 Upscale & Face Fix to 1280×768, queued together. |
+
+#### Measured (M4 Max 64 GB, Q8 DiT, 2026-10-07)
+
+Seam = the first frame of a new window. "Jump" = the change across the seam over the
+median frame-to-frame change around it (1.0 = invisible). Sound step = RMS 0.25 s after
+minus 0.25 s before.
+
+| Chain | Sound step at seams | Colour jump (eased) | Motion jump (eased) | Time |
+|---|---|---|---|---|
+| High 10 s, one still per window | +5.7 dB | 0.85 | 1.30 | 1008 s |
+| High 10 s, carried context | −0.9 dB | 1.81 | 1.14 | 1131 s |
+| Standard 15 s ×2 seeds, one still | avg 3.4 dB (worst 7.6) | avg 1.02 | avg 0.93 | 769 s |
+| Standard 15 s ×2 seeds, carried | avg 1.3 dB (worst 2.4) | avg 1.20 | avg 1.08 | 862 s |
+
+Without the easing the colour jump is 10–40× on either path — the grade step is a
+per-window decode artefact and the easing is what removes it. What carried context buys
+is the sound: the level and timbre continue across the seam (spectral similarity at the
+second seam 0.85/0.89 → 0.89/0.91, random-pair baseline 0.94). Transcripts were complete
+and identical on every chain.
+
+Other modes, High (1024×576) unless noted:
+
+- Keyframes, first + last, 5 s: normalised cross-correlation 1.000 at frame 0 and frame
+  123; ArcFace median 0.956 against the reference stills; 545 s.
+- Extend, 5 s source + 5 s: seam motion 1.60, colour 1.35, sound −0.8 dB, voice
+  similarity 0.997; the dialogue continues; ArcFace 0.927; 606 s.
+- Lip-sync, 10 s spoken voice on a still: mouth/audio correlation 0.35 without the
+  character LoRA, 0.47 with it (native H3 dialogue renders: −0.24…0.38); ArcFace 0.82 /
+  0.83; ~1110–1170 s. A song on its full mix scores −0.08 (the mouth stops after ~2 s) —
+  songs need Voice only (the vocal stem).
+- Add sound, Draft canvas, a talking clip with its audio removed: the line comes back
+  word for word on the lips (correlation 0.71, peak −7.9 dB); video stream byte-identical
+  to the source; 187 s for 5 s.
+
+#### Fast HD
+
+Same Bizarro prompt, still and seed, 5 s (124 frames):
+
+| Recipe | Output | Time | ArcFace median (min) |
+|---|---|---|---|
+| Fast HD: 640×384 Fast + x2 Face Fix, 1 step | 1280×768 | 181 + 158 = 339 s | 0.891 (0.841) |
+| 640×384 Fast + x2 Face Fix, 3 steps | 1280×768 | 181 + 357 = 538 s | 0.850 (0.818) |
+| High Fast (1024×576) | 1024×576 | 535 s | 0.914 (0.839) |
+| High Best (1024×576, 15 forwards) | 1024×576 | 2253 s | 0.922 (0.902) |
+| Native Best (1344×768, 8 forwards) | 1344×768 | 2888 s | 0.926 (0.886) |
+
+The 3-step finish redraws the face and costs as much as High Fast, so Fast HD uses the
+1-step "face kept" recipe. bf16 DiT on High Fast: 512 s, ArcFace 0.911, peak 42.6 GiB
+(Q8: 25.1 GiB) — not adopted. Skipping the 5 smallest-gate DiT blocks (`--skip-blocks
+auto:5`): 489 s, ArcFace 0.892 (min 0.814), visible expression change at the same seed —
+not adopted; the flag stays in the runner for research only.
+
+
 ### Export pass — the same post-process LTX renders get
 
 Draft writes 640×384 (5:3) and Standard 768×448 (12:7), neither of them 720p
@@ -557,11 +628,12 @@ is hidden entirely on a pack that predates it.
 
 ## What H3 does *not* do
 
-- **Modes**: Text and Image only. Every other mode (FFLF, Extend, Remix,
-  Character, A2V) is LTX-pipeline-specific; the picker snaps back to LTX with a
-  note. Character does too — it submits `mode=t2v` but stacks **LTX** LoRAs, and
-  those cannot load on H3 (see LoRAs below, which is about H3's own library).
-- **LoRA STACKING**: H3 takes exactly one adapter — see LoRAs below.
+- **Modes**: Remix and Character are LTX-pipeline-specific; the picker snaps
+  back to LTX with a note. Character submits `mode=t2v` but stacks **LTX**
+  LoRAs, and those cannot load on H3 (see LoRAs above, which is about H3's own
+  library). Text, Image, Keyframes, Extend, Lip-sync and Add sound all render
+  on H3 since 4.19 — see "Media modes" above.
+- **LoRA STACKING**: up to four adapters on a stacking runner — see LoRAs above.
 - **Orientation, accel, temporal interpolation, the LTX upscale control**: none
   apply. Those carry `data-ltx-only` and fold away under
   `body[data-engine="h3"]`. H3 has its own export control (`h3_upscale`,
@@ -575,8 +647,20 @@ FL2VA first-frame conditioning landed on the engine repo **after** the branch
 installed `scripts/generate_staged.py` for the flag
 (`h3_supports_first_frame()`), reports it as `/status.h3.first_frame`, and keeps
 Image mode on LTX when it's absent — so an older checkout degrades to Text-only
-instead of dying 30 s into a render with an argparse error. **Bump `H3_BRANCH`
-in `install_h3.js` once the first-frame work is published.**
+instead of dying 30 s into a render with an argparse error. (Historical: the
+first-frame work has long been published.)
+
+### The engine pin (4.19.0)
+
+The engine an install runs is an exact commit: `H3_PIN_SHA` + `H3_PIN_REF` in
+`scripts/pinokio/h3_checkout.sh`, called by both `install_h3.js` (Install,
+Repair, "Update Hailuo H3 runner") and `scripts/post_update.sh` (Update, and
+the panel's Update now). Through 4.18.x it was the tip of
+`codex/h3-engine-v2`, so a push to that branch reached every install with no
+release behind it. To move the engine: push the commit to a ref on
+`mrbizarro/minimax-h3-mlx` (a new branch or tag — never force-move one), change
+both lines in one commit, and ship it in a Phosphene release.
+`test_h3_engine_pin.py` pins the behaviour.
 
 ---
 

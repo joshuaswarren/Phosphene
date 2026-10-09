@@ -612,6 +612,17 @@ def post_output_delete(h, path, qs, ctype) -> None:
             if not any(p_resolved.is_relative_to(r) for r in roots):
                 continue
             _expand_for_media(p_resolved, seen, candidates)
+        # An Extend's lossless audio master (issue #48) — a FLAC in the
+        # outputs' `.extend/masters` dot-folder that only the next extend of
+        # this clip reads — goes with the clip instead of piling up.
+        v = meta.get("extend_audio_master")
+        if v:
+            try:
+                m_resolved = P.Path(str(v)).resolve()
+            except OSError:
+                m_resolved = None
+            if m_resolved is not None and any(m_resolved.is_relative_to(r) for r in roots):
+                _add(seen, candidates, m_resolved)
 
     # (b) filename-pattern expansion. Always include the clicked
     # file. Then derive base + every known upscale suffix and add
