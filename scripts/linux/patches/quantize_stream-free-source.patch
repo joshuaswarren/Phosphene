@@ -1,0 +1,20 @@
+diff --git a/scripts/quantize_stream.py b/scripts/quantize_stream.py
+index 2b566cc..8a59efb 100644
+--- a/scripts/quantize_stream.py
++++ b/scripts/quantize_stream.py
+@@ -103,13 +103,13 @@ def main() -> None:
+     with mx.stream(mx.cpu):            # CPU quant: deterministic and RAM-bounded
+         for k, kind, shape, bits in plan:
+             if kind == "q":
+-                w, sc, bi = mx.quantize(src[k], group_size=GROUP, bits=BITS)
++                w, sc, bi = mx.quantize(src.pop(k), group_size=GROUP, bits=BITS)
+                 base = k[: -len(".weight")]
+                 add = {base + ".weight": w,
+                        base + ".scales": sc.astype(mx.bfloat16),
+                        base + ".biases": bi.astype(mx.bfloat16)}
+             else:
+-                add = {k: src[k]}
++                add = {k: src.pop(k)}
+             mx.eval(list(add.values()))
+             nbytes = sum(t.nbytes for t in add.values())
+             if shard_bytes + nbytes > MAX_SHARD and shard:

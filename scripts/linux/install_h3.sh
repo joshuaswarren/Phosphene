@@ -22,6 +22,11 @@ bash scripts/pinokio/h3_preflight.sh
 bash scripts/pinokio/h3_checkout.sh "$H3_CHECKOUT"
 
 cd "$H3_CHECKOUT"
+# quantize_stream.py keeps every source tensor it has read alive in `src`. macOS maps the file lazily, so that
+# costs nothing there; on Linux each tensor is a real allocation and the 38.6 GiB bf16 DiT exhausts the GPU heap
+# mid-build. Releasing each tensor once it is quantized restores the "one tensor at a time" bound.
+git apply --check "$ROOT/scripts/linux/patches/quantize_stream-free-source.patch" 2>/dev/null \
+  && git apply "$ROOT/scripts/linux/patches/quantize_stream-free-source.patch"
 [ -x .venv/bin/python3 ] || python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements.txt
