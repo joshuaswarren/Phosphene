@@ -57,6 +57,16 @@ cd "$ROOT"
   'urllib3>=2.6.0' 'protobuf<8,>=4.25' 'safetensors<1,>=0.4.4' 'filelock>=3.20.1'
 "$PY" -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
 "$PY" -m pip install --force-reinstall --no-deps "$WHEEL"
+# omarchy-mlx links the system libopenblas.so.0 and torch bundles its own under
+# the same soname. Whichever loads first serves both, and the distro build can
+# lack symbols torch needs (Arch: no sbgemm_), so `import mlx` then
+# `import torch` - mflux's own order - fails. Load torch's copy at interpreter
+# start; it is a superset for what mlx calls.
+SITE="$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+cat > "$SITE/00-phosphene-openblas.pth" <<'EOF'
+import os, ctypes, sysconfig; _p = os.path.join(sysconfig.get_paths()["purelib"], "torch", "lib", "libopenblas.so.0"); os.path.exists(_p) and ctypes.CDLL(_p, mode=ctypes.RTLD_GLOBAL)
+EOF
+"$PY" -c 'import mlx.core, torch'
 
 "$PY" patch_ltx_codec.py
 "$PY" patch_mflux_fbcache.py
