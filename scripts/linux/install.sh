@@ -10,7 +10,9 @@
 #     whatever `mlx` the resolver pulled in (anything installed after it
 #     would put PyPI's CPU/CUDA mlx files back);
 #   * mflux is installed without its Linux dependency set, which is
-#     mlx[cuda13] plus CUDA torch (several GB of NVIDIA wheels).
+#     mlx[cuda13] plus CUDA torch (several GB of NVIDIA wheels). mflux's
+#     weight loader imports torch, so the CPU build is installed instead,
+#     with the matching torchaudio that vocal separation (demucs) needs.
 #
 # Usage, from the app root:
 #   bash scripts/linux/install.sh
@@ -53,6 +55,7 @@ cd "$ROOT"
 "$PY" -m pip install fonttools 'matplotlib<4,>=3.9.2' 'opencv-python<5,>=4.10' 'piexif<2,>=1.1.3' \
   'platformdirs<5,>=4' regex requests 'sentencepiece<1,>=0.2.1' 'toml<1,>=0.10.2' 'tqdm<5,>=4.66.5' \
   'urllib3>=2.6.0' 'protobuf<8,>=4.25' 'safetensors<1,>=0.4.4' 'filelock>=3.20.1'
+"$PY" -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
 "$PY" -m pip install --force-reinstall --no-deps "$WHEEL"
 
 "$PY" patch_ltx_codec.py
