@@ -142,3 +142,11 @@ def keep_awake_prefix() -> list[str]:
     Linux gets none: systemd-inhibit needs an interactive polkit grant outside
     a local seat session, and a refused grant would fail the render it wraps."""
     return ["caffeinate", "-i"] if IS_MAC else []
+
+
+def h3_env_defaults() -> dict[str, str]:
+    """Environment the Hailuo H3 runner needs on this system, applied only where the caller has not set it.
+
+    Linux: the MLX Vulkan backend addresses one storage buffer through a 2 GiB binding, and the video VAE's
+    default 8-tile batch asks attention for 2.48 GB at 640x384 (H3_VAE_BATCH=1 decodes tile by tile)."""
+    return {} if IS_MAC else {"H3_VAE_BATCH": "1"}

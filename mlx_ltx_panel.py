@@ -13121,7 +13121,9 @@ def h3_paths() -> dict:
     dit = compact_root = text_config = models_root = None
     for root in _h3_model_roots():
         cand_dit = root / "deepbeep-pruned-bf16" / H3_DIT_FILENAME
-        if not cand_dit.is_file():
+        # The 41 GB bf16 master is not needed once the Q8 pack is built; a Mac that deleted it
+        # to get the disk back is still an installed H3.
+        if not cand_dit.is_file() and not (root / H3_DIT_Q8_DIRNAME / ".built_ok").is_file():
             continue
         models_root = root
         dit = cand_dit
@@ -35416,6 +35418,8 @@ def run_h3_job_inner(job: dict) -> None:
     # Pinokio's bundled binary is not on the default PATH.
     env["PATH"] = media_tool_path(env.get("PATH", ""))
     env["PYTHONUNBUFFERED"] = "1"
+    for _k, _v in hostinfo.h3_env_defaults().items():
+        env.setdefault(_k, _v)
     # FP16 VAE decode — the default (h3_vae_fp16_decode()). Passed as the runner's
     # own flag so the argv says what ran; a runner that predates the flag
     # would reject it, so that case is said out loud instead of passed.
