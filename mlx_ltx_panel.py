@@ -70,6 +70,7 @@ SEQ_NOUN_CAP = "Sequence"
 # External agents drive Phosphene via the HTTP API documented in docs/API.md.
 # Pre-removal snapshot: git tag pre-agent-removal-2026-05-15.
 import image_engine as agent_image_engine
+import hostinfo
 
 # Agent-facing Ideogram 4 caption builder + validator (pure stdlib). Powers
 # the GET /image/agent/schema + POST /image/agent endpoints — a clean JSON
@@ -151,7 +152,9 @@ def _resolve_helper_python() -> Path:
     explicit = os.environ.get("LTX_HELPER_PYTHON")
     if explicit and Path(explicit).is_file():
         return Path(explicit)
-    for sub in (".venv/bin/python3.11", "env/bin/python3.11"):
+    # python3.11 is the Pinokio/macOS venv; plain python3 is a Linux venv
+    # (omarchy-mlx ships wheels for the distro's Python only).
+    for sub in (".venv/bin/python3.11", "env/bin/python3.11", ".venv/bin/python3", "env/bin/python3"):
         p = MLX / sub
         if p.is_file():
             return p
@@ -8713,8 +8716,11 @@ def caffeinate_on() -> None:
     global CAFFEINATE_PROC
     if CAFFEINATE_PROC and CAFFEINATE_PROC.poll() is None:
         return
+    argv = hostinfo.keep_awake_prefix()
+    if not argv:
+        return
     try:
-        CAFFEINATE_PROC = subprocess.Popen(["caffeinate", "-i"],
+        CAFFEINATE_PROC = subprocess.Popen(argv,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         push("caffeinate active — Mac won't idle-sleep while queue is running")
     except Exception as exc:
@@ -8907,14 +8913,7 @@ CAPABILITIES: dict[str, dict] = {
 
 def _detect_total_ram_gb() -> float:
     """Return physical unified memory in GiB, or 0.0 when unavailable."""
-    try:
-        out = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"],
-            capture_output=True, text=True, errors="replace", timeout=1,
-        ).stdout.strip()
-        return int(out) / 1024**3
-    except Exception:
-        return 0.0
+    return hostinfo.total_ram_bytes() / 1024**3
 
 
 SYSTEM_RAM_GB = _detect_total_ram_gb()
@@ -10346,8 +10345,7 @@ def _hw_chip_family() -> str:
     if _HW_CHIP_FAMILY is None:
         fam = "unknown"
         try:
-            brand = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
-                                   capture_output=True, text=True, errors="replace", timeout=3).stdout.strip()
+            brand = hostinfo.chip_brand()
             m = re.search(r"Apple (M\d+)(?: (Pro|Max|Ultra))?", brand)
             if m:
                 fam = m.group(1) + (f" {m.group(2)}" if m.group(2) else "")
@@ -17671,10 +17669,7 @@ def _analytics_chip_family() -> str:
         return _CHIP_FAMILY_CACHE
     family = "unknown"
     try:
-        brand = subprocess.run(
-            ["sysctl", "-n", "machdep.cpu.brand_string"],
-            capture_output=True, text=True, errors="replace", timeout=2,
-        ).stdout.strip()
+        brand = hostinfo.chip_brand()
         m = _CHIP_FAMILY_RE.search(brand)
         if m:
             family = f"M{m.group(1)}" + (f" {m.group(2).title()}" if m.group(2) else "")
@@ -19599,32 +19594,12 @@ def ltx_mode_price_card(mode: str, steps: int | None = None, *,
 
 def get_memory() -> dict:
     info = {"total_gb": 0.0, "used_gb": 0.0, "pressure_pct": 0, "swap_gb": 0.0}
-    try:
-        total = int(subprocess.run(["sysctl", "-n", "hw.memsize"],
-            capture_output=True, text=True, errors="replace", timeout=1).stdout.strip())
-        info["total_gb"] = total / 1024**3
-        vm = subprocess.run(["vm_stat"], capture_output=True, text=True, errors="replace", timeout=1).stdout
-        m = re.search(r"page size of (\d+)", vm)
-        page_size = int(m.group(1)) if m else 16384
-
-        def pages(name: str) -> int:
-            mm = re.search(rf"{re.escape(name)}:\s+(\d+)", vm)
-            return int(mm.group(1)) if mm else 0
-
-        used_bytes = (pages("Pages active") + pages("Pages wired down")
-                      + pages("Pages occupied by compressor")) * page_size
-        info["used_gb"] = used_bytes / 1024**3
-        info["pressure_pct"] = round(used_bytes / total * 100) if total else 0
-
-        swap = subprocess.run(["sysctl", "-n", "vm.swapusage"],
-            capture_output=True, text=True, errors="replace", timeout=1).stdout
-        m = re.search(r"used\s*=\s*([\d.]+)([KMG])", swap)
-        if m:
-            v = float(m.group(1))
-            mult = {"K": 1 / 1024 / 1024, "M": 1 / 1024, "G": 1.0}[m.group(2)]
-            info["swap_gb"] = v * mult
-    except Exception:
-        pass
+    mem = hostinfo.memory_usage()
+    total = mem["total"]
+    info["total_gb"] = total / 1024**3
+    info["used_gb"] = mem["used"] / 1024**3
+    info["pressure_pct"] = round(mem["used"] / total * 100) if total else 0
+    info["swap_gb"] = mem["swap_used"] / 1024**3
     # SYS-19: `pressure_pct` above (active+wired+compressed / total) is a
     # USED ratio, not a pressure signal — plan_memory_policy() above
     # deliberately keeps using it exactly as-is (its 82%+swap>=4GB
@@ -19638,14 +19613,7 @@ def get_memory() -> dict:
     # jetsam-kill (1 normal / 2 warning / 3 critical) — a genuine pressure
     # level, not a used ratio. New field, additive; nothing that reads
     # pressure_pct changes.
-    try:
-        lvl = subprocess.run(
-            ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
-            capture_output=True, text=True, errors="replace", timeout=1,
-        ).stdout.strip()
-        info["pressure_level"] = int(lvl) if lvl.isdigit() else 1
-    except Exception:
-        info["pressure_level"] = 1
+    info["pressure_level"] = hostinfo.pressure_level()
     return info
 
 
@@ -35267,7 +35235,7 @@ def run_h3_job_inner(job: dict) -> None:
     cmd = [
         # caffeinate keeps the Mac awake for the whole render; being the
         # process-group leader means /stop's killpg takes both down together.
-        "caffeinate", "-i",
+        *hostinfo.keep_awake_prefix(),
         str(paths["python"]), str(paths["runner"]),
     ]
     # The positional prompt and `--chain-prompts` are MUTUALLY EXCLUSIVE on the

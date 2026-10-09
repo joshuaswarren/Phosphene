@@ -190,6 +190,11 @@ class TrackedProcessesObeyStop(unittest.TestCase):
             self.assertNotIn(f'STATE["{key}"] = os.getpgid', src, key)
 
 
+def _is_renderer(cmd) -> bool:
+    """The H3 renderer spawn, with or without the platform's keep-awake prefix."""
+    return isinstance(cmd, list) and any(str(a).endswith("generate_staged.py") for a in cmd)
+
+
 def _h3_dispatch_patches(stack, fetch, popen):
     tmp = _TMP / "pack"
     paths = dict(missing=[], repairable=False, dit=tmp / "dit", python=sys.executable,
@@ -262,7 +267,7 @@ class TheTurboDispatchObeysStop(unittest.TestCase):
         spawned = []
 
         def popen(cmd, **kw):
-            if cmd and cmd[0] == "caffeinate":
+            if _is_renderer(cmd):
                 raise AssertionError("renderer spawned after Stop")
             p = real_popen(cmd, **kw)
             spawned.append(p)
@@ -283,7 +288,7 @@ class TheTurboDispatchObeysStop(unittest.TestCase):
         spawned = []
 
         def popen(cmd, **kw):
-            self.assertEqual(cmd[0], "caffeinate")
+            self.assertTrue(_is_renderer(cmd), cmd)
             kw.pop("cwd", None)
             p = real_popen(["sleep", "30"], **{k: v for k, v in kw.items()
                                                if k in ("stdout", "stderr", "text",
@@ -402,7 +407,7 @@ class AOneShotPartBelongsToItsTake(unittest.TestCase):
         real_popen = subprocess.Popen
 
         def popen(cmd, **kw):
-            if cmd and cmd[0] == "caffeinate":
+            if _is_renderer(cmd):
                 raise AssertionError("renderer spawned after Stop")
             proc = real_popen(cmd, **kw)
             spawned.append(proc)
