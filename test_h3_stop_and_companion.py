@@ -293,6 +293,7 @@ class TheTurboDispatchObeysStop(unittest.TestCase):
 
         def popen(cmd, **kw):
             self.assertTrue(_is_renderer(cmd), cmd)
+            self.assertEqual(cmd[:2], ["caffeinate", "-i"])
             kw.pop("cwd", None)
             p = real_popen(["sleep", "30"], **{k: v for k, v in kw.items()
                                                if k in ("stdout", "stderr", "text",
@@ -303,6 +304,7 @@ class TheTurboDispatchObeysStop(unittest.TestCase):
             return p
 
         with ExitStack() as st, _CurrentJob(job):
+            st.enter_context(unittest.mock.patch.object(P.hostinfo, "IS_MAC", True))
             _h3_dispatch_patches(st, lambda *a, **k: True, popen)
             st.enter_context(unittest.mock.patch.object(
                 P, "h3_turbo_paths", lambda: dict(

@@ -13233,12 +13233,17 @@ def _h3_q8_shards_complete(d: Path) -> bool:
         return False
 
 
+def _h3_q8_pack_complete(d: Path) -> bool:
+    return ((d / "config.json").is_file()
+            and (d / "quant_config.json").is_file()
+            and _h3_q8_shards_complete(d))
+
+
 def _h3_q8_dit_dir() -> Path | None:
     """The quantized DiT pack, if present: config + quant recipe + all shards."""
     for root in _h3_model_roots():
         d = root / H3_DIT_Q8_DIRNAME
-        if (d / "config.json").is_file() and (d / "quant_config.json").is_file() \
-                and _h3_q8_shards_complete(d):
+        if _h3_q8_pack_complete(d):
             return d
     return None
 
@@ -13582,10 +13587,10 @@ def h3_supports_lora() -> bool:
 
 
 def _h3_holds_dit(root: Path) -> bool:
-    """Find the bf16 master, or a Linux Q8 pack."""
+    """Find the bf16 master, or a complete Linux Q8 pack."""
     if (root / "deepbeep-pruned-bf16" / H3_DIT_FILENAME).is_file():
         return True
-    return not hostinfo.IS_MAC and (root / H3_DIT_Q8_DIRNAME / ".built_ok").is_file()
+    return not hostinfo.IS_MAC and _h3_q8_pack_complete(root / H3_DIT_Q8_DIRNAME)
 
 
 def _h3_turbo_dir() -> Path:

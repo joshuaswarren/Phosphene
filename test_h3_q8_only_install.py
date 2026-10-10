@@ -27,11 +27,13 @@ class Q8OnlyInstall(unittest.TestCase):
         _touch(pack / "config.json", b"{}")
         _touch(pack / "quant_config.json", b"{}")
         _touch(pack / ".built_ok")
+        _touch(pack / "model-00001-of-00001.safetensors")
+        _touch(pack / "model.safetensors.index.json",
+               b'{"weight_map":{"w":"model-00001-of-00001.safetensors"}}')
         self.models = self.tmp / "models"
 
     def _paths(self):
         with mock.patch.object(P, "H3_MODELS", self.tmp), \
-                mock.patch.object(P, "_h3_q8_shards_complete", lambda d: True), \
                 mock.patch.object(hostinfo, "IS_MAC", False):
             return P.h3_paths(), P.h3_dit_choice()
 
@@ -47,7 +49,6 @@ class Q8OnlyInstall(unittest.TestCase):
         pack is the renderable DiT and the choice routes to it."""
         master = self.models / "deepbeep-pruned-bf16" / P.H3_DIT_FILENAME
         with mock.patch.object(P, "H3_MODELS", self.tmp), \
-                mock.patch.object(P, "_h3_q8_shards_complete", lambda d: True), \
                 mock.patch.object(hostinfo, "IS_MAC", False):
             self.assertIsNone(P.h3_paths()["dit"])
             self.assertFalse(master.exists())
@@ -64,9 +65,19 @@ class Q8OnlyInstall(unittest.TestCase):
             self.assertEqual(P._h3_turbo_dir(), self.models / P.H3_TURBO_DIRNAME)
             self.assertEqual(P._h3_loras_dir(), self.models / P.H3_LORAS_DIRNAME)
 
-    def test_no_pack_and_no_master_is_still_missing(self):
-        (self.models / P.H3_DIT_Q8_DIRNAME / ".built_ok").unlink()
+    def test_marker_without_configs_is_not_installed(self):
+        pack = self.models / P.H3_DIT_Q8_DIRNAME
+        (pack / "config.json").unlink()
+        (pack / "quant_config.json").unlink()
         paths, _ = self._paths()
+        self.assertFalse(paths["weights_ok"])
+        self.assertTrue(any("pruned bf16" in m for m in paths["missing"]))
+
+    def test_marker_with_a_missing_indexed_shard_is_not_installed(self):
+        pack = self.models / P.H3_DIT_Q8_DIRNAME
+        (pack / "model-00001-of-00001.safetensors").unlink()
+        paths, _ = self._paths()
+        self.assertFalse(paths["weights_ok"])
         self.assertTrue(any("pruned bf16" in m for m in paths["missing"]))
 
 
