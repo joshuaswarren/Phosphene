@@ -192,7 +192,11 @@ class TrackedProcessesObeyStop(unittest.TestCase):
 
 def _is_renderer(cmd) -> bool:
     """The H3 renderer spawn, with or without the platform's keep-awake prefix."""
-    return isinstance(cmd, list) and any(str(a).endswith("generate_staged.py") for a in cmd)
+    if not isinstance(cmd, list) or not any(str(a).endswith("generate_staged.py") for a in cmd):
+        return False
+    if sys.platform == "darwin":
+        assert cmd[:2] == ["caffeinate", "-i"]
+    return True
 
 
 def _h3_dispatch_patches(stack, fetch, popen):

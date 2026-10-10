@@ -13124,7 +13124,7 @@ def h3_paths() -> dict:
         if not _h3_holds_dit(root):
             continue
         models_root = root
-        dit = cand_dit
+        dit = cand_dit if cand_dit.is_file() else None
         # LTX_H3_COMPACT_DIR picks an alternate conditioning-encoder dir under the same
         # models root (e.g. "heretic-q8", an abliterated encoder re-quantized to the
         # ddalcu layout). Dev/testing override; default stays the shipped ddalcu-q8.
@@ -13148,7 +13148,7 @@ def h3_paths() -> dict:
         missing.append(f"runner {runner}")
     if python is None:
         missing.append(f"venv python under {H3_ROOT / '.venv'}")
-    if dit is None:
+    if dit is None and models_root is None:
         missing.append(f"pruned bf16 DiT ({H3_DIT_FILENAME})")
     if compact_root is None:
         missing.append("Q8 components (text_encoder / video_vae / audio_vae)")
@@ -13170,7 +13170,8 @@ def h3_paths() -> dict:
     # `repairable` is the load-bearing one: weights present + code/venv gone.
     # It is what stops the panel silently reporting "not installed" to a user
     # who has 75 GB of H3 weights sitting on their disk.
-    weights_ok = dit is not None and compact_root is not None and text_config is not None
+    weights_ok = (models_root is not None
+                  and compact_root is not None and text_config is not None)
     runner_ok = runner.is_file()
     venv_ok = python is not None
     venv_built = _h3_venv_present()
@@ -13191,9 +13192,6 @@ def h3_paths() -> dict:
         "runner": runner,
         "python": python,
         "dit": dit,
-        # bf16 master path stays canonical in `dit`; the render-time swap to
-        # the Q8 pack happens in the dispatch via h3_dit_choice(), so /status
-        # can always show BOTH what exists and what will be used.
         "compact_root": compact_root,
         "text_config": text_config,
         "missing": missing,
@@ -13259,12 +13257,8 @@ def h3_dit_choice() -> tuple[str, Path | None]:
     q8 = _h3_q8_dit_dir()
     if pref == "q8" and q8 is not None:
         return "q8", q8
-    # A bf16 preference below the bf16 floor, with the Q8 pack built, is not
-    # honoured: the master loads 38.6 GiB before the modulation cache and a
-    # 48 GB Mac died with Metal "Insufficient Memory" on every render, Draft
-    # included (Pinokio report, M5 Max 48 GB, Q8 engine built and skipped).
-    # Q8 is the only lane that fits there; the dispatch says so in the log.
-    if pref == "bf16" and (SYSTEM_RAM_GB >= H3_MIN_RAM_GB or q8 is None):
+    if pref == "bf16" and h3_paths()["dit"] is not None \
+            and (SYSTEM_RAM_GB >= H3_MIN_RAM_GB or q8 is None):
         return "bf16", None
     if pref == "q8" and q8 is None:
         pref = "auto"      # fall through, surfaced via /status
@@ -13588,10 +13582,10 @@ def h3_supports_lora() -> bool:
 
 
 def _h3_holds_dit(root: Path) -> bool:
-    """This model root has a DiT: the bf16 master, or the Q8 pack built from it (the master is 41 GB and
-    can be deleted once the pack exists)."""
-    return (root / "deepbeep-pruned-bf16" / H3_DIT_FILENAME).is_file() \
-        or (root / H3_DIT_Q8_DIRNAME / ".built_ok").is_file()
+    """Find the bf16 master, or a Linux Q8 pack."""
+    if (root / "deepbeep-pruned-bf16" / H3_DIT_FILENAME).is_file():
+        return True
+    return not hostinfo.IS_MAC and (root / H3_DIT_Q8_DIRNAME / ".built_ok").is_file()
 
 
 def _h3_turbo_dir() -> Path:

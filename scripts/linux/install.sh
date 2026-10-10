@@ -14,14 +14,26 @@
 #     weight loader imports torch, so the CPU build is installed instead,
 #     with the matching torchaudio that vocal separation (demucs) needs.
 #
+# The omarchy-mlx wheel is a third-party build. pip verifies the pinned release sha256 before installation.
+# Linux-only: the 00-phosphene-openblas.pth preload written below must never
+# be written on macOS.
+#
 # Usage, from the app root:
 #   bash scripts/linux/install.sh
-#   OMARCHY_MLX_WHEEL=/path/or/url.whl bash scripts/linux/install.sh
+#   OMARCHY_MLX_WHEEL=/path/or/url.whl OMARCHY_MLX_WHEEL_SHA256=<hash> bash scripts/linux/install.sh
 # Then ./run_panel.sh. Models download from the panel, as on a Mac.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-WHEEL="${OMARCHY_MLX_WHEEL:-https://github.com/joshuaswarren/omarchy-mlx/releases/download/v0.7.31/mlx_omarchy-0.32.4.dev202610071347+9b5c938-cp314-cp314-linux_aarch64.whl}"
+PINNED_WHEEL_URL='https://github.com/joshuaswarren/omarchy-mlx/releases/download/v0.7.31/mlx_omarchy-0.32.4.dev202610071347%2B9b5c938-cp314-cp314-linux_aarch64.whl'
+WHEEL="${OMARCHY_MLX_WHEEL:-$PINNED_WHEEL_URL}"
+SHA256="a2f8c83e5c5f635d00702565a8557d87c40a9eccac885329dcec4692d85d300d"
+if [[ -n "${OMARCHY_MLX_WHEEL:-}" ]]; then
+  SHA256="${OMARCHY_MLX_WHEEL_SHA256:?Set OMARCHY_MLX_WHEEL_SHA256 for a custom wheel}"
+fi
+[[ "$SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || { echo 'ERR: invalid wheel sha256' >&2; exit 1; }
+[[ "$WHEEL" == *://* ]] || WHEEL="file://$(realpath "$WHEEL")"
+WHEEL="${WHEEL%%#*}#sha256=$SHA256"
 
 if [ "$(uname -s)" != Linux ] || [ "$(uname -m)" != aarch64 ]; then
   echo "ERR: this installer is for Linux on Apple Silicon (aarch64)." >&2

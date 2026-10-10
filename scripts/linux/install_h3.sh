@@ -9,8 +9,23 @@
 #   PHOSPHENE_H3_SKIP_WEIGHTS=1 ...   # code + venv only; weights placed by hand
 set -euo pipefail
 
+if [ "$(uname -s)" != Linux ] || [ "$(uname -m)" != aarch64 ]; then
+  echo "ERR: this installer is for Linux on Apple Silicon (aarch64)." >&2
+  exit 1
+fi
+
+# The omarchy-mlx wheel is a third-party build. pip verifies the pinned release sha256 before installation.
+
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-WHEEL="${OMARCHY_MLX_WHEEL:-https://github.com/joshuaswarren/omarchy-mlx/releases/download/v0.7.31/mlx_omarchy-0.32.4.dev202610071347+9b5c938-cp314-cp314-linux_aarch64.whl}"
+PINNED_WHEEL_URL='https://github.com/joshuaswarren/omarchy-mlx/releases/download/v0.7.31/mlx_omarchy-0.32.4.dev202610071347%2B9b5c938-cp314-cp314-linux_aarch64.whl'
+WHEEL="${OMARCHY_MLX_WHEEL:-$PINNED_WHEEL_URL}"
+SHA256="a2f8c83e5c5f635d00702565a8557d87c40a9eccac885329dcec4692d85d300d"
+if [[ -n "${OMARCHY_MLX_WHEEL:-}" ]]; then
+  SHA256="${OMARCHY_MLX_WHEEL_SHA256:?Set OMARCHY_MLX_WHEEL_SHA256 for a custom wheel}"
+fi
+[[ "$SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || { echo 'ERR: invalid wheel sha256' >&2; exit 1; }
+[[ "$WHEEL" == *://* ]] || WHEEL="file://$(realpath "$WHEEL")"
+WHEEL="${WHEEL%%#*}#sha256=$SHA256"
 cd "$ROOT"
 mkdir -p .install-tmp
 export TMPDIR="$ROOT/.install-tmp"
