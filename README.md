@@ -182,8 +182,11 @@ Linux on Apple Silicon uses MLX with a Vulkan backend instead of Metal. These ar
 | Machine | Engine and settings | Actual output | Native job time | Peak memory | Driver source |
 | --- | --- | --- | ---: | --- | --- |
 | 14-inch M2 Max MacBook Pro | FLUX.2-klein-4B, native queue, browser on another machine | 512x512 PNG | 58.3 s | Not recorded | Not captured at run |
+| 14-inch M2 Max MacBook Pro | FLUX.2-klein-4B (4-bit weights folder, mflux), 4 steps, seed 42, 512x512, one image per fresh process, model load included | 512x512 PNG, same pixel hash in all 30 jobs | 55.1 to 66.3 s in 20 jobs (median 57.8 s); 79.7 to 88.4 s in 10 jobs (median 85.3 s) | Not recorded | [69bde15340](https://github.com/joshuaswarren/mesa-1/commit/69bde153405cf02d52b0c9810307a0c7d0085d52) |
 | 14-inch M2 Max MacBook Pro | H3 native UI, Draft, Fast (3-step), seed 42, 640x384 | 73 frames, 1280x720 export, 3.042 s duration | 1610.79 s | Not recorded | Not captured; binary hash below |
 | 16-inch M1 Max MacBook Pro | LTX native queue, 8 steps, seed 42 | 9 frames, 256x128, 0.375 s duration | 181.26 s | 31.1G as reported, no swap | [69bde15340](https://github.com/joshuaswarren/mesa-1/commit/69bde153405cf02d52b0c9810307a0c7d0085d52) |
+
+The second FLUX.2-klein row is five runs of six identical jobs each. Every job starts a new process that loads the model, so there is no warm job to time. The times fall in two groups with nothing between 66.3 s and 79.7 s. In the 18 jobs where system power was sampled (SMC Total System Power, mean per job), the faster jobs drew 69 to 82 W and the slower jobs drew 52 to 56 W, and every job used 4.2 to 4.6 kJ per image. Fan speed was at its maximum and the charge regulator ran at 62 to 67 C in both groups, so the slow jobs were not hotter. The cause of the slower group is not established. Both groups occurred with the background ANE load on and off. Give a timing from this machine as a range or as both groups, not as one number.
 
 The LTX row used an unreleased diagnostics runtime. The published 0.7.32 wheel cannot run its uint8 Take operation, and the installer pin remains unchanged. A requested height of 160 becomes 128 on the 64-pixel canvas grid. The queue also normalized a four-step request to eight steps; this is not a four-step timing.
 
@@ -197,6 +200,13 @@ LTX, 16-inch M1 Max MacBook Pro
   package        omarchy-mlx-vulkan-omarchy 1:26.2.4.git69bde15340-2
   driver sha256  40282811c6e14ef991f72936bb675008cb4d6b3199b1785bc34c7976ab89c425
   kernel         7.1.12-2-12.6-sep-ARCH
+
+FLUX.2-klein-4B, 14-inch M2 Max MacBook Pro, five runs on one boot
+  source commit  69bde153405cf02d52b0c9810307a0c7d0085d52
+  package        omarchy-mlx-vulkan-omarchy 1:26.2.4.git69bde15340-2
+  driver sha256  40282811c6e14ef991f72936bb675008cb4d6b3199b1785bc34c7976ab89c425
+  kernel         7.1.12-2-20261013.18-sep-ARCH
+  Phosphene      7b1068d71329088c162a334bbbd8299d0ecafa0f
 
 H3, 14-inch M2 Max MacBook Pro
   source commit  not captured; this run predates the package above
