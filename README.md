@@ -182,8 +182,11 @@ Linux on Apple Silicon uses MLX with a Vulkan backend instead of Metal. These ar
 | Machine | Engine and settings | Actual output | Native job time | Peak memory | Driver source |
 | --- | --- | --- | ---: | --- | --- |
 | 14-inch M2 Max MacBook Pro | FLUX.2-klein-4B, native queue, browser on another machine | 512x512 PNG | 58.3 s | Not recorded | Not captured at run |
+| 14-inch M2 Max MacBook Pro | FLUX.2-klein-4B (4-bit weights folder, mflux), 4 steps, seed 42, 512x512, one image per fresh process, model load included | 512x512 PNG, same pixel hash in all 30 jobs | 55.1 to 66.3 s in 20 jobs (median 57.8 s); 79.7 to 88.4 s in 10 jobs (median 85.3 s) | Not recorded | [69bde15340](https://github.com/joshuaswarren/mesa-1/commit/69bde153405cf02d52b0c9810307a0c7d0085d52) |
 | 14-inch M2 Max MacBook Pro | H3 native UI, Draft, Fast (3-step), seed 42, 640x384 | 73 frames, 1280x720 export, 3.042 s duration | 1610.79 s | Not recorded | Not captured; binary hash below |
 | 16-inch M1 Max MacBook Pro | LTX native queue, 8 steps, seed 42 | 9 frames, 256x128, 0.375 s duration | 181.26 s | 31.1G as reported, no swap | [69bde15340](https://github.com/joshuaswarren/mesa-1/commit/69bde153405cf02d52b0c9810307a0c7d0085d52) |
+
+The second FLUX.2-klein row is five runs of six identical jobs each. Every job starts a new process that loads the model, so there is no warm job to time. The times fall in two groups with nothing between 66.3 s and 79.7 s. In the 18 jobs with SMC samples, the mean Total System Power between each job's start and finish times was 69 to 81 W for the faster jobs and 52 to 56 W for the slower jobs. Energy per image was 4.1 to 4.6 kJ in both groups. The charge regulator averaged 55 to 68 C in the faster jobs and 63 to 67 C in the slower jobs, so the slower jobs were not hotter. Fan speed was 5,390 to 5,790 rpm (fan 1) and 5,820 to 6,245 rpm (fan 2) in every sampled job except the first job of two runs, which began while the fans were still speeding up. The cause of the slower group is not established. Of the 30 jobs, 18 ran with the background ANE load off (12 fast, 6 slow) and 12 with it on (8 fast, 4 slow); both groups occurred in both. Give a timing from this machine as a range or as both groups, not as one number.
 
 The LTX row used an unreleased diagnostics runtime. The published 0.7.32 wheel cannot run its uint8 Take operation, and the installer pin remains unchanged. A requested height of 160 becomes 128 on the 64-pixel canvas grid. The queue also normalized a four-step request to eight steps; this is not a four-step timing.
 
@@ -197,6 +200,13 @@ LTX, 16-inch M1 Max MacBook Pro
   package        omarchy-mlx-vulkan-omarchy 1:26.2.4.git69bde15340-2
   driver sha256  40282811c6e14ef991f72936bb675008cb4d6b3199b1785bc34c7976ab89c425
   kernel         7.1.12-2-12.6-sep-ARCH
+
+FLUX.2-klein-4B, 14-inch M2 Max MacBook Pro, five runs on one boot
+  source commit  69bde153405cf02d52b0c9810307a0c7d0085d52
+  package        omarchy-mlx-vulkan-omarchy 1:26.2.4.git69bde15340-2
+  driver sha256  40282811c6e14ef991f72936bb675008cb4d6b3199b1785bc34c7976ab89c425
+  kernel         7.1.12-2-20261013.18-sep-ARCH
+  Phosphene      7b1068d71329088c162a334bbbd8299d0ecafa0f
 
 H3, 14-inch M2 Max MacBook Pro
   source commit  not captured; this run predates the package above
