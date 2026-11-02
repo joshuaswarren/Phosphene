@@ -360,3 +360,7 @@ Phosphene renders locally — no prompt, model input or output is ever uploaded.
 That last one is **on by default and the build ships a working key**, so a fresh clone does report. Every event and field is specified in [docs/ANALYTICS.md](docs/ANALYTICS.md), mirrored in plain text to `state/usage-log.jsonl` so you can read exactly what was sent, and switched off in one click in Settings → *Anonymous usage analytics* (or with `PHOSPHENE_ANALYTICS_DISABLED=1`).
 
 The panel binds to `127.0.0.1` with no auth. It's not designed for LAN exposure or tunneling.
+
+## Contributors
+
+Everyone credited so far: [CONTRIBUTORS.md](CONTRIBUTORS.md).
